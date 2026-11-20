@@ -1,2 +1,10 @@
+node_modules/
+dist/
+web-ext-artifacts/
+tests/fixture-profile/
+tests/e2e-downloads/
+tests/e2e-firefox.log
+tests/e2e-console.log
+tests/*.log
+tests/e2e-console.lock
 *~
-#*#

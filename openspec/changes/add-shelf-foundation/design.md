@@ -51,13 +51,22 @@ to the user and to TST.
   attribute (TST wiki); TST then runs its own drag-and-drop — drop
   zones, edge-insertion vs attach-as-child, re-parenting of the
   dragged tree — exactly as for a row drag.
-- Helper menu items are registered by `contextMenu-create` (params:
-  `id`, `title`, `contexts: ['tab']`, `viewTypes: ['sidebar']`); TST
-  creates the real `browser.menus` item on the addon's behalf and
-  forwards clicks as `contextMenu-click` (plus a legacy
-  `fake-contextMenu-click` duplicate) with `{info: {menuItemId},
-  tab}` (`background/tab-context-menu.js`). Visibility flips
-  per-invocation via `contextMenu-update` on `contextMenu-shown`.
+- Menu items are OUR OWN `browser.menus` items (manifest permission
+  `menus`): `{id, title, contexts: ['tab']}`, visibility flipped by our
+  `menus.onShown` listener, clicks handled by our `menus.onClicked`.
+  REJECTED route, verified against TST 4.4.9/4.4.10 sources: registering
+  via `contextMenu-create` creates the item `visible: false`
+  (`background/tab-context-menu.js` — the create handler computes
+  `lastVisible && mOverriddenContext && owner == sender`), and no TST
+  code path ever flips it for a plain tab-row menu: `onShown`'s main
+  body updates only TST's own items, and `contextMenu-update` strips
+  the `visible` property unless an owner-matched menu is currently
+  overridden (menus for the addon's own extra contents). The flagship
+  helper, tst-more-tree-commands, bypasses `contextMenu-create` for the
+  same reason. TST's sidebar opens the tab menu via
+  `overrideContext({context: 'tab', tabId})`, which shows every
+  extension's `contexts: ['tab']` items — ours included (and they also
+  appear in the native tab bar's menu, as More Tree Commands' do).
 - Clicks on extra contents arrive as `extra-contents-clicked` /
   `extra-contents-mousedown` with `originalTarget` (the clicked
   element's HTML, `data-*` attributes included), `originalTargetPart`,
@@ -275,3 +284,35 @@ to the user and to TST.
   plan is quantized owner heights via state classes
   (`tst-shelf-owner-rows-1..N` setting `--tab-current-size`
   explicitly) if scroll mispredictions appear.
+
+## Implementation notes (2026-11-21, discovered while building)
+
+Deviations and refinements the E2E forced, all recorded in the README
+too:
+
+- **No per-tab uuid key.** Decision 1 planned a `tst-shelf-key`
+  session value for stable per-tab keys; implementation showed it is
+  unnecessary — the sticky flag rides the tab through session restore
+  and window moves, and nothing correlates tabs across sessions by
+  anything but id. The flag alone is the stored state.
+- **`windowId` is load-bearing in every TST request.** TST's
+  `getTargetTabs` falls back to the last focused window without it;
+  unfocused/headless sessions then resolve an active tab of null and
+  the request silently processes zero tabs while answering `true`.
+  Every `add-tab-state`/`remove-tab-state`/`collapse-tree`/
+  `expand-tree` call now carries the target's `windowId`.
+- **The renderer's state cleanup is window-scoped.** A derivation of
+  window W must only remove shelf states of tabs that exist in W;
+  the first E2E runs nuked the other window's shelf states through
+  the global cleanup.
+- **The donor TST client needed two more deviations** (documented in
+  the file header): boolean response passthrough (the verbatim copy's
+  unconditional `true` would cancel every `tryOperationAllowed` we
+  subscribe to) and bulk-frame fan-out for `allowBulkMessaging`.
+- **Firefox 158 Marionette takes `WebDriver:ExecuteScript` as a plain
+  function body**; the donor harness's IIFE-with-`arguments` form
+  silently returns null (probe: `tests/probe-mexec.mjs`).
+- **The icon markup avoids `<button>`** (TST cancels native drags
+  started on button/select/scrollbar targets) and re-enables
+  `pointer-events` on `::part(shelf-icon)` (the below container is
+  `pointer-events: none`).

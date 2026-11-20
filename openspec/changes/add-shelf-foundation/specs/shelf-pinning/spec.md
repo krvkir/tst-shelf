@@ -84,6 +84,18 @@ The extension SHALL keep a tab shelved through any change of parent — drag-and
 - **WHEN** a shelved tab is re-parented by any means other than dragging
 - **THEN** the tab stays shelved and its icon moves to the new parent's shelf
 
+### Requirement: Firefox pinning and shelving are mutually exclusive
+The extension SHALL take a shelved tab off the shelf when the user pins it, and SHALL NOT offer "Put on shelf" for pinned tabs. Firefox pinning moves the tab into the global pinned box outside the tree; the extension SHALL NOT hide a pinned tab from the pinned box.
+
+#### Scenario: Pinning a shelved tab takes it off the shelf
+- **WHEN** the user right-clicks a shelf icon and chooses the tab's native "Pin Tab"
+- **THEN** the tab leaves its shelf, appears in the global pinned box, and no shelf icon remains for it
+- **AND** the tab's shelved flag is cleared
+
+#### Scenario: A pinned tab is not offered shelving
+- **WHEN** the tab context menu opens on a pinned tab
+- **THEN** "Put on shelf" is not among the offered items
+
 ### Requirement: Closing the shelf owner re-shelves its members instead of unfolding rows
 The extension SHALL keep every member of a closing owner's shelf shelved and SHALL move each member's icon to the shelf of the member's new parent, as determined by Tree Style Tab's own behavior for children of a closing parent, or to the root shelf when the member becomes a root tab. No member SHALL become a visible row because of the closure.
 
