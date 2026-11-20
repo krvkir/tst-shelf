@@ -366,3 +366,37 @@ Three user-reported layout bugs and the mechanics they forced:
   is measurably taller than a plain row (the second line), the
   selected member's children render ABOVE the owner's following
   non-member child, and the re-put member is the rightmost icon.
+
+## Implementation notes (2026-11-20, favicon stickiness)
+
+A user-reported blank: the shelf icon lost its favicon while the tab
+reloaded. Root cause: our renderer reads live `browser.tabs` on every
+re-derivation, and Firefox reports NO `favIconUrl` for a navigating or
+loading tab — so the mid-load derivation rendered an empty style.
+TST's own rows never blank, for two stacked reasons (both verified in
+4.4.10):
+
+- The background only propagates a favicon change when the changeInfo
+  EXPLICITLY carries `favIconUrl` — never on `status` flips
+  (`tabs-update.js`: `options.forceApply || 'favIconUrl' in newState`),
+  so a loading tab's row simply never hears about a vanished favicon.
+- The row element is sticky on its own: `applyAttributes` does
+  `this.favIconUrl = this._favIconUrl ||= this.raw?.favIconUrl` — a
+  null never overwrites the remembered value when a row element is
+  reused.
+
+The fix mirrors that in the background: `resolveFavicons`
+(logic.esm.js) threads a per-session `Map<tabId, url>` through every
+`tabs.query` — tabs that have a favicon update the memory, blanks
+render the remembered one (shallow-copied records). Wired at the single
+metadata entry point (`rederive`), cleaned on `tabs.onRemoved`. The
+diffing renderer then produces an UNCHANGED strap during the load (no
+send at all), so the sidebar keeps the old style attribute until the
+new page's favicon arrives. A genuinely favicon-less tab shows no
+image (TST's own fallback there is its `defaultFavicon.svg`; ours is
+the empty icon box).
+
+E2E: the smoke page navigates a shelved tab to `about:blank` and
+asserts that the derivation's favicon for that tab (the same record
+that feeds `strapHtml`) stays the remembered URL while the live tab
+reports none.

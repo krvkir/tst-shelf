@@ -243,6 +243,27 @@ async function phaseOneAndTwo () {
 		menuPlain && menuPlain.menu.lastTabId == ids.A
 			&& menuPlain.menu.lastPutVisible === true && menuPlain.menu.lastTakeVisible === false,
 		JSON.stringify(menuPlain && menuPlain.menu));
+
+	// -- favicon stickiness while a shelved tab reloads -----------------
+	// Navigate the shelved C to a page with no favicon: the icon must
+	// keep the last known favicon while the tab loads and after it
+	// completes (the live tab reports none; the derivation's favicon
+	// comes from the resolveFavicons memory — same record that feeds
+	// the strap HTML, so the rendered style attribute is unchanged).
+	{
+		const before = await browser.tabs.get(ids.C);
+		const remembered = before.favIconUrl;
+		record("the shelved tab starts with a favicon", !!remembered, String(remembered));
+		if (remembered) {
+			await send({ type: "test:navigate", tabId: ids.C, url: "about:blank", });
+			await eventually("a reloading shelved tab keeps the remembered favicon", async () => {
+				const live = await browser.tabs.get(ids.C);
+				if (live.status != "complete" || live.favIconUrl) { return null; }
+				const s = await send({ type: "test:state" });
+				return s.favicons && s.favicons[String(ids.C)] == remembered ? s : null;
+			}, 15000);
+		}
+	}
 }
 
 async function phaseThree (ids) {

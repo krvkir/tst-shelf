@@ -47,6 +47,31 @@ export function isFolded (states) {
 }
 
 /**
+ * Favicon stickiness: the shelf icon keeps the last known favicon while
+ * the tab is loading.  Firefox reports no favIconUrl for a navigating or
+ * reloading tab, so a fresh tabs.query carries none — and a naive
+ * re-render blanks the icon until the new page announces its own.
+ * TST's own rows never blank: the background only propagates a favicon
+ * change when the changeInfo explicitly carries favIconUrl, never on
+ * status flips (tabs-update.js), and a row element never lets a null
+ * overwrite its remembered value (`this.favIconUrl =
+ * this._favIconUrl ||= this.raw?.favIconUrl`).  This mirrors that with
+ * a per-session memory threaded through every query: tabs that have a
+ * favicon update the memory, tabs that do not render the remembered
+ * one.  Pure — returns patched tab records (shallow copies, favIconUrl
+ * filled in) plus the updated memory.
+ */
+export function resolveFavicons (tabs, memory) {
+	const next = new Map(memory);
+	const patched = tabs.map(tab => {
+		if (tab.favIconUrl) { next.set(tab.id, tab.favIconUrl); return tab; }
+		const remembered = next.get(tab.id);
+		return remembered ? { ...tab, favIconUrl: remembered, } : tab;
+	});
+	return { tabs: patched, memory: next, };
+}
+
+/**
  * The full derivation of one window.
  * @returns {{
  *   parentIdOf: Map<number, number|null>,

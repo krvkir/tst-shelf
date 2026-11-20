@@ -55,11 +55,15 @@ The extension SHALL NOT change the height or spacing of tab rows outside shelves
 - **THEN** rows of trees without shelves render at their normal height, the same as in a session without the extension
 
 ### Requirement: A shelf icon shows the tab's favicon, title, and URL on hover
-The extension SHALL render each shelved tab's favicon as its icon and SHALL show the tab's title and URL as a tooltip when the pointer hovers over the icon.
+The extension SHALL render each shelved tab's favicon as its icon and SHALL show the tab's title and URL as a tooltip when the pointer hovers over the icon. While the tab reports no favicon, the extension SHALL keep showing the last known favicon.
 
 #### Scenario: Hovering an icon shows the tab's identity
 - **WHEN** the pointer hovers over a shelf icon
 - **THEN** a tooltip shows the shelved tab's title and URL, as tab tooltips do
+
+#### Scenario: The icon keeps the last known favicon while the tab loads
+- **WHEN** a shelved tab navigates to a new page and is loading, before the new page reports a favicon
+- **THEN** its icon keeps showing the favicon of the page the tab had before the navigation
 
 ### Requirement: A shelf icon highlights while its subtree is active
 The extension SHALL highlight a shelf icon's background while the shelved tab itself or any of its descendants is the active tab, using the selected-tab background color of the active TST theme, and SHALL remove the highlight when the active tab leaves the subtree.

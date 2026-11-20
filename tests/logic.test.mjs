@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
-	subtreeSizes, treePositions, nextPlacementMove,
+	subtreeSizes, treePositions, nextPlacementMove, resolveFavicons,
 	ROOT_SHELF,
 } from "../src/background/logic.esm.js";
 
@@ -322,4 +322,43 @@ test("the first shelf needing a move wins across several shelves", () => {
 		sizes: subtreeSizes(tree),
 		shelves,
 	}), { tabId: 4, kind: "move-before", referenceTabId: 8 });
+});
+
+// ---------------------------------------------------------------------------
+// favicon stickiness (the icon keeps the last known favicon while loading)
+
+test("resolveFavicons records tabs that have a favicon", () => {
+	const memory = new Map;
+	const { tabs, memory: next, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/img.png", }], memory);
+	assert.equal(next.get(1), "https://a/img.png");
+	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "no patching needed");
+});
+
+test("a loading tab without a favicon renders the remembered one", () => {
+	const memory = new Map([[1, "https://a/img.png",]]);
+	const { tabs, } = resolveFavicons([{ id: 1, favIconUrl: undefined, }], memory);
+	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "the blank tab carries the remembered favicon");
+	assert.equal(memory.get(1), "https://a/img.png", "the memory is not consumed");
+});
+
+test("a never-seen tab without a favicon stays favicon-less", () => {
+	const { tabs, memory, } = resolveFavicons([{ id: 7, }], new Map);
+	assert.equal("favIconUrl" in tabs[0], false, "no phantom favicon appears");
+	assert.equal(memory.size, 0);
+});
+
+test("the memory follows favicon changes; blanks fall back to the newest one", () => {
+	let { tabs, memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/1.png", }], new Map);
+	assert.equal(memory.get(1), "https://a/1.png");
+	({ tabs, memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://b/2.png", }], memory));
+	assert.equal(memory.get(1), "https://b/2.png", "a new favicon overwrites the memory");
+	({ tabs, memory, } = resolveFavicons([{ id: 1, }], memory));
+	assert.equal(tabs[0].favIconUrl, "https://b/2.png", "a blank falls back to the NEW favicon, not the oldest one");
+});
+
+test("the memory survives across windows' derivations", () => {
+	let { memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/1.png", }], new Map);
+	({ memory, } = resolveFavicons([{ id: 2, favIconUrl: "https://b/2.png", }], memory));
+	const { tabs, } = resolveFavicons([{ id: 1, }], memory);
+	assert.equal(tabs[0].favIconUrl, "https://a/1.png", "entries from other derivations persist");
 });

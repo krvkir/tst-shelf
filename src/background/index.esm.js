@@ -18,7 +18,7 @@
  * live TST light tree + browser.tabs on every structural event.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, ROOT_SHELF } from "./logic.esm.js";
+import { derive, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, ROOT_SHELF } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
 import { SHELF_STYLE } from "./style.esm.js";
 
@@ -28,6 +28,10 @@ const FLAG_KEY = "tst-shelf";
 
 /** @type {Set<number>} tab ids carrying the sticky flag */
 const shelved = new Set;
+/** @type {Map<number, string>} tab id -> last known favicon URL (session
+ * scope): shelf icons keep the old favicon while the tab reloads —
+ * TST's rows do the same (see resolveFavicons in logic.esm.js). */
+let faviconMemory = new Map;
 /** @type {Map<number, {derivation: object, tabsById: Map}>} last derivation per window */
 const windows = new Map;
 /** @type {Map<number, any>} per-window re-derivation timers */
@@ -171,8 +175,14 @@ async function rederive (windowId, { reconcile = false, } = {}) {
 		logBoot("light-tree-fail", `${windowId} ${error && error.message || error}`);
 		return null;
 	});
-	const tabs = await browser.tabs.query({ windowId, });
-	if (!tree || tabs.length == 0) { return; }
+	// favicon stickiness: tabs.query carries no favIconUrl while a tab
+	// is loading or navigating — resolveFavicons fills the blank from
+	// the memory and records every known one (logic.esm.js).
+	const queryTabs = await browser.tabs.query({ windowId, });
+	if (!tree || queryTabs.length == 0) { return; }
+	const resolved = resolveFavicons(queryTabs, faviconMemory);
+	faviconMemory = resolved.memory;
+	const tabs = resolved.tabs;
 	const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
 
 const derivation = derive({ tree, shelved, tabsById, });
@@ -505,6 +515,7 @@ async function restorePreShelvePosition (tab, prev) {
 // 8. tab/window events, pin guard
 
 browser.tabs.onRemoved.addListener(tabId => {
+	faviconMemory.delete(tabId);
 	if (shelved.delete(tabId)) { scheduleRederiveAll(); }
 });
 
@@ -574,23 +585,34 @@ browser.runtime.onMessage.addListener((message, _sender) => {
 		switch (message.type) {
 		case "test:state": {
 			const shelves = {};
-			for (const [windowId, { derivation, }] of windows.entries()) {
+			const favicons = {};
+			for (const [windowId, { derivation, tabsById, }] of windows.entries()) {
 				shelves[windowId] = {
 					shelves: [...derivation.shelves.entries()].map(([owner, members]) => [owner == ROOT_SHELF ? "root" : owner, members]),
 					ghosts: [...derivation.ghostIds],
 					badges: [...derivation.badgeIds],
 					selected: [...derivation.selectedOfShelf.entries()].map(([owner, id]) => [owner == ROOT_SHELF ? "root" : owner, id]),
 				};
+				// the favicon the derivation renders for each member —
+				// the sticky one while the tab is loading (resolveFavicons)
+				for (const id of derivation.shelvedVisible) {
+					const tab = tabsById.get(id);
+					if (tab && tab.favIconUrl) { favicons[String(id)] = tab.favIconUrl; }
+				}
 			}
 			const menuItems = menuTelemetry.items;
 			return {
 				registered: TST.isRegistered, usable: tstUsable,
-				shelved: [...shelved], shelves,
+				shelved: [...shelved], shelves, favicons,
 				menu: { ...menuTelemetry, items: menuItems, },
 			};
 		}
 		case "test:put": return { ok: await putOnShelf(message.tabId), };
 		case "test:take": return { ok: await takeOffShelf(message.tabId), };
+		case "test:navigate": {
+			await browser.tabs.update(message.tabId, { url: message.url, }).catch(() => {});
+			return { ok: true, };
+		}
 		case "test:menu-shown": {
 			// Native menus open only for trusted events (impossible in the
 			// headless rig) — run the menus.onShown visibility logic directly.

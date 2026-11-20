@@ -143,7 +143,7 @@ Marionette's `Addon:Install`, and runs three phases:
    derivation: the restart-persistence proxy (temporary installs
    never survive a real restart; the boot path is identical).
 
-Exit code 0 means every assertion passed (currently 48 across the
+Exit code 0 means every assertion passed (currently 50 across the
 three phases; two consecutive clean runs required before merging).
 `node tests/probe-mexec.mjs` is a standalone probe for Marionette
 `ExecuteScript` semantics on the current Firefox build.
@@ -158,6 +158,14 @@ three phases; two consecutive clean runs required before merging).
   250 ms debounce (tabs-move.js `syncToNativeTabs`). Shelf placement
   plans and derives in the walk order — planning against physical
   indices spun 40 moves into the guard on every put.
+- **Shelf icons keep the last known favicon while their tab reloads**
+  (Firefox reports no `favIconUrl` for a navigating tab; TST's rows
+  are sticky the same way — the background only propagates explicit
+  `favIconUrl` changeInfo, and a row's `_favIconUrl ||= raw.favIconUrl`
+  never lets a null win). The background threads a per-session
+  favicon memory through every `tabs.query` (`resolveFavicons`,
+  logic.esm.js); the diffing renderer then emits an unchanged strap
+  during the load, so the sidebar never drops the style attribute.
 - **base.css:183 pins rows at
   `tab-item:not(.faviconized):not(.dummy)`** — specificity (0,2,1);
   a plain `.tst-shelf-owner` rule never wins the height. Match the
