@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
+	subtreeSizes, treePositions, nextPlacementMove,
 	ROOT_SHELF,
 } from "../src/background/logic.esm.js";
 
@@ -15,7 +16,7 @@ const node = (id, states = [], children = []) => ({ id, states, children });
 
 /** tabs.Tab stand-ins keyed by id. */
 const tabsById = (tabs) => new Map(tabs.map(tab => [tab.id, {
-	index: 0, hidden: false, active: false, pinned: false, ...tab,
+	pos: 0, hidden: false, active: false, pinned: false, ...tab,
 }]));
 
 test("shelved children are assigned to their parent's shelf", () => {
@@ -181,4 +182,144 @@ test("isFolded reads the subtree-collapsed state", () => {
 	assert.equal(isFolded(["collapsed"]), false, "'collapsed' is the per-row state, not the subtree fold");
 	assert.equal(isFolded([]), false);
 	assert.equal(isFolded(undefined), false);
+});
+
+// ---------------------------------------------------------------------------
+// shelf placement (the member block)
+
+/** Rank fixture: array of {id, pos} in TST's internal walk order
+ *  (pinned optional). */
+const ranks = (tabs) => tabs.map(tab => ({ pinned: false, ...tab }));
+
+test("subtreeSizes counts rows plus descendants", () => {
+	const tree = [node(1, [], [node(2, [], [node(3), node(4)]), node(5)]), node(6)];
+	const sizes = subtreeSizes(tree);
+	assert.equal(sizes.get(1), 5);
+	assert.equal(sizes.get(2), 3);
+	assert.equal(sizes.get(3), 1);
+	assert.equal(sizes.get(6), 1);
+});
+
+test("treePositions numbers the pre-order walk", () => {
+	const tree = [node(1, [], [node(2, [], [node(4)]), node(3)]), node(5)];
+	assert.deepEqual([...treePositions(tree).entries()], [
+		[1, 0], [2, 1], [4, 2], [3, 3], [5, 4],
+	]);
+});
+
+test("a laid-out member block needs no moves", () => {
+	// A <- (B shelved, C shelved), C <- (c1); strip: A B C c1 D
+	const tree = [node(1, [], [node(2), node(3, [], [node(4)]), node(5)])];
+	const shelves = new Map([[1, [2, 3]]]);
+	assert.equal(nextPlacementMove({
+		ranks: ranks([{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 3, pos: 2 }, { id: 4, pos: 3 }, { id: 5, pos: 4 }]),
+		sizes: subtreeSizes(tree),
+		shelves,
+	}), null);
+});
+
+test("a scattered member is moved before the tab at its expected slot", () => {
+	// strip: A D C c1 c2 B — members B (idx 5) and C (idx 2): in index
+	// order C moves first, to slot 1 (before D); B follows on the next
+	// iteration, after C's subtree.  Deterministic: members keep their
+	// relative strip order inside the block.
+	const tree = [node(1, [], [node(6), node(3, [], [node(7), node(8)]), node(2)])];
+	const shelves = new Map([[1, [2, 3]]]);
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 1, pos: 0 }, { id: 6, pos: 1 }, { id: 3, pos: 2 },
+			{ id: 7, pos: 3 }, { id: 8, pos: 4 }, { id: 2, pos: 5 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+	}), { tabId: 3, kind: "move-before", referenceTabId: 6 });
+});
+
+test("appendTabId is forced to the shelf end regardless of index", () => {
+	// members B (idx 1) and C (idx 3, freshly put): C must go AFTER B
+	const tree = [node(1, [], [node(2), node(6), node(3)])];
+	const shelves = new Map([[1, [2, 3]]]);
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 6, pos: 2 }, { id: 3, pos: 3 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+		appendTabId: 3,
+	}), { tabId: 3, kind: "move-before", referenceTabId: 6 });
+});
+
+test("the second member slots after the first one's subtree", () => {
+	// B in place (idx 1) with subtree (b1: idx 2); C must go before D (idx 3)
+	const tree = [node(1, [], [node(2, [], [node(5)]), node(3), node(4)])];
+	const shelves = new Map([[1, [2, 3]]]);
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 5, pos: 2 },
+			{ id: 4, pos: 3 }, { id: 3, pos: 4 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+	}), { tabId: 3, kind: "move-before", referenceTabId: 4 });
+});
+
+test("an append past the strip end goes after the previous member, outdenting when it has descendants", () => {
+	// Defensive path: with TST's contiguity invariants a dense strip can
+	// hardly reach this state (the first misplaced member always gets a
+	// move-before first), but a race or a gap must not wedge the loop —
+	// sparse indices exercise it: B in place, its subtree ending at the
+	// last dense index, C stranded beyond the expected slot.
+	const tree = [node(1, [], [node(2, [], [node(5), node(6)]), node(3)])];
+	const shelves = new Map([[1, [2, 3]]]);
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 5, pos: 2 },
+			{ id: 6, pos: 3 }, { id: 3, pos: 7 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+		appendTabId: 3,
+	}), { tabId: 3, kind: "move-after", referenceTabId: 2, thenOutdent: true });
+
+	// same, but B childless: plain move-after re-parents to the owner
+	const tree2 = [node(1, [], [node(2), node(3)])];
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 3, pos: 7 }]),
+		sizes: subtreeSizes(tree2),
+		shelves,
+		appendTabId: 3,
+	}), { tabId: 3, kind: "move-after", referenceTabId: 2, thenOutdent: false });
+});
+
+test("root members slot against the first non-pinned tab", () => {
+	// pinned P (idx 0), root members R1 (idx 2), R2 (idx 3, appended);
+	// root block top = idx 1 (normal tab X sits there)
+	const tree = [node(9), node(1), node(2)];
+	const shelves = new Map([[ROOT_SHELF, [1, 2]]]);
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 99, pos: 0, pinned: true }, { id: 9, pos: 1 },
+			{ id: 1, pos: 2 }, { id: 2, pos: 3 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+		appendTabId: 2,
+	}), { tabId: 1, kind: "move-before", referenceTabId: 9 });
+});
+
+test("the first shelf needing a move wins across several shelves", () => {
+	const tree = [
+		node(1, [], [node(2), node(7)]),
+		node(3, [], [node(4), node(8)]),
+	];
+	const shelves = new Map([[1, [2]], [3, [4]]]);
+	// shelf 1 laid out (B at 1); shelf 3's member at idx 3, slot = 2 (tab 8)
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 3, pos: 2 },
+			{ id: 8, pos: 3 }, { id: 4, pos: 4 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+	}), { tabId: 4, kind: "move-before", referenceTabId: 8 });
 });

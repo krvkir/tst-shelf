@@ -207,6 +207,7 @@ async function phaseOneAndTwo () {
 			owner: ids.A, members: [ids.B, ids.C], rootMember: ids.E,
 			children: [ids.c1, ids.c2],
 			clickFirst: ids.C, clickSecond: ids.B,
+			plain: ids.D,
 		},
 		results,
 	}, "tst-shelf-e2e-setup.json");

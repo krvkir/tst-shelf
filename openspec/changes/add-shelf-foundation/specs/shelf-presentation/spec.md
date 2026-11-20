@@ -1,11 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: A tab's shelf reserves horizontal space directly under its owner's row
-The extension SHALL reserve a horizontal space directly below the shelf owner's tab row, spanning the tab row width, and SHALL render shelved tabs only inside that space, between the owner's row and the owner's following children rows.
+The extension SHALL reserve a horizontal space directly below the shelf owner's tab row, spanning the tab row width, growing the owner's row downward by the strap's height, and SHALL render shelved tabs only inside that space, between the owner's row and the owner's following children rows.
 
 #### Scenario: The shelf appears between the owner and its other children
 - **WHEN** a tab is put on the shelf of a parent whose shelf is empty
-- **THEN** a one-icon-row space appears directly under the owner's row
+- **THEN** a one-icon-row space appears directly under the owner's row, extending the owner's row height, without squeezing the owner's caption line
 - **AND** the owner's other children rows follow below that space
 
 ### Requirement: The root shelf renders as a fixed strap at the top of the tab bar
@@ -38,6 +38,10 @@ The extension SHALL render each shelved tab as a favicon icon of the same size a
 #### Scenario: Icon order follows tab order
 - **WHEN** shelved tabs are read left to right, top to bottom on the shelf
 - **THEN** their order matches the order of the same tabs among the owner's children in the tree
+
+#### Scenario: A newly shelved tab becomes the rightmost icon
+- **WHEN** the user puts a tab on a shelf that already holds icons
+- **THEN** the new tab's icon appears at the right end of the shelf, after every earlier member
 
 ### Requirement: The rest of the tree keeps its normal compact layout
 The extension SHALL NOT change the height or spacing of tab rows outside shelves: rows of tabs that are not shelf owners SHALL keep their normal size regardless of how many shelves exist and how tall they are.

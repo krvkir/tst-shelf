@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "TST Shelf",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Shelves for Tree Style Tab: put constant tabs of a project on a favicon strap under their parent, fold their subtrees until selected.",
 	"browser_specific_settings": {
 		"gecko": {

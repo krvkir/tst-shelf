@@ -316,3 +316,53 @@ too:
   started on button/select/scrollbar targets) and re-enables
   `pointer-events` on `::part(shelf-icon)` (the below container is
   `pointer-events: none`).
+
+## Implementation notes (2026-11-22, the v0.1.1 layout fixes)
+
+Three user-reported layout bugs and the mechanics they forced:
+
+- **Bug 1 (strap sharing the owner's line).** base.css:183 pins rows
+  at `tab-item:not(.faviconized):not(.dummy)` — specificity (0,2,1)
+  with two pseudo-classes; a plain `tab-item.tst-shelf-owner` rule
+  (0,1,1) never wins. And `tab-item-substance` is a ROW flex
+  (base.css:527), so the in-flow below container rendered BESIDE the
+  caption. Fix: match the pseudo-class chain with `!important`, make
+  the substance `flex-wrap: wrap`, and give the below container
+  `flex-basis: 100%; order: 2` so the strap breaks onto a second
+  line that grows the row.
+- **Bugs 2+3 (subtree dangling below the owner's subtree; new member
+  at the wrong end).** Members must sit contiguous directly under
+  their owner so the selected member's children render right below
+  the strap and the newest member is the rightmost icon. Rows cannot
+  be reordered (TST renders them), so members are physically moved
+  among their siblings through TST's own subtree-preserving move API
+  — `move-before` / `move-after` (plus `outdent` for one window-end
+  corner) with `followChildren: true`. References are chosen so
+  TST's position-derived re-parenting (`calculateReferenceItemsFrom
+  InsertionPosition`, context MOVED) always resolves to the shelf
+  owner: insert before the tab currently occupying the expected
+  slot, never before a tab outside the owner's children.
+- **TST has THREE tab orders, and they disagree for ~250 ms after
+  every internal move.** (1) The physical strip
+  (`browser.tabs.query` indices). (2) TST's internal index order
+  (`win.order`, spliced on reindex). (3) The children-array walk —
+  what `get-light-tree` returns and what the SIDEBAR RENDERS.
+  Without `doNotOptimize`, move-before updates (2)+(3)
+  synchronously but defers the physical move by a 250 ms debounce
+  (`syncToNativeTabs`, tabs-move.js). Planning against (1) spins on
+  stale snapshots — the first E2E of this change looped 40 moves
+  into the guard on every put. The planner and the derivation now
+  think in (3): the walk is what the user sees, and our moves
+  re-sort the children arrays anyway (reindex →
+  `sortAndInvalidateChildren`), so all three orders converge to the
+  block layout.
+- **Placement loops are per-window serialized and bounded** (40
+  steps, then a logged bail-out that also drops the pending-append);
+  `pendingAppend` is re-read every iteration so a mid-loop put is
+  honored, and take-off restores the stored pre-shelve strip index
+  best-effort (same-window only) via the same move-before reference
+  trick.
+- **The E2E now asserts geometry, not just presence**: the owner row
+  is measurably taller than a plain row (the second line), the
+  selected member's children render ABOVE the owner's following
+  non-member child, and the re-put member is the rightmost icon.

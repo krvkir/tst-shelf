@@ -25,12 +25,21 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
   on shelf-less tabs (their shelf auto-creates), re-parenting and
   window moves re-derive the target shelf; only the explicit
   "Take off the shelf" action ends shelving.
-- **Shelves render as favicon straps** under the owner's row (TST
-  extra contents, place `tab-below`); shelved root tabs go on the
+- **Shelves render as favicon straps on a SECOND line of the owner's
+  row** (TST extra contents, place `tab-below`; the owner row grows —
+  the caption line is never squeezed); shelved root tabs go on the
   root shelf, a fixed strap at the top of the tab bar (TST renders
   `tabbar-top` above the global pinned box — the below-pinned
   placement needs an upstream TST slot; recorded in the openspec
-  design). Icons wrap into more rows when they do not fit.
+  design). Icons wrap into more rows when they do not fit, and a
+  newly shelved tab becomes the rightmost icon.
+- **Members stay contiguous directly under their owner**, so the
+  selected member's children dangle right below the strap instead of
+  below the owner's whole subtree. Placement uses TST's own
+  subtree-preserving move API (`move-before`/`move-after` with
+  `followChildren`) — tree relations never change, non-member tabs
+  keep their relative order, and take-off returns the tab to the
+  position it had before shelving.
 - **Icons carry the tab's tooltip** (title and URL), its favicon, a
   plus badge while the member's subtree is folded, and a highlight
   while the member or one of its descendants is active. Right-click
@@ -134,13 +143,28 @@ Marionette's `Addon:Install`, and runs three phases:
    derivation: the restart-persistence proxy (temporary installs
    never survive a real restart; the boot path is identical).
 
-Exit code 0 means every assertion passed (currently 45 across the
+Exit code 0 means every assertion passed (currently 48 across the
 three phases; two consecutive clean runs required before merging).
 `node tests/probe-mexec.mjs` is a standalone probe for Marionette
 `ExecuteScript` semantics on the current Firefox build.
 
 ## Implementation notes (verified against TST 4.4.10 sources)
 
+- **TST has three tab orders that disagree for ~250 ms after every
+  internal move**: the physical strip, TST's internal index order,
+  and the children-array walk that `get-light-tree` returns and the
+  sidebar RENDERS. Without `doNotOptimize`, `move-before` updates the
+  internal orders synchronously but defers the physical move by a
+  250 ms debounce (tabs-move.js `syncToNativeTabs`). Shelf placement
+  plans and derives in the walk order — planning against physical
+  indices spun 40 moves into the guard on every put.
+- **base.css:183 pins rows at
+  `tab-item:not(.faviconized):not(.dummy)`** — specificity (0,2,1);
+  a plain `.tst-shelf-owner` rule never wins the height. Match the
+  pseudo-class chain, force with `!important`, and remember
+  `tab-item-substance` is a ROW flex: the below container needs
+  `flex-basis: 100%` + substance `flex-wrap: wrap` to become a
+  second line.
 - **The only stored state is the sticky flag** (`tst-shelf` session
   value). Shelf membership, ghosts, badges, highlight and selection
   are derived from TST's light tree + `browser.tabs` on every

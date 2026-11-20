@@ -31,10 +31,27 @@ export const SHELF_STYLE = `
   display: none !important;
 }
 
-/* 2. A shelf owner row grows to fit its strap, keeps the normal minimum. */
-tab-item.tst-shelf-owner {
-  height: auto;
+/* 2. A shelf owner row grows to fit its strap on a SECOND line.
+     base.css:183 pins rows at the chain tab-item:not(.faviconized):not(.dummy)
+     (specificity 0,2,1) and stretches tab-item-substance (a ROW flex,
+     base.css:527) to 100 percent — a plain tab-item.tst-shelf-owner rule
+     (0,1,1) never won, and the in-flow below container rendered BESIDE
+     the title, sharing the single line.  Match the pseudo-class chain,
+     force the height, and make the substance wrap so the full-basis
+     below container breaks onto its own line. */
+tab-item.tst-shelf-owner:not(.faviconized):not(.dummy) {
+  height: auto !important;
   min-height: var(--tab-size);
+}
+tab-item.tst-shelf-owner:not(.faviconized):not(.dummy) tab-item-substance {
+  height: auto !important;
+  flex-wrap: wrap;
+  align-content: flex-start;
+}
+tab-item.tst-shelf-owner:not(.faviconized):not(.dummy) tab-item-substance .extra-items-container.below {
+  flex-basis: 100%;
+  order: 2;
+  overflow: visible;
 }
 
 /* 3. A shelved row disappears exactly the way TST collapses rows:
@@ -50,9 +67,23 @@ tab-item.tst-shelf-shelved:not(.tst-shelf-ghost) {
 /* 3b. A ghost row: a shelved tab anchoring a visible nested shelf —
      caption gone, only its own strap remains, at its tree indent. */
 tab-item.tst-shelf-ghost {
-  height: auto;
-  min-height: 0;
   visibility: visible;
+}
+/* Ghost rows must also beat the base.css:183 height chain, and their
+   strap must own the full row width (the caption parts are hidden). */
+tab-item.tst-shelf-ghost:not(.faviconized):not(.dummy) {
+  height: auto !important;
+  min-height: 0 !important;
+}
+tab-item.tst-shelf-ghost:not(.faviconized):not(.dummy) tab-item-substance {
+  height: auto !important;
+  min-height: 0;
+  flex-wrap: wrap;
+  align-content: flex-start;
+}
+tab-item.tst-shelf-ghost:not(.faviconized):not(.dummy) tab-item-substance .extra-items-container.below {
+  flex-basis: 100%;
+  overflow: visible;
 }
 tab-item.tst-shelf-ghost tab-twisty,
 tab-item.tst-shelf-ghost tab-favicon,

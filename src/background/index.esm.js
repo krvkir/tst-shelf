@@ -18,7 +18,7 @@
  * live TST light tree + browser.tabs on every structural event.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, straysToCollapse, ROOT_SHELF } from "./logic.esm.js";
+import { derive, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, ROOT_SHELF } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
 import { SHELF_STYLE } from "./style.esm.js";
 
@@ -92,6 +92,7 @@ const TST = tstApi({
 		"add-tab-state", "remove-tab-state",
 		"collapse-tree", "expand-tree",
 		"set-extra-contents", "clear-extra-contents",
+		"move-before", "move-after", "outdent",
 		"scroll",
 	],
 	events: {
@@ -174,9 +175,10 @@ async function rederive (windowId, { reconcile = false, } = {}) {
 	if (!tree || tabs.length == 0) { return; }
 	const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
 
-	const derivation = derive({ tree, shelved, tabsById, });
+const derivation = derive({ tree, shelved, tabsById, });
 	windows.set(windowId, { derivation, tabsById, });
 	await renderer.applyDerivation({ windowId, derivation, tabsById, });
+	await reconcilePlacement(windowId, { tree, tabsById, shelves: derivation.shelves, });
 
 	if (reconcile) {
 		// boot reconciliation: one selected member per shelf (spec
@@ -193,6 +195,74 @@ async function rederive (windowId, { reconcile = false, } = {}) {
 function onTreeMutated (windowId) {
 	if (!tstUsable || windowId == null) { return; }
 	scheduleRederive(windowId);
+}
+
+// ---------------------------------------------------------------------------
+// 3b. shelf placement (the member block)
+//
+// Members of a shelf are kept CONTIGUOUS directly under their owner
+// (root shelf: at the top of the root tabs), in shelving order with the
+// newest last — so the selected member's children always render right
+// below the strap and a newly shelved tab becomes the rightmost icon.
+// Applied through TST's own move-before/move-after/outdent with
+// followChildren: TST moves the member's whole subtree and re-derives
+// the member's parent from the landing position; the planner's
+// references are chosen so that parent is always the shelf owner
+// (nextPlacementMove doc, logic.esm.js).  One move per iteration with a
+// fresh derivation in between — indices shift with every move.
+
+/** windowId -> tabId just put on a shelf here (append order). */
+const pendingAppend = new Map;
+/** windowIds with a running placement loop (one at a time per window). */
+const placing = new Set;
+
+async function reconcilePlacement (windowId, { tree = null, tabsById = null, shelves = null, } = {}) {
+	if (!tstUsable || placing.has(windowId)) { return; }
+	placing.add(windowId);
+	try {
+		let steps = 0;
+		while (steps++ < 40) {
+			const appendTabId = pendingAppend.get(windowId) ?? null;
+			if (!tree || !tabsById) {
+				tree = await TST.methods.getLightTree({ windowId, }).catch(error => {
+					logBoot("light-tree-fail", `${windowId} ${error && error.message || error}`);
+					return null;
+				});
+				const tabs = await browser.tabs.query({ windowId, }).catch(() => []);
+				if (!tree || tabs.length == 0) { pendingAppend.delete(windowId); return; }
+				tabsById = new Map(tabs.map(tab => [tab.id, tab]));
+				shelves = derive({ tree, shelved, tabsById, }).shelves;
+			}
+			// ranks in TST's INTERNAL order: move-before/move-after update
+			// it synchronously, while the physical strip catches up only
+			// after TST's deferred 250 ms sync (tabs-move.js) — planning
+			// against physical indices spins on stale snapshots.
+			const positions = treePositions(tree);
+			const ranks = [...tabsById.values()].map(tab => ({
+				id: tab.id,
+				pos: positions.get(tab.id) ?? Number.MAX_SAFE_INTEGER,
+				pinned: !!tab.pinned,
+			}));
+			const move = nextPlacementMove({ ranks, sizes: subtreeSizes(tree), shelves, appendTabId, });
+			if (!move) { pendingAppend.delete(windowId); return; }
+			const sent = move.kind == "move-before"
+				? TST.methods.moveBefore({ tab: move.tabId, windowId, referenceTabId: move.referenceTabId, followChildren: true, })
+				: TST.methods.moveAfter({ tab: move.tabId, windowId, referenceTabId: move.referenceTabId, followChildren: true, })
+					.then(move.thenOutdent
+						? () => TST.methods.outdent({ tab: move.tabId, windowId, followChildren: true, })
+						: null);
+			const ok = await sent.catch(error => {
+				logBoot("placement-fail", `${move.kind} ${move.tabId} ${error && error.message || error}`);
+				return false;
+			});
+			if (ok === false) { pendingAppend.delete(windowId); return; }
+			logBoot("placement", `${move.kind} tab ${move.tabId} ref ${move.referenceTabId}`);
+			tree = null; tabsById = null; shelves = null;
+		}
+		logBoot("placement-guard", `window ${windowId} steps ${steps}`);
+		pendingAppend.delete(windowId);
+	}
+	finally { placing.delete(windowId); }
 }
 
 /** tabs-rendered: rows were (re)rendered — restore their straps. */
@@ -383,8 +453,17 @@ async function onTryScrollToActivatedTab (message) {
 async function putOnShelf (tabId) {
 	const tab = await browser.tabs.get(tabId).catch(() => null);
 	if (!tab || tab.pinned || tab.incognito) { return false; }
-	await browser.sessions.setTabValue(tabId, FLAG_KEY, { on: true, }).catch(() => {});
+	// The pre-shelve position, captured BEFORE the placement move: the
+	// member block will relocate the tab, take-off restores it.  A tab
+	// that re-enters shelving (take + put again) stores a fresh one; a
+	// shelf-to-shelf drag keeps the original.
+	const existing = await browser.sessions.getTabValue(tabId, FLAG_KEY).catch(() => null);
+	const prev = existing && existing.prev
+		? existing.prev
+		: { windowId: tab.windowId, index: tab.index, };
+	await browser.sessions.setTabValue(tabId, FLAG_KEY, { on: true, prev, }).catch(() => {});
 	shelved.add(tabId);
+	pendingAppend.set(tab.windowId, tabId);
 	// fold the subtree under TST's own collapse: the confirmation dialog,
 	// the twisty state and restart persistence all come for free.
 	// windowId is load-bearing (see applyTabStates).
@@ -395,12 +474,31 @@ async function putOnShelf (tabId) {
 }
 
 async function takeOffShelf (tabId) {
+	const stored = await browser.sessions.getTabValue(tabId, FLAG_KEY).catch(() => null);
 	await browser.sessions.removeTabValue(tabId, FLAG_KEY).catch(() => {});
 	shelved.delete(tabId);
 	const tab = await browser.tabs.get(tabId).catch(() => null);
-	if (tab) { scheduleRederive(tab.windowId); }
+	if (tab) {
+		await restorePreShelvePosition(tab, stored && stored.prev);
+		scheduleRederive(tab.windowId);
+	}
 	logBoot("take", `tab ${tabId}`);
 	return true;
+}
+
+/** Return the tab to the strip position it had before it was shelved
+ *  (spec shelf-pinning): move-before the tab now occupying that index —
+ *  best effort, only when the tab still lives in the same window. */
+async function restorePreShelvePosition (tab, prev) {
+	if (!prev || prev.windowId != tab.windowId) { return; }
+	const tabs = await browser.tabs.query({ windowId: tab.windowId, }).catch(() => []);
+	if (!tabs.length) { return; }
+	const sorted = tabs.slice().sort((a, b) => a.index - b.index);
+	const index = Math.max(0, Math.min(prev.index, sorted.length - 1));
+	const ref = sorted.find(t => t.index === index) || sorted[sorted.length - 1];
+	if (!ref || ref.id === tab.id) { return; }
+	await TST.methods.moveBefore({ tab: tab.id, windowId: tab.windowId, referenceTabId: ref.id, followChildren: true, })
+		.catch(error => logBoot("restore-fail", `${tab.id} ${error && error.message || error}`));
 }
 
 // ---------------------------------------------------------------------------

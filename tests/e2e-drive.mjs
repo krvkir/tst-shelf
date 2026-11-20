@@ -170,9 +170,12 @@ const sidebarScript = String.raw`
 	const flat = [];
 	const icons = [];
 	for (const row of document.querySelectorAll("tab-item[data-tab-id]")) {
+		const rect = row.getBoundingClientRect();
 		const info = {
 			id: row.dataset.tabId,
 			classes: [...row.classList],
+			top: rect.top,
+			height: rect.height,
 		};
 		// tab-item itself has NO shadow root: the extra-items spans are
 		// light-DOM children (inside tab-item-substance), and each span
@@ -228,18 +231,20 @@ const sidebarScript = String.raw`
 	});
 `;
 
-/** Visibility probe for the selected shelved tab's children rows. */
+/** Visibility probe for the selected shelved tab's children rows, plus
+ *  the plain sibling for the dangle-position check (bug 2). */
 const visibilityScript = String.raw`
 	const rowOf = id => document.querySelector('tab-item[data-tab-id="' + id + '"]');
 	const probe = id => {
 		const row = rowOf(id);
 		return {
 			exists: !!row,
+			top: row ? row.getBoundingClientRect().top : -1,
 			height: row ? row.getBoundingClientRect().height : -1,
 			classes: row ? [...row.classList].join(",") : "",
 		};
 	};
-	return JSON.stringify({ c1: probe(arguments[0]), c2: probe(arguments[1]), });
+	return JSON.stringify({ c1: probe(arguments[0]), c2: probe(arguments[1]), plain: probe(arguments[2]), });
 `;
 
 /** Model probe: dumps every tab's states from the TST background. */
@@ -339,6 +344,11 @@ async function main () {
 						await commandTry(marionette, "WebDriver:SwitchToWindow", ["Marionette:SwitchToWindow"], { handle, });
 					}
 					await commandTry(marionette, "WebDriver:Navigate", ["Marionette:GetURL"], { url: pageUrl, });
+				// A tall window keeps every row inside TST's virtual-scroll
+				// render range; a short headless viewport legitimately skips
+				// off-screen rows (exists: false), which is TST working as
+				// designed, not a shelf bug.
+				await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 900, }).catch(() => {});
 				} catch (error) {
 					console.log(`[drive] phase 2 navigation failed: ${error.message}`);
 				}
@@ -375,6 +385,32 @@ async function main () {
 					} else {
 						console.log("FAIL [driver] owner row carries the tst-shelf-owner class");
 						process.exitCode = process.exitCode || 1;
+					}
+
+					// bug 1: the strap must EXTEND the owner row (a second
+					// line), not share it — measured against the plain sibling.
+					{
+						const ownerRow = dump.rows.find(row => row.id == String(e.owner));
+						const plainRow = dump.rows.find(row => row.id == String(e.plain));
+						if (ownerRow && plainRow && ownerRow.height > plainRow.height + 20) {
+							console.log(`PASS [driver] the strap extends the owner row to a second line (owner=${ownerRow.height.toFixed(1)} plain=${plainRow.height.toFixed(1)})`);
+						} else {
+							console.log(`FAIL [driver] the strap extends the owner row to a second line (owner=${ownerRow && ownerRow.height} plain=${plainRow && plainRow.height})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+
+					// bug 3: the re-put member (B, the newest put) is the
+					// RIGHTMOST icon; C kept its earlier block slot.
+					{
+						const order = (dump.icons || []).map(icon => icon.id);
+						const expected = [String(e.members[1]), String(e.members[0])];
+						if (JSON.stringify(order) == JSON.stringify(expected)) {
+							console.log(`PASS [driver] the newest member is the rightmost icon (${order.join(",")})`);
+						} else {
+							console.log(`FAIL [driver] the newest member is the rightmost icon (got ${order.join(",")})`);
+							process.exitCode = process.exitCode || 1;
+						}
 					}
 
 					if (dump.rows.find(row => row.id == String(e.members[0]) && row.classes.includes("tst-shelf-shelved"))) {
@@ -439,7 +475,7 @@ async function main () {
 					for (let i = 0; i < 10 && !(visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0); i++) {
 						const afterFirst = await marionette.command("WebDriver:ExecuteScript", {
 							script: visibilityScript,
-							args: [e.children[0], e.children[1],], newSandbox: false,
+							args: [e.children[0], e.children[1], e.plain,], newSandbox: false,
 						}).catch(error => { console.log(`[drive] visibility probe failed: ${error.message}`); return null; });
 						visibleInfo = afterFirst && afterFirst.value ? JSON.parse(afterFirst.value) : null;
 						if (visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0) { break; }
@@ -449,6 +485,20 @@ async function main () {
 						console.log("PASS [driver] the selected shelved tab's children render below the shelf");
 					} else {
 						console.log(`FAIL [driver] the selected shelved tab's children render below the shelf ${JSON.stringify(visibleInfo)}`);
+						process.exitCode = process.exitCode || 1;
+					}
+
+					// bug 2: the children dangle from the SHELF — above the
+					// plain sibling that follows the member block, not below
+					// it.  Rows must EXIST (a missing row would make the
+					// top comparison vacuously true).
+					if (visibleInfo && visibleInfo.c1.exists && visibleInfo.c1.height > 0
+						&& visibleInfo.c2.exists && visibleInfo.c2.height > 0
+						&& visibleInfo.plain && visibleInfo.plain.height > 0
+						&& visibleInfo.c1.top < visibleInfo.plain.top && visibleInfo.c2.top < visibleInfo.plain.top) {
+						console.log("PASS [driver] the selected member's subtree dangles from the shelf, above the following siblings");
+					} else {
+						console.log(`FAIL [driver] the selected member's subtree dangles from the shelf, above the following siblings ${JSON.stringify(visibleInfo && { c1: visibleInfo.c1, c2: visibleInfo.c2, plain: visibleInfo.plain && visibleInfo.plain.top })}`);
 						process.exitCode = process.exitCode || 1;
 					}
 

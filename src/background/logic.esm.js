@@ -62,6 +62,11 @@ export function isFolded (states) {
  */
 export function derive ({ tree, shelved, tabsById, }) {
 	const { parentIdOf, hasChildIds, foldedIds, } = indexTree(tree);
+	// Member order = the TREE WALK order (treePositions), the order the
+	// TST sidebar renders rows in.  Physical browser.tabs indices lag
+	// every move by TST's deferred sync (tabs-move.js, ~250 ms), and the
+	// strap must agree with the rendered rows, not with the stale strip.
+	const positions = treePositions(tree);
 
 	const tabOf = id => tabsById.get(id) || { id, hidden: true, active: false, index: Number.MAX_SAFE_INTEGER, };
 	const visible = id => {
@@ -70,7 +75,7 @@ export function derive ({ tree, shelved, tabsById, }) {
 	};
 
 	// shelves: group every VISIBLE shelved tab under its derived owner
-	// (parent tab, or ROOT_SHELF for root tabs), in native tab order.
+	// (parent tab, or ROOT_SHELF for root tabs), in rendered order.
 	const shelves = new Map;
 	const shelfOf = new Map;
 	const shelvedVisible = [];
@@ -83,12 +88,12 @@ export function derive ({ tree, shelved, tabsById, }) {
 		members.push(id);
 		shelves.set(owner, members);
 	}
-	const byIndex = (a, b) => tabOf(a).index - tabOf(b).index;
+	const byPosition = (a, b) => (positions.get(a) ?? Number.MAX_SAFE_INTEGER) - (positions.get(b) ?? Number.MAX_SAFE_INTEGER);
 	for (const [owner, members] of shelves) {
-		members.sort(byIndex);
+		members.sort(byPosition);
 		shelves.set(owner, members);
 	}
-	shelvedVisible.sort(byIndex);
+	shelvedVisible.sort(byPosition);
 
 	const ownerIds = new Set(shelves.keys());
 
@@ -183,4 +188,121 @@ export function ownersAffectedByActivation ({ fromId, toId, parentIdOf }) {
 		}
 	}
 	return [...owners];
+}
+
+/**
+ * Subtree sizes of the light tree (member row + all descendants).
+ * @returns {Map<number, number>} id -> node count of its subtree
+ */
+export function subtreeSizes (tree) {
+	const sizes = new Map;
+	(function walk (nodes) {
+		let total = 0;
+		for (const node of nodes || []) {
+			const size = 1 + walk(node.children || []);
+			sizes.set(node.id, size);
+			total += size;
+		}
+		return total;
+	})(tree);
+	return sizes;
+}
+
+/**
+ * Pre-order walk positions of the light tree: TST's INTERNAL tab order.
+ * TST updates this order synchronously inside move-before/move-after,
+ * while the PHYSICAL strip (browser.tabs.query indices) catches up only
+ * after the deferred sync (tabs-move.js syncToNativeTabs — a 250 ms
+ * debounce per window).  Placement planning MUST run in this internal
+ * space: planning against physical indices spins on stale snapshots
+ * until the debounce lands (the move-storm bug, design.md).
+ * @returns {Map<number, number>} id -> walk position
+ */
+export function treePositions (tree) {
+	const positions = new Map;
+	(function walk (nodes) {
+		for (const node of nodes || []) {
+			positions.set(node.id, positions.size);
+			walk(node.children);
+		}
+	})(tree);
+	return positions;
+}
+
+/**
+ * The single next move that makes every shelf's members contiguous
+ * directly under their owner, newest member last (spec
+ * shelf-nesting/shelf-presentation: the selected member's children
+ * render directly below the strap; a tab put on the shelf becomes the
+ * rightmost icon).  Non-member tabs never change their relative order.
+ *
+ * Ranks are positions in TST's INTERNAL order (treePositions), not
+ * physical strip indices.  Returns ONE move per call — positions shift
+ * with every applied move, so the caller re-derives between
+ * applications (bounded, per-window-serialized fixpoint loop).
+ *
+ * Move kinds (applied via TST's move-before/move-after/outdent with
+ * followChildren: TST moves the member's whole subtree and re-derives
+ * the member's parent from the position; the references below are
+ * chosen so that parent is provably the shelf owner):
+ *   {tabId, kind: 'move-before', referenceTabId} — insert before the
+ *     tab currently occupying the expected slot;
+ *   {tabId, kind: 'move-after', referenceTabId, thenOutdent} — the
+ *     expected slot is past the end: after the previous member, with
+ *     an outdent when that member has descendants (positioning after
+ *     its subtree).  Defensive: unreachable under TST's contiguity
+ *     invariants with a dense strip, kept as a failsafe.
+ *
+ * `appendTabId` forces that member to the END of its shelf regardless
+ * of its current rank (put order; drags keep rank order).
+ * @returns {null|{tabId: number, kind: string, referenceTabId: number, thenOutdent?: boolean}}
+ */
+export function nextPlacementMove ({ ranks, sizes, shelves, appendTabId = null, }) {
+	const sorted = [...ranks].sort((a, b) => a.pos - b.pos);
+	const rankOf = new Map(sorted.map(rank => [rank.id, rank]));
+	const rankAt = pos => sorted.find(rank => rank.pos === pos) || null;
+	for (const [owner, members] of shelves) {
+		const ordered = members
+			.filter(id => rankOf.has(id) && !rankOf.get(id).pinned)
+			.sort((a, b) => rankOf.get(a).pos - rankOf.get(b).pos);
+		if (appendTabId != null && ordered.includes(appendTabId)) {
+			ordered.splice(ordered.indexOf(appendTabId), 1);
+			ordered.push(appendTabId);
+		}
+		const ownerRank = owner === ROOT_SHELF ? null : rankOf.get(owner);
+		if (owner !== ROOT_SHELF && !ownerRank) { continue; }
+		let expected = owner === ROOT_SHELF ? firstNormalPos(sorted) : ownerRank.pos + 1;
+		let prev = null;
+		for (const id of ordered) {
+			const rank = rankOf.get(id);
+			if (rank.pos === expected) {
+				expected += sizes.get(id) ?? 1;
+				prev = id;
+				continue;
+			}
+			const ref = rankAt(expected);
+			if (ref) { return { tabId: id, kind: "move-before", referenceTabId: ref.id, }; }
+			// past the end: append after the previous member; when it has
+			// descendants, move-after parents us to it — outdent then
+			// re-attaches to the owner after its subtree.
+			if (prev != null) {
+				return {
+					tabId: id,
+					kind: "move-after",
+					referenceTabId: prev,
+					thenOutdent: (sizes.get(prev) ?? 1) > 1,
+				};
+			}
+			return null; // no reference exists; nothing safe to do here
+		}
+	}
+	return null;
+}
+
+/** Walk position of the first non-pinned rank (the root block's top). */
+function firstNormalPos (sortedRanks) {
+	for (const rank of sortedRanks) {
+		if (!rank.pinned) { return rank.pos; }
+	}
+	return 0;
 }

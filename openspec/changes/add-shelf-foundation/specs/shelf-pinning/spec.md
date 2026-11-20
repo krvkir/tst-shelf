@@ -12,7 +12,7 @@ The extension SHALL add a "Put on shelf" item to the Tree Style Tab tab context 
 - **THEN** the menu contains "Take off the shelf" and no "Put on shelf"
 
 ### Requirement: Putting a tab on the shelf removes its row and shows its favicon on the target shelf
-The extension SHALL, when the user puts a tab on the shelf, remove that tab's row from the sidebar tree and render the tab as a favicon icon on the shelf of the tab's parent tab, or on the root shelf when the tab has no parent. The tab SHALL keep its position and state as a regular tab in the native tab bar.
+The extension SHALL, when the user puts a tab on the shelf, remove that tab's row from the sidebar tree and render the tab as a favicon icon on the shelf of the tab's parent tab, or on the root shelf when the tab has no parent. The tab SHALL stay a regular tab in the native tab bar with unchanged tree relations; its sibling position may be normalized into the owner's member block (see "Shelving keeps the tree structure and reorders only shelf members among their siblings").
 
 #### Scenario: A child tab lands on its parent's shelf
 - **WHEN** the user puts a tab that has a parent tab on the shelf
@@ -29,24 +29,29 @@ The extension SHALL, when the user puts a tab on the shelf, remove that tab's ro
 - **THEN** the tab's row disappears and its icon appears on the target shelf
 - **AND** its child tabs' rows stay hidden in the tree (they unfold only when the shelved tab is selected)
 
-### Requirement: Shelving never changes the tree structure or tab order
-The extension SHALL NOT move, reorder, detach, or close any tab as part of shelving, unshelving, or shelf bookkeeping; TST's tree data and the native tab order SHALL remain exactly what they would be without the extension.
+### Requirement: Shelving keeps the tree structure and reorders only shelf members among their siblings
+The extension SHALL NOT change the parent-child relations of any tab: TST's tree data and every tab's native tree relations SHALL remain exactly what they would be without the extension. The extension SHALL keep the members of every shelf contiguous among their owner's children, directly after the owner (root shelf: at the top of the root tabs), newest member last; when a member is out of place, the extension SHALL move it among its siblings via Tree Style Tab's own subtree-preserving move API, leaving the relative order of all non-member tabs unchanged.
 
-#### Scenario: The native tab bar is unchanged by shelving
-- **WHEN** the user puts a tab on the parent's shelf
-- **THEN** every tab keeps its native position and tree relations, and the shelved tab shows as a regular tab in the native tab bar
+#### Scenario: A member is normalized into the block without disturbing others
+- **WHEN** a shelved member sits below non-member siblings of its owner
+- **THEN** the member moves to the end of the member block, directly under the owner, with its subtree following it
+- **AND** the non-member siblings keep their relative order and their children
+
+#### Scenario: A member keeps its parent through the placement move
+- **WHEN** the extension repositions a shelved member
+- **THEN** the member stays a child of the same owner, and its descendants stay its children
 
 #### Scenario: A tree operation on the shelved tab behaves as on a regular tab
 - **WHEN** the user closes, reloads, bookmarks, or otherwise acts on a shelved tab through its context menu or the native tab bar
 - **THEN** the operation has exactly its regular effect on the tab, with no shelf-specific differences besides the sidebar row
 
 ### Requirement: Taking a tab off the shelf restores its row in the tree
-The extension SHALL, when the user takes a shelved tab off the shelf, remove the tab's icon from its shelf and show the tab's row in the sidebar tree as a regular row at its current position in the tree.
+The extension SHALL, when the user takes a shelved tab off the shelf, remove the tab's icon from its shelf and show the tab's row in the sidebar tree as a regular row, restoring the strip position the tab had before it was shelved when the tab still lives in the same window; otherwise the row appears at the tab's current position.
 
-#### Scenario: Taking a tab off the shelf brings the row back
+#### Scenario: Taking a tab off the shelf brings the row back where it was
 - **WHEN** the user chooses "Take off the shelf" on a shelved tab
 - **THEN** the tab's icon disappears from the shelf
-- **AND** the tab's row reappears in the tree at its current position
+- **AND** the tab's row reappears in the tree near the position it had before it was shelved, with its subtree following it
 
 #### Scenario: The last icon removed closes the shelf space
 - **WHEN** the user takes the only tab of a shelf off the shelf

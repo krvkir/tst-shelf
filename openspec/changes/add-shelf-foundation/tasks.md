@@ -148,6 +148,22 @@
   shelved rows; if mispredictions appear, switch owner rows to
   quantized height state classes (`tst-shelf-owner-rows-1..N`).
 
+## 7b. v0.1.1 layout fixes (user-reported)
+
+- [x] 7b.1 The strap extends the owner's row as a second line (CSS
+  specificity chain + substance wrap; E2E measures owner vs plain row
+  height).
+- [x] 7b.2 Members stay contiguous directly under the owner via
+  TST's move-before/move-after/outdent (followChildren), planned in
+  the light-tree walk order; the selected member's children render
+  above the owner's following children (E2E geometry).
+- [x] 7b.3 A newly shelved tab becomes the rightmost icon (append
+  semantics through pendingAppend; E2E icon order after a re-put).
+- [x] 7b.4 Take-off restores the pre-shelve strip position (stored in
+  the flag's session value; same-window best-effort).
+- [x] 7b.5 Placement loop: per-window serialized, bounded, guarded;
+  planner unit-tested (tests/logic.test.mjs, walk-space ranks).
+
 ## 8. Packaging
 
 - [x] 8.1 `make lint` clean (0 errors / 0 notices / 0 warnings);
