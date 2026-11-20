@@ -400,3 +400,224 @@ E2E: the smoke page navigates a shelved tab to `about:blank` and
 asserts that the derivation's favicon for that tab (the same record
 that feeds `strapHtml`) stays the remembered URL while the live tab
 reports none.
+## Implementation notes (2026-11-20, the uniform-row law — 0.1.3)
+
+A user-reported regression with a structural root: after 0.1.1,
+**dropping a tab onto a shelfless tab always inserted it as a sibling
+below**, and the attach-drop visual clue stopped appearing below any
+shelf.
+
+- **TST never measures painted rows.** Sidebar geometry is pure
+  arithmetic: `Scroll.getItemRect` computes `top = renderedTabHeight *
+  index over renderable items + scrollBoxTop - scrollTop`
+  (scroll.js:664-716), and the drag-and-drop zones quarter THAT rect
+  (drag-and-drop.js:458-500: top quarter = insert-before, bottom
+  quarter = insert-after, middle = attach-as-child).  Virtual scroll
+  translates the row container by `itemSize * firstIndex` and sizes
+  the content as `itemSize * count` (scroll.js
+  renderVirtualScrollViewport).  Every subsystem assumes **every
+  renderable row paints at exactly one `--tab-size`**.
+- **0.1.1 violated the assumption twice per shelf**: owner rows
+  painted 39+37.6 px (the strap as a second line) and member rows
+  painted 0 px (negative-margin collapse) while the index arithmetic
+  counted both as 39.  Every computed rect below a shelf drifted by
+  `39*members + strap extra`, so any hover on a shelfless row after a
+  shelf resolved to kDROP_AFTER — "lands below as sibling", marker
+  drawn on the hovered row while the decision came from drifted
+  coordinates.  Owner rows still accepted drops by luck: their
+  computed rect (39 px) happens to cover the caption, which is the
+  attach zone.  Conservation law: **space saved by packing = drift =
+  broken drop zones below the shelf.**  No CSS layout can both save
+  member-row space and keep TST's arithmetic true.
+- **0.1.3 conforms**: every row keeps the default height.  Owner
+  rows are untouched; member rows stay in the flow as BLANK boxes
+  (`visibility: hidden`, no negative margin — they still count in
+  the arithmetic); the strap renders IN FLOW inside the FIRST visible
+  member's row (the *host*, state `tst-shelf-host`): caption hidden,
+  the below-container carries the icon grid, one line fits inside the
+  39 px box and wrapped lines spill VISUALLY (below-container is
+  `overflow: visible`, base.css:770-781) across the following blank
+  member rows.  `ceil(members/perLine) <= members`, so the spill
+  never leaves the shelf's own space.  The ghost-row concept is gone:
+  nested shelves host on their own first member.
+- **The selected member is ordered last** by the placement planner
+  (new `selectedIds` argument): its subtree then dangles below the
+  shelf's whole space, and the host row is always a member without
+  rendered children — a multi-line strap can never spill across
+  rendered child rows.  Icon order follows the reordered tab order, so
+  the selection is the rightmost icon while selected; a newly shelved
+  tab becomes the rightmost icon otherwise.
+- **The E2E now asserts the law itself** ("every rendered row sits at
+  TST's computed position"): the driver replays TST's arithmetic in
+  the tab-hosted sidebar — first row at the content origin,
+  consecutive pitch = a plain row's height, tolerance 1.5 px.  This
+  closes task 7.3 (virtual-scroll sanity) and is the regression gate
+  for any future layout change; it would have caught the 0.1.1 bug
+  (the pitch at owner rows measured 76.6 instead of 39).
+- **Known edge**: a shelf whose icons wrap (>~10 members on a typical
+  sidebar) reserves one row per member; the icons fill only the first
+  `ceil(members/perLine)` lines and the remaining member rows are
+  blank space.  Packing density is a deliberate sacrifice for
+  geometric correctness — the real space win remains the folding
+  (hidden subtrees), which is untouched.
+- **Upgrade path**: 0.1.2 strapped owner rows (and ghost rows); TST
+  keeps extra contents per addon+tab across our update, so the first
+  rederive of each window clears `tab-below` on every shelved tab and
+  owner (`clearLegacyStraps`) before the host-targeted straps render.
+
+## Implementation notes (2026-11-22, the shelf moves into the owner's row — 0.1.4)
+
+The 0.1.3 layout (the shelf painted across the members' own rows) was
+geometrically correct but visually wrong: a member row that paints
+nothing reads as a gap, and the strap's carrier row read as a
+pseudo-tab.  0.1.4 keeps the geometry and moves the shelf into the
+owner's own row.
+
+- **The row does not grow, the caption shrinks.**  The owner row's
+  `.ui` is a COLUMN flex by default (base.css:546-554) with the
+  caption on top and `.extra-items-container.below` underneath — that
+  is why 0.1.1's in-flow strap made the row taller.  The stylesheet
+  flips `.ui` to a ROW flex for owner rows: the caption and the below
+  container become siblings side by side.  The caption gets
+  `min-width: 0` (without it a flex item refuses to shrink below its
+  content width), TST's own `tab-label { overflow: hidden;
+  white-space: nowrap; text-overflow }` then truncates the title, and
+  TST's tab-preview tooltip keeps the full title on hover.
+- **Two thirds is a hard cap, overflow scrolls.**  The below container
+  is a flex item with `max-width: 66%`; the strap inside it is a
+  single-line flex row with `overflow-x: auto` and a hidden scrollbar.
+  Because the row height is pinned by `tab-item:not(.faviconized)
+  :not(.dummy) { height: var(--tab-size) }`, a full shelf cannot
+  change the row's painted height — verified by the E2E, which
+  inflates the strap with cloned icons and measures the row height
+  again.
+- **Members lose their rows entirely.**  Under the uniform-row law
+  the only way to reclaim a member's row is to remove the tab from
+  TST's renderable set (tabs-store.js:538-553), and the only lever for
+  that is `browser.tabs.hide()` — a row that paints nothing while
+  still being counted is exactly the 0.1.1 drift.  Consequences:
+  the manifest gains `tabHide`; hiding is skipped for the active tab
+  (Firefox refuses it) and for a window's last visible tab; every hide
+  is re-applied on each derivation, so an addon that shows our tabs
+  (tst-workspace switching workspaces) loses the race within one
+  debounce.
+- **Ours vs theirs.**  A hidden tab is indistinguishable from a tab
+  hidden by another addon, but the shelf needs the distinction: ours
+  keeps its icon, a container-workspace filter must not.  The "we hid
+  it" bit lives in the tab's session value next to the sticky flag, is
+  restored at boot, and is passed to the derivation as `hiddenByUs`.
+- **TST drops hidden ROOT tabs from the tree.**  `get-root-tabs`
+  queries the CONTROLLABLE index and a hidden tab is removed from it
+  (`TreeItem.js` updateIndexes, `kTAB_STATE_HIDDEN` →
+  `TabsStore.removeControllableTab`).  Hidden CHILDREN survive (the
+  export walks `$TST.children` unfiltered), so only root-shelf members
+  vanished — found by the reinstall phase of the E2E.  `fetchLightTree`
+  asks for each such root individually (`tab: <id>` resolves through
+  `Tab.get`, which has no such filter) and splices it back in tab
+  order.
+- **Icon order no longer depends on the selection.**  With no member
+  rows, the selected member's children render directly below the owner
+  row wherever the member sits among its siblings, so the "selected
+  member last" rule of 0.1.3 was dropped: icons now follow plain tab
+  order and no longer rearrange themselves when an icon is clicked.
+
+## Implementation notes (2026-11-22, the squeezed shelf and the reveal invariant — 0.1.5)
+
+Two user reports, one CSS bug and one browser invariant.
+
+- **The shelf was squeezed below one icon.**  The shelf container was a
+  flex item with `flex-shrink: 1` beside a caption whose flex *basis* is
+  the whole untruncated title.  When basis(caption) + basis(shelf)
+  exceed the row, the browser shrinks both in proportion to their
+  bases, so a long title ate the shelf: measured on the fixture with a
+  long owner title, the container collapsed to 17.1 px (icons are
+  34 px) and started scrolling — the icon cells themselves stayed
+  34 px, which is why the scrollbar appeared while "the icons fit".
+  Fix: `flex: 0 0 auto` on the container — the caption, which is
+  designed to truncate, absorbs the whole deficit.  The E2E gate
+  compares the shelf's natural width against TST's own
+  `--faviconized-tab-size`, so a shrunk shelf cannot pass vacuously
+  through a shrunk cell measurement (the first version of the gate did
+  exactly that).
+- **A member's row cannot be suppressed while it is active.**  Firefox
+  enforces "the active tab is visible": `tabs.update({active:true})`
+  sets `gBrowser.selectedTab`, which reveals a hidden tab, and
+  `tabs.hide()` on the active tab is a silent no-op (ext-tabs.js
+  `hide()` only reports tabs that actually became hidden; MDN lists the
+  active tab as ineligible).  Measured on Firefox 158 in the E2E:
+  hide → activate → `hidden: false`, then `hide([id])` resolves with
+  `[]`.  TST offers no alternative: the only ways into a row-less state
+  are hidden, pinned, `collapsed-completely` (the sidebar's animation
+  state, recomputed for *all* children whenever a parent expands) and
+  membership of a collapsed native group — none applies to an active
+  unpinned tab.  What the extension can do, and now does, is end the
+  reveal the instant focus moves: `rehideMembersNow` runs from
+  `tabs.onActivated` instead of waiting out the 120 ms re-derivation
+  debounce (measured 33–37 ms, against 150 ms through the debounce).
+- **An unfolded member must stay visible.**  The first attempt also
+  re-hid on the member's own `hidden: false` update, which races the
+  activation: for a few milliseconds the tab is revealed but not yet
+  the active tab, so it got hidden again — and a hidden parent's
+  children have no rows (observed: the selected member was unfolded yet
+  its two children had no rows at all).  The fast path now listens to
+  activation only, and `reconcileHidden` *shows* an active member that a
+  race hid, so the invariant "unfolded ⇒ visible ⇒ rowless-with-children"
+  cannot be broken.
+- **A trap in the test rig**: the smoke page is a *background* tab, so
+  Firefox throttles its `setTimeout` to 1000 ms.  A polling loop with
+  `sleep(20)` measured 1035 ms for a re-hide that happened in 21 ms.
+  Latency measurements in that page must be paced by IPC round-trips
+  (or `Promise.resolve()`), never by timers.
+
+## Implementation notes (2026-11-22, rows that must not be reclaimed — 0.1.6)
+
+Two user reports about the same mechanism: which rows the extension may
+take back, and in what order.
+
+- **A shelf of shelves disappeared.**  0.1.5 reclaimed a member's row as
+  soon as it stopped being the active tab.  But a hidden tab has no
+  rendered descendants, so reclaiming an ANCESTOR of the active tab also
+  removed the active tab's own row — and, for a shelved tab that owns a
+  shelf, the nested strap, which is rendered *in that owner's row*.
+  `mustShowTabs` (logic.esm.js) now protects the active tab and its whole
+  ancestor chain; `reconcileHidden` only ever reclaims rows outside that
+  set and *shows* anything in it that it had hidden.
+- **The tree bounced on every switch.**  Measured with a frame sampler
+  (one sample per animation frame in the live sidebar): 0.1.5 produced a
+  gap in which the outgoing member's row was already gone while the
+  incoming one was not yet painted, and TST's own collapse animation made
+  it worse — 5 rows → 6 → 5 → 3 with the marker row moving down and up.
+  Three changes fixed it:
+  1. the outgoing member is hidden in the same tick as the activation
+     (`selectShelfTab` issues both calls before awaiting either, relying
+     on the parent processing messages in order), instead of one
+     `tabs.query` round trip later — the window dropped from ~80 ms to
+     0–34 ms;
+  2. a member whose children are folding away is protected by
+     `hideGuard` for `COLLAPSE_ANIMATION_GRACE_MS` (300 ms): TST animates
+     for `configs.collapseDuration` (150 ms) *before* it removes the
+     children's rows, and the `collapsing` state is sidebar-only, so the
+     background cannot see the animation — the guard is armed wherever the
+     extension asks TST to collapse a member's subtree.  Without it, some
+     frames showed children with no parent row;
+  3. when the guard defers a hide, a re-derivation is scheduled for its
+     expiry — otherwise a member put on a shelf kept its row until the
+     next unrelated event (caught as a flaky E2E assertion).
+- **A swap still costs one frame at most** and cannot be made atomic:
+  the reveal is performed by the browser on activation, the hide is a
+  separate API call, and TST paints them in separate sidebar frames.  The
+  E2E therefore measures the *displacement budget*: the tree must return
+  to its exact position and be displaced for at most two frames
+  (measured 0, 1 and 2 frames across runs).
+- **Put order is a sequence, not a slot.**  The E2E flake
+  `[B, C, F]` instead of `[C, B, F]` came from a single
+  `pendingAppend` slot per window: two puts in quick succession
+  overwrote each other and the first tab silently kept its old slot.
+  The planner now takes `appendOrder` (tabId → sequence) and drops the
+  sequences once a placement pass confirms the shelves are laid out, so
+  a later user drag is not fought forever.
+- **Never lose the "we hid it" bit.**  `rememberHidden` skipped the
+  write when the tab's session value was not on the tab yet — and after a
+  restart such a tab was mistaken for one hidden by another add-on, so it
+  vanished from the tree *and* from the root shelf.  The bit is now
+  written beside a fresh flag when the value is missing.

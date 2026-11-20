@@ -18,7 +18,7 @@
  * live TST light tree + browser.tabs on every structural event.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, ROOT_SHELF } from "./logic.esm.js";
+import { derive, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, mustShowTabs, ROOT_SHELF } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
 import { SHELF_STYLE } from "./style.esm.js";
 
@@ -28,12 +28,20 @@ const FLAG_KEY = "tst-shelf";
 
 /** @type {Set<number>} tab ids carrying the sticky flag */
 const shelved = new Set;
+/** @type {Set<number>} tab ids we hid ourselves (browser.tabs.hide) to
+ * take their rows out of TST's flow — the shelf icon is their whole
+ * presentation.  Kept separate from "hidden" so that a tab hidden by
+ * ANOTHER addon (tst-workspace container filtering) is distinguishable:
+ * ours still gets an icon, theirs must not appear at all. */
+const hiddenByUs = new Set;
 /** @type {Map<number, string>} tab id -> last known favicon URL (session
  * scope): shelf icons keep the old favicon while the tab reloads —
  * TST's rows do the same (see resolveFavicons in logic.esm.js). */
 let faviconMemory = new Map;
 /** @type {Map<number, {derivation: object, tabsById: Map}>} last derivation per window */
 const windows = new Map;
+/** @type {Set<number>} windows whose 0.1.2 legacy straps were cleared */
+const preparedWindows = new Set;
 /** @type {Map<number, any>} per-window re-derivation timers */
 const timers = new Map;
 let tstUsable = false;
@@ -64,7 +72,13 @@ async function loadShelvedFromSessions () {
 		catch (_error) { return null; }
 	}));
 	tabs.forEach((tab, index) => {
-		if (values[index] && values[index].on) { shelved.add(tab.id); }
+		const value = values[index];
+		if (!value || !value.on) { return; }
+		shelved.add(tab.id);
+		// a member whose row we hid stays OURS across a restart: without
+		// this the boot derivation would read it as foreign-hidden
+		// (workspace filtering) and leave its icon off the shelf.
+		if (value.hidden) { hiddenByUs.add(tab.id); }
 	});
 	logBoot("boot-shelved", `${shelved.size} of ${tabs.length} tabs`);
 }
@@ -169,26 +183,75 @@ function scheduleRederive (windowId) {
 	}, RECOMPUTE_DELAY_MS));
 }
 
-async function rederive (windowId, { reconcile = false, } = {}) {
-	if (!tstUsable) { return; }
+/**
+ * The window's light tree.  Plain `get-light-tree` with only a windowId
+ * resolves through TST's `getRootTabs`, which queries the CONTROLLABLE
+ * index — and a hidden tab is removed from that index the moment the
+ * `hidden` state applies (TreeItem.js updateIndexes, kTAB_STATE_HIDDEN →
+ * `TabsStore.removeControllableTab`).  A hidden member of the ROOT shelf
+ * therefore disappears from the tree entirely, while hidden CHILDREN
+ * survive (the export walks `$TST.children` unfiltered).  Such a root is
+ * fetched individually — `tab: <id>` resolves via `Tab.get`, which has
+ * no such filter — and spliced back at its tab-order position.
+ */
+async function fetchLightTree (windowId, tabsById) {
 	const tree = await TST.methods.getLightTree({ windowId, }).catch(error => {
 		logBoot("light-tree-fail", `${windowId} ${error && error.message || error}`);
 		return null;
 	});
+	if (!tree) { return null; }
+	const roots = Array.isArray(tree) ? tree.slice() : [tree];
+	const present = new Set;
+	(function walk (nodes) {
+		for (const node of nodes || []) {
+			present.add(node.id);
+			walk(node.children);
+		}
+	})(roots);
+	const missing = [...shelved].filter(id => hiddenByUs.has(id) && tabsById.has(id) && !present.has(id));
+	if (!missing.length) { return roots; }
+	for (const id of missing) {
+		const subtree = await TST.methods.getLightTree({ windowId, tab: id, }).catch(() => null);
+		if (subtree && subtree.id == id) { roots.push(subtree); }
+	}
+	const indexOf = id => tabsById.get(id)?.index ?? Number.MAX_SAFE_INTEGER;
+	roots.sort((a, b) => indexOf(a.id) - indexOf(b.id));
+	logBoot("tree-splice", `window ${windowId} hidden roots=${missing.length}`);
+	return roots;
+}
+
+async function rederive (windowId, { reconcile = false, } = {}) {
+	if (!tstUsable) { return; }
 	// favicon stickiness: tabs.query carries no favIconUrl while a tab
 	// is loading or navigating — resolveFavicons fills the blank from
 	// the memory and records every known one (logic.esm.js).
 	const queryTabs = await browser.tabs.query({ windowId, });
-	if (!tree || queryTabs.length == 0) { return; }
+	if (queryTabs.length == 0) { return; }
 	const resolved = resolveFavicons(queryTabs, faviconMemory);
 	faviconMemory = resolved.memory;
 	const tabs = resolved.tabs;
 	const tabsById = new Map(tabs.map(tab => [tab.id, tab]));
+	// the tree comes FIRST: the hide decision needs the ancestor chain of
+	// the active tab (mustShowTabs).  Hiding never changes the structure,
+	// so the tree stays valid across it.
+	const tree = await fetchLightTree(windowId, tabsById);
+	if (!tree) { return; }
+	// members keep NO row: hide them (and bring back any we hid that
+	// left the shelf, or that must stay visible).
+	await reconcileHidden(windowId, tabs, mustShowTabs({ tree, activeId: tabs.find(tab => tab.active)?.id ?? null, }));
 
-const derivation = derive({ tree, shelved, tabsById, });
-	windows.set(windowId, { derivation, tabsById, });
+const derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
+	windows.set(windowId, { derivation, tabsById, tree, });
+	if (!preparedWindows.has(windowId)) {
+		// upgrade path: 0.1.2 parked straps on owner rows (second line)
+		// and 0.1.3 on the first member's row; TST keeps extra contents
+		// per addon+tab across our update — clear every row once, before
+		// the first owner-targeted render.
+		preparedWindows.add(windowId);
+		await renderer.clearLegacyStraps({ windowId, tabIds: tabs.map(tab => tab.id), }).catch(() => {});
+	}
 	await renderer.applyDerivation({ windowId, derivation, tabsById, });
-	await reconcilePlacement(windowId, { tree, tabsById, shelves: derivation.shelves, });
+	await reconcilePlacement(windowId, { tree, tabsById, derivation, });
 
 	if (reconcile) {
 		// boot reconciliation: one selected member per shelf (spec
@@ -200,6 +263,132 @@ const derivation = derive({ tree, shelved, tabsById, });
 		}
 		if (strays.length) { logBoot("reconcile", `collapsed ${strays.length}`); }
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 3a. member rows: none at all
+//
+// A shelved tab's row would be a blank box in the flow, and TST's
+// uniform-row law forbids making it zero-height (the painted height must
+// equal the row size TST assumes, or every computed rect — and therefore
+// every drop zone — below it drifts; see style.esm.js).  The only lever
+// that removes a tab from TST's renderable set WITHOUT breaking the law
+// is browser.tabs.hide(): a hidden tab is not counted, not painted and
+// takes no space at all.  TST drops hidden tabs from
+// `virtualScrollRenderableTabsInWindow` unless the expert option
+// `renderHiddenTabs` is on (tabs-store.js:538-553) — that option puts
+// members back into the flow and is unsupported (README).
+
+/** Hide the members of this window; bring back members we hid that left
+ *  the shelf.  Mutates the `tabs` records so the derivation sees the
+ *  truth: tabs.query snapshots taken before a hide are stale. */
+async function reconcileHidden (windowId, tabs, mustShow = new Set) {
+	if (!tabs.length) { return; }
+	const byId = new Map(tabs.map(tab => [tab.id, tab]));
+	// Firefox refuses to hide the ACTIVE tab and refuses to empty a
+	// window: both cases are filtered out here rather than failing the
+	// whole batch (one bad id rejects the entire tabs.hide call).
+	// `mustShow` adds the active tab's ancestors: a hidden parent has no
+	// rendered descendants, so reclaiming an ancestor's row would take
+	// the active tab's own row (and any nested shelf's strap) with it.
+	const now = Date.now();
+	let deferredUntil = 0;
+	const toHide = [...shelved].filter(id => {
+		const tab = byId.get(id);
+		if (!tab || tab.hidden || tab.pinned || mustShow.has(id)) { return false; }
+		const guardedUntil = hideGuard.get(id);
+		if (guardedUntil && now < guardedUntil) {
+			// its subtree is still animating; come back when the guard
+			// expires — nothing else would trigger us (a member put on a
+			// shelf would otherwise keep its row until the next event).
+			deferredUntil = Math.max(deferredUntil, guardedUntil);
+			return false;
+		}
+		if (guardedUntil) { hideGuard.delete(id); }
+		return true;
+	});
+	if (deferredUntil) {
+		const delay = Math.max(20, deferredUntil - now + 20);
+		setTimeout(() => scheduleRederive(windowId), delay);
+	}
+	const visibleCount = tabs.filter(tab => !tab.hidden).length;
+	while (toHide.length && visibleCount - toHide.length < 1) { toHide.pop(); }
+	if (toHide.length) {
+		try {
+			const hid = await browser.tabs.hide(toHide);
+			const actuallyHidden = (Array.isArray(hid) ? hid : toHide).filter(id => byId.has(id));
+			for (const id of actuallyHidden) {
+				hiddenByUs.add(id);
+				byId.get(id).hidden = true;
+			}
+			await rememberHidden(actuallyHidden, true);
+			logBoot("hide", `window ${windowId} tabs=${actuallyHidden.join(",")}`);
+		}
+		catch (error) { logBoot("hide-fail", `window ${windowId} ${error && error.message || error}`); }
+	}
+	// a member we hid that is no longer shelved must come back into the
+	// strip (take-off shows it explicitly; this is the safety net for
+	// the paths that do not — a close-parent re-parent, a pin guard…)
+	const toShow = new Set([...hiddenByUs].filter(id => byId.has(id) && !shelved.has(id)));
+	// Anything in the must-show chain that we hid comes back: the active
+	// tab (Firefox may have revealed it already, or not yet) and every
+	// ancestor of it — without the ancestors the active tab would have no
+	// row at all, and a nested shelf would lose the row its strap lives
+	// in.
+	for (const id of mustShow) {
+		if (hiddenByUs.has(id) && byId.has(id)) { toShow.add(id); }
+	}
+	const toShowIds = [...toShow];
+	if (toShowIds.length) {
+		for (const id of toShowIds) {
+			hiddenByUs.delete(id);
+			if (byId.has(id)) { byId.get(id).hidden = false; }
+		}
+		await browser.tabs.show(toShowIds).catch(error => logBoot("show-fail", String(error && error.message || error)));
+		await rememberHidden(toShowIds, false);
+		logBoot("show", `window ${windowId} tabs=${toShowIds.join(",")}`);
+	}
+}
+
+/** Persist the "we hid it" bit beside the sticky flag: a restart must
+ *  tell our own hides from another addon's (tst-workspace filtering). */
+async function rememberHidden (tabIds, hidden) {
+	await Promise.all(tabIds.map(async id => {
+		const value = await browser.sessions.getTabValue(id, FLAG_KEY).catch(() => null);
+		if (value && !!value.hidden == hidden) { return; }
+		// the flag may not be on the tab yet (the put that shelved it can
+		// still be in flight) — then write the bit BESIDE a fresh flag.
+		// Skipping here used to lose the bit, and after a restart the tab
+		// was mistaken for one hidden by another add-on: it then vanished
+		// from the tree AND from the root shelf (caught in phase 3 E2E).
+		if (!value && !shelved.has(id)) { return; }
+		const next = { ...(value || { on: true, }), hidden, };
+		await browser.sessions.setTabValue(id, FLAG_KEY, next)
+			.catch(error => logBoot("remember-fail", `${id} ${error && error.message || error}`));
+	}));
+}
+
+/** Immediate variant of the member reconcile, with NO re-derivation
+ *  debounce.  Firefox reveals a hidden tab the instant it becomes the
+ *  active tab and refuses to hide the active tab again (measured:
+ *  `tabs.hide([activeId])` resolves with `[]`; MDN: "The current active
+ *  tab cannot be hidden"), so a member that the user activates keeps a
+ *  row for as long as it is active.  That reveal cannot be prevented,
+ *  but it can be ended the moment focus moves: this runs straight from
+ *  the activation/visibility events instead of waiting out the 120 ms
+ *  re-derivation debounce. */
+async function rehideMembersNow (windowId) {
+	if (!tstUsable || windowId == null) { return; }
+	const tabs = await browser.tabs.query({ windowId, }).catch(() => []);
+	if (!tabs.length) { return; }
+	// No extra IPC here: the tree cached by the last derivation is good
+	// enough to decide what must stay visible (structure does not change
+	// on activation), and the debounced re-derivation corrects any drift.
+	const cached = windows.get(windowId)?.tree ?? null;
+	if (!cached) { return; }
+	const mustShow = mustShowTabs({ tree: cached, activeId: tabs.find(tab => tab.active)?.id ?? null, });
+	await reconcileHidden(windowId, tabs, mustShow).catch(error =>
+		logBoot("rehide-fail", `${windowId} ${error && error.message || error}`));
 }
 
 function onTreeMutated (windowId) {
@@ -221,27 +410,57 @@ function onTreeMutated (windowId) {
 // (nextPlacementMove doc, logic.esm.js).  One move per iteration with a
 // fresh derivation in between — indices shift with every move.
 
-/** windowId -> tabId just put on a shelf here (append order). */
-const pendingAppend = new Map;
+/** tabId -> timestamp until which its row must not be reclaimed.
+ *
+ * TST's collapse animation (`configs.collapseDuration`, 150 ms) runs in
+ * the SIDEBAR and only removes the children's rows when it ends; the
+ * `collapsing` state is sidebar-only, so the background model (and thus
+ * the light tree) never reports it.  Reclaiming a parent's row mid-way
+ * would orphan its still-painted children for the rest of the animation
+ * — the visible "jump" when switching between shelf tabs.  So every
+ * collapse we request for a member arms a guard that outlives the
+ * animation, and `reconcileHidden` honours it. */
+const hideGuard = new Map;
+const COLLAPSE_ANIMATION_GRACE_MS = 300;
+
+function guardRow (tabId) {
+	hideGuard.set(tabId, Date.now() + COLLAPSE_ANIMATION_GRACE_MS);
+}
+
+/** tabId -> put sequence: the shelf order is the PUT order, so a newly
+ *  shelved tab becomes the rightmost icon and two quick puts cannot lose
+ *  each other (a per-window single slot could, and did). */
+const appendSeq = new Map;
+let appendCounter = 0;
+
+function rememberAppend (tabId) {
+	appendSeq.set(tabId, ++appendCounter);
+}
+
+/** Drop the sequences whose placement has been confirmed for this
+ *  derivation — otherwise they would fight a later user drag forever. */
+function consumeAppends (derivation) {
+	for (const members of derivation.shelves.values()) {
+		for (const id of members) { appendSeq.delete(id); }
+	}
+}
 /** windowIds with a running placement loop (one at a time per window). */
 const placing = new Set;
 
-async function reconcilePlacement (windowId, { tree = null, tabsById = null, shelves = null, } = {}) {
+async function reconcilePlacement (windowId, { tree = null, tabsById = null, derivation = null, } = {}) {
 	if (!tstUsable || placing.has(windowId)) { return; }
 	placing.add(windowId);
 	try {
 		let steps = 0;
 		while (steps++ < 40) {
-			const appendTabId = pendingAppend.get(windowId) ?? null;
+			const appendOrder = appendSeq.size ? new Map(appendSeq) : null;
 			if (!tree || !tabsById) {
-				tree = await TST.methods.getLightTree({ windowId, }).catch(error => {
-					logBoot("light-tree-fail", `${windowId} ${error && error.message || error}`);
-					return null;
-				});
 				const tabs = await browser.tabs.query({ windowId, }).catch(() => []);
-				if (!tree || tabs.length == 0) { pendingAppend.delete(windowId); return; }
+				if (tabs.length == 0) { return; }
 				tabsById = new Map(tabs.map(tab => [tab.id, tab]));
-				shelves = derive({ tree, shelved, tabsById, }).shelves;
+				tree = await fetchLightTree(windowId, tabsById);
+				if (!tree) { return; }
+				derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
 			}
 			// ranks in TST's INTERNAL order: move-before/move-after update
 			// it synchronously, while the physical strip catches up only
@@ -253,8 +472,13 @@ async function reconcilePlacement (windowId, { tree = null, tabsById = null, she
 				pos: positions.get(tab.id) ?? Number.MAX_SAFE_INTEGER,
 				pinned: !!tab.pinned,
 			}));
-			const move = nextPlacementMove({ ranks, sizes: subtreeSizes(tree), shelves, appendTabId, });
-			if (!move) { pendingAppend.delete(windowId); return; }
+			const move = nextPlacementMove({
+				ranks,
+				sizes: subtreeSizes(tree),
+				shelves: derivation.shelves,
+				appendOrder,
+			});
+			if (!move) { consumeAppends(derivation); return; }
 			const sent = move.kind == "move-before"
 				? TST.methods.moveBefore({ tab: move.tabId, windowId, referenceTabId: move.referenceTabId, followChildren: true, })
 				: TST.methods.moveAfter({ tab: move.tabId, windowId, referenceTabId: move.referenceTabId, followChildren: true, })
@@ -265,12 +489,11 @@ async function reconcilePlacement (windowId, { tree = null, tabsById = null, she
 				logBoot("placement-fail", `${move.kind} ${move.tabId} ${error && error.message || error}`);
 				return false;
 			});
-			if (ok === false) { pendingAppend.delete(windowId); return; }
+			if (ok === false) { return; }
 			logBoot("placement", `${move.kind} tab ${move.tabId} ref ${move.referenceTabId}`);
-			tree = null; tabsById = null; shelves = null;
+			tree = null; tabsById = null; derivation = null;
 		}
 		logBoot("placement-guard", `window ${windowId} steps ${steps}`);
-		pendingAppend.delete(windowId);
 	}
 	finally { placing.delete(windowId); }
 }
@@ -429,16 +652,57 @@ async function selectShelfTab (memberId) {
 	const windowId = tab?.windowId;
 	if (windowId == null) { return; }
 	const cached = windows.get(windowId);
+	let outgoingId = null;
 	if (cached) {
+		// the member that currently owns the shelf's one visible row: the
+		// previous active tab, if it is shelved
+		const previousActive = [...cached.tabsById.values()].find(candidate => candidate.active && !candidate.pinned);
+		if (previousActive && previousActive.id != memberId && shelved.has(previousActive.id)) {
+			outgoingId = previousActive.id;
+		}
 		const owner = cached.derivation.shelfOf.get(memberId);
 		const previous = cached.derivation.selectedOfShelf.get(owner);
 		if (previous != null && previous != memberId) {
+			// its children are about to animate away: keep its own row
+			// until the animation is over (see hideGuard)
+			guardRow(previous);
 			await TST.methods.collapseTree({ tab: previous, windowId, }).catch(() => {});
 		}
 	}
 	await TST.methods.expandTree({ tab: memberId, windowId, }).catch(() => {});
-	await browser.tabs.update(memberId, { active: true, }).catch(() => {});
+	// The row swap must look atomic: the sidebar renders in batched
+	// frames, so the outgoing member's row has to be reclaimed in the
+	// SAME batch as the incoming one's appears.  Both calls are therefore
+	// issued without awaiting the first — round-trip latencies measured
+	// through separate awaits left ~33 ms (two frames) with two member
+	// rows painted, which reads as the tree bouncing by one row.
+	// The hide may be processed before the activation (and be refused
+	// because the tab is still active); the retry covers that order.
+	const reclaimable = outgoingId != null && !hideGuard.has(outgoingId);
+	const activation = browser.tabs.update(memberId, { active: true, }).catch(() => null);
+	// issued without awaiting the activation: the parent processes the two
+	// messages in order, so the reveal and the hide land in the same task
+	// and TST's sidebar paints them in one frame
+	const hideAttempt = reclaimable ? hideNow(outgoingId) : Promise.resolve(true);
+	await activation;
+	if (reclaimable && !(await hideAttempt.catch(() => false))) {
+		await hideNow(outgoingId);
+	}
 	scheduleRederive(windowId);
+}
+
+/** Hide one tab right away, recording it as OUR hide (see hiddenByUs). */
+async function hideNow (tabId) {
+	try {
+		const hid = await browser.tabs.hide([tabId]);
+		if (Array.isArray(hid) && hid.includes(tabId)) {
+			hiddenByUs.add(tabId);
+			await rememberHidden([tabId], true);
+			return true;
+		}
+		return false;
+	}
+	catch (error) { logBoot("hide-now-fail", `${tabId} ${error && error.message || error}`); return false; }
 }
 
 // ---------------------------------------------------------------------------
@@ -473,10 +737,11 @@ async function putOnShelf (tabId) {
 		: { windowId: tab.windowId, index: tab.index, };
 	await browser.sessions.setTabValue(tabId, FLAG_KEY, { on: true, prev, }).catch(() => {});
 	shelved.add(tabId);
-	pendingAppend.set(tab.windowId, tabId);
+	rememberAppend(tabId);
 	// fold the subtree under TST's own collapse: the confirmation dialog,
 	// the twisty state and restart persistence all come for free.
 	// windowId is load-bearing (see applyTabStates).
+	guardRow(tabId);
 	await TST.methods.collapseTree({ tab: tabId, windowId: tab.windowId, }).catch(() => {});
 	scheduleRederive(tab.windowId);
 	logBoot("put", `tab ${tabId} under ${tab.openerTabId}`);
@@ -487,8 +752,17 @@ async function takeOffShelf (tabId) {
 	const stored = await browser.sessions.getTabValue(tabId, FLAG_KEY).catch(() => null);
 	await browser.sessions.removeTabValue(tabId, FLAG_KEY).catch(() => {});
 	shelved.delete(tabId);
+	appendSeq.delete(tabId);
+	// the row comes back: a tab we hid has none at all (0.1.4)
+	const wasHidden = hiddenByUs.delete(tabId);
 	const tab = await browser.tabs.get(tabId).catch(() => null);
 	if (tab) {
+		// only OUR hides are ours to lift: a tab that a container filter
+		// hid must stay hidden, or taking it off the shelf would defeat
+		// the workspace it is filtered out of.
+		if (wasHidden) {
+			await browser.tabs.show([tabId]).catch(error => logBoot("show-fail", `${tabId} ${error && error.message || error}`));
+		}
 		await restorePreShelvePosition(tab, stored && stored.prev);
 		scheduleRederive(tab.windowId);
 	}
@@ -516,10 +790,14 @@ async function restorePreShelvePosition (tab, prev) {
 
 browser.tabs.onRemoved.addListener(tabId => {
 	faviconMemory.delete(tabId);
+	hideGuard.delete(tabId);
+	hiddenByUs.delete(tabId);
 	if (shelved.delete(tabId)) { scheduleRederiveAll(); }
 });
 
 browser.tabs.onActivated.addListener(activeInfo => {
+	// end the previous member's reveal immediately (see rehideMembersNow)
+	rehideMembersNow(activeInfo.windowId);
 	scheduleRederive(activeInfo.windowId);
 });
 
@@ -589,8 +867,8 @@ browser.runtime.onMessage.addListener((message, _sender) => {
 			for (const [windowId, { derivation, tabsById, }] of windows.entries()) {
 				shelves[windowId] = {
 					shelves: [...derivation.shelves.entries()].map(([owner, members]) => [owner == ROOT_SHELF ? "root" : owner, members]),
-					ghosts: [...derivation.ghostIds],
 					badges: [...derivation.badgeIds],
+					highlights: [...derivation.highlightIds],
 					selected: [...derivation.selectedOfShelf.entries()].map(([owner, id]) => [owner == ROOT_SHELF ? "root" : owner, id]),
 				};
 				// the favicon the derivation renders for each member —
@@ -603,12 +881,32 @@ browser.runtime.onMessage.addListener((message, _sender) => {
 			const menuItems = menuTelemetry.items;
 			return {
 				registered: TST.isRegistered, usable: tstUsable,
-				shelved: [...shelved], shelves, favicons,
+				shelved: [...shelved], hiddenByUs: [...hiddenByUs],
+				shelves, favicons,
 				menu: { ...menuTelemetry, items: menuItems, },
 			};
 		}
 		case "test:put": return { ok: await putOnShelf(message.tabId), };
 		case "test:take": return { ok: await takeOffShelf(message.tabId), };
+		case "test:probe-hidden": {
+			// Characterize Firefox's invariant: can a hidden tab become
+			// the active tab without being revealed, and can an active
+			// tab be hidden again?  (0.1.5 relies on the answer.)
+			const scratch = await browser.tabs.create({ windowId: message.windowId, url: "about:blank", active: false, });
+			const out = { id: scratch.id, };
+			try { out.hid = await browser.tabs.hide([scratch.id]); }
+			catch (error) { out.hideError = String(error); }
+			out.hiddenAfterHide = (await browser.tabs.get(scratch.id)).hidden;
+			await browser.tabs.update(scratch.id, { active: true, });
+			let live = await browser.tabs.get(scratch.id);
+			out.afterActivate = { hidden: live.hidden, active: live.active, };
+			try { out.hid2 = await browser.tabs.hide([scratch.id]); }
+			catch (error) { out.hideError2 = String(error); }
+			live = await browser.tabs.get(scratch.id);
+			out.afterRehide = { hidden: live.hidden, active: live.active, };
+			await browser.tabs.remove(scratch.id).catch(() => {});
+			return out;
+		}
 		case "test:navigate": {
 			await browser.tabs.update(message.tabId, { url: message.url, }).catch(() => {});
 			return { ok: true, };

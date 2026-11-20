@@ -9,6 +9,13 @@
  * `style` attribute survives sanitization — favicons ride inside it as
  * background-image, without host permissions.
  *
+ * Where the strap lives (0.1.4): on the OWNER's `tab-below` extra
+ * contents.  It is NOT a second line under the caption — the sidebar
+ * stylesheet turns the owner row's .ui into a row flex, so the strap
+ * becomes a flex item BESIDE the caption (style.esm.js rule 2) and the
+ * row keeps its default height (TST's uniform-row law).  Members keep
+ * no row at all: they are hidden tabs (index.esm.js).
+ *
  * Icon markup contract (all attributes verified against TST 4.4.10):
  *   data-tab-id      → TST routes right-clicks on the element to that
  *                      tab's native context menu (closest('[data-tab-id]')
@@ -75,13 +82,12 @@ export function strapHtml ({ members, tabsById, highlightIds, badgeIds, }) {
 }
 
 /**
- * Diffing renderer.  Tracks what it last sent per strap (so identical
- * re-derivations cost nothing) and per tab (state classes), and clears
- * straps that became empty.  `send(type, params)` is TST's message
- * route; the caller injects it.
+ * Diffing renderer.  Tracks what it last sent per strap and clears the
+ * targets that vanished (an empty shelf, a closed owner).
+ * `send(type, params)` is TST's message route; the caller injects it.
  */
 export function createRenderer ({ send, log, }) {
-	const renderedStraps = new Map; // `${windowId}:${owner}` -> last contents (or null)
+	const renderedStraps = new Map; // `${windowId}:${owner}` -> { owner, contents } (null = cleared)
 	const tabStates = new Map;      // tabId -> Set of applied tst-shelf-* states
 	const strapKey = (windowId, owner) => `${windowId}:${owner ?? "root"}`;
 
@@ -89,32 +95,38 @@ export function createRenderer ({ send, log, }) {
 	async function applyDerivation ({ windowId, derivation, tabsById, }) {
 		const desired = new Map;
 		for (const [owner, members] of derivation.shelves) {
-			const key = strapKey(windowId, owner);
-			desired.set(key, {
+			if (!members.length) { continue; }
+			desired.set(strapKey(windowId, owner), {
 				owner,
-				contents: members.length ?
-					strapHtml({
-						members,
-						tabsById,
-						highlightIds: derivation.highlightIds,
-						badgeIds: derivation.badgeIds,
-					}) :
-					null,
+				contents: strapHtml({
+					members,
+					tabsById,
+					highlightIds: derivation.highlightIds,
+					badgeIds: derivation.badgeIds,
+				}),
 			});
 		}
 
 		const sends = [];
-		for (const [key, { owner, contents }] of desired) {
-			if (renderedStraps.get(key) === contents) { continue; }
-			renderedStraps.set(key, contents);
-			sends.push(sendStrap({ windowId, owner, contents }));
+		const strapSend = ({ owner, contents, }) => send("set-extra-contents",
+			owner === ROOT_SHELF
+				? { place: "tabbar-top", windowId, contents, }
+				: { place: "tab-below", tab: owner, windowId, contents, });
+
+		for (const [key, strap] of desired) {
+			const current = renderedStraps.get(key);
+			if (current && current.contents === strap.contents) { continue; }
+			renderedStraps.set(key, strap);
+			sends.push(strapSend(strap));
 		}
 		// straps that vanished entirely (owner left the tree, members gone)
-		for (const key of [...renderedStraps.keys()]) {
-			if (key.startsWith(`${windowId}:`) && !desired.has(key) && renderedStraps.get(key) != null) {
+		for (const [key, current] of [...renderedStraps.entries()]) {
+			if (key.startsWith(`${windowId}:`) && !desired.has(key) && current && current.contents != null) {
 				renderedStraps.set(key, null);
-				const owner = key.endsWith(":root") ? ROOT_SHELF : Number(key.slice(String(windowId).length + 1));
-				sends.push(sendStrap({ windowId, owner, contents: null }));
+				sends.push(strapSend({
+					owner: key.endsWith(":root") ? ROOT_SHELF : Number(key.slice(String(windowId).length + 1)),
+					contents: null,
+				}));
 			}
 		}
 		await Promise.all(sends);
@@ -122,26 +134,17 @@ export function createRenderer ({ send, log, }) {
 		await applyTabStates({ windowId, derivation, tabsById, });
 	}
 
-	function sendStrap ({ windowId, owner, contents, }) {
-		const params = owner === ROOT_SHELF ?
-			{ place: "tabbar-top", windowId, contents, } :
-			{ place: "tab-below", tab: owner, windowId, contents, };
-		return send("set-extra-contents", params);
-	}
-
-	/** Diff the tst-shelf-* state classes against what we last applied. */
+	/**
+	 * Diff the tst-shelf-* state classes against what we last applied.
+	 * Only owners carry a state now: members have no rows at all (hidden
+	 * tabs), so there is nothing to style on them — the strap icon IS
+	 * their presentation (0.1.4).
+	 */
 	async function applyTabStates ({ windowId, derivation, tabsById, }) {
 		const wanted = new Map; // tabId -> Set of states
-		for (const id of derivation.shelvedVisible) {
-			const states = new Set(["tst-shelf-shelved"]);
-			if (derivation.ghostIds.has(id)) { states.add("tst-shelf-ghost"); }
-			wanted.set(id, states);
-		}
 		for (const owner of derivation.ownerIds) {
 			if (owner === ROOT_SHELF) { continue; }
-			const states = wanted.get(owner) || new Set;
-			states.add("tst-shelf-owner");
-			wanted.set(owner, states);
+			wanted.set(owner, new Set(["tst-shelf-owner"]));
 		}
 
 		const sends = [];
@@ -188,20 +191,37 @@ export function createRenderer ({ send, log, }) {
 		log("restore", `window ${windowId} shelves=${derivation.shelves.size}`);
 		const sends = [];
 		for (const [owner, members] of derivation.shelves) {
-			sends.push(sendStrap({
-				windowId,
-				owner,
-				contents: members.length ?
-					strapHtml({
-						members,
-						tabsById,
-						highlightIds: derivation.highlightIds,
-						badgeIds: derivation.badgeIds,
-					}) :
-					null,
-			}).catch(error => log("restore-send-fail", `${owner} ${error && error.message || error}`)));
+			if (!members.length) { continue; }
+			const contents = strapHtml({
+				members,
+				tabsById,
+				highlightIds: derivation.highlightIds,
+				badgeIds: derivation.badgeIds,
+			});
+			const params = owner === ROOT_SHELF
+				? { place: "tabbar-top", windowId, contents, }
+				: { place: "tab-below", tab: owner, windowId, contents, };
+			sends.push(send("set-extra-contents", params)
+				.catch(error => log("restore-send-fail", `${owner} ${error && error.message || error}`)));
 		}
 		await Promise.all(sends);
+	}
+
+	/**
+	 * Upgrade path.  TST keeps extra contents per addon+tab across our
+	 * updates, and 0.1.2/0.1.3 parked straps on rows that no longer host
+	 * them (owner rows as a second line, then the first member's row).
+	 * Without this one-shot the stale markup would sit in those rows
+	 * forever.  Clear `tab-below` for every tab of the window once.
+	 */
+	async function clearLegacyStraps ({ windowId, tabIds, }) {
+		const sends = [];
+		for (const tabId of tabIds) {
+			sends.push(send("set-extra-contents", { place: "tab-below", tab: tabId, windowId, contents: null, })
+				.catch(error => log("legacy-clear-fail", `${tabId} ${error && error.message || error}`)));
+		}
+		await Promise.all(sends);
+		log("legacy-clear", `window ${windowId} tabs=${tabIds.length}`);
 	}
 
 	/** Forget a window (closed): stop tracking its keys and states. */
@@ -214,5 +234,5 @@ export function createRenderer ({ send, log, }) {
 		}
 	}
 
-	return { applyDerivation, restoreStraps, forgetWindow };
+	return { applyDerivation, restoreStraps, clearLegacyStraps, forgetWindow };
 }

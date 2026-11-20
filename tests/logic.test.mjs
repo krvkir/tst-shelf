@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
 	subtreeSizes, treePositions, nextPlacementMove, resolveFavicons,
-	ROOT_SHELF,
+	mustShowTabs, ROOT_SHELF,
 } from "../src/background/logic.esm.js";
 
 /** Light-tree node helper. */
@@ -60,7 +60,20 @@ test("hidden members (workspace filtering) are not rendered on the shelf", () =>
 	assert.equal(shelves.has(3), false);
 });
 
-test("an empty shelf (all members hidden) reserves no owner", () => {
+test("members hidden BY US keep their icons (their rows are gone on purpose)", () => {
+	const tree = [node(1, [], [node(2), node(3), node(4)])];
+	const shelved = new Set([2, 3]);
+	const { shelves } = derive({
+		tree, shelved,
+		tabsById: tabsById([
+			{ id: 1, index: 0 }, { id: 2, index: 1, hidden: true }, { id: 3, index: 2, hidden: true }, { id: 4, index: 3 },
+		]),
+		hiddenByUs: new Set([2, 3]),
+	});
+	assert.deepEqual(shelves.get(1), [2, 3], "0.1.4: members have no rows, so they are hidden — the icon is their whole presentation");
+});
+
+test("an empty shelf (all members hidden by someone else) reserves no owner", () => {
 	const tree = [node(1, [], [node(2)])];
 	const shelved = new Set([2]);
 	const { shelves, ownerIds } = derive({ tree, shelved, tabsById: tabsById([
@@ -73,13 +86,12 @@ test("an empty shelf (all members hidden) reserves no owner", () => {
 test("selection is the member with an unfolded subtree", () => {
 	const tree = [node(1, [], [node(2, ["subtree-collapsed"], [node(5)]), node(4, [], [node(6)])])];
 	const shelved = new Set([2, 4]);
-	const { selectedOfShelf, ghostIds, badgeIds } = derive({ tree, shelved, tabsById: tabsById([
+	const { selectedOfShelf, badgeIds } = derive({ tree, shelved, tabsById: tabsById([
 		{ id: 1, index: 0 }, { id: 2, index: 1 }, { id: 4, index: 2 }, { id: 5, index: 3 }, { id: 6, index: 4 },
 	]) });
 	assert.equal(selectedOfShelf.get(1), 4, "the unfolded member is selected");
 	assert.equal(badgeIds.has(2), true, "folded member carries the plus badge");
 	assert.equal(badgeIds.has(4), false, "unfolded member carries none");
-	assert.equal(ghostIds.has(4), false, "no ghost without an own nested shelf");
 });
 
 test("the active member wins a selection tie", () => {
@@ -92,27 +104,28 @@ test("the active member wins a selection tie", () => {
 	assert.equal(selectedOfShelf.get(1), 3, "active member beats tab order");
 });
 
-test("ghost row appears for a selected shelved tab owning a nested shelf", () => {
+test("nested shelves: the inner owner keeps its own strap", () => {
 	// 1 owns a shelf with {2}; 2 (shelved, selected) owns a nested shelf with {3}
 	const tree = [node(1, [], [node(2, [], [node(3, [], [node(4)])])])];
 	const shelved = new Set([2, 3]);
-	const { selectedOfShelf, ghostIds, shelves } = derive({ tree, shelved, tabsById: tabsById([
+	const { selectedOfShelf, shelves, ownerIds } = derive({ tree, shelved, tabsById: tabsById([
 		{ id: 1, index: 0 }, { id: 2, index: 1 }, { id: 3, index: 2 }, { id: 4, index: 3 },
 	]) });
 	assert.equal(selectedOfShelf.get(1), 2);
 	assert.equal(shelves.get(2).includes(3), true, "3 is shelved on 2's nested shelf");
-	assert.equal(ghostIds.has(2), true, "selected shelved tab with own members ghosts");
-	assert.equal(ghostIds.has(3), false);
+	assert.deepEqual(shelves.get(1), [2], "the outer shelf holds 2 only");
+	assert.equal(ownerIds.has(2), true, "the nested owner carries its own strap in its own row");
 });
 
-test("no ghost while the nested shelf owner is folded", () => {
+test("the owner is the strap target regardless of fold state", () => {
 	const tree = [node(1, [], [node(2, ["subtree-collapsed"], [node(3, [], [node(4)])])])];
 	const shelved = new Set([2, 3]);
-	const { selectedOfShelf, ghostIds } = derive({ tree, shelved, tabsById: tabsById([
+	const { selectedOfShelf, shelves, ownerIds } = derive({ tree, shelved, tabsById: tabsById([
 		{ id: 1, index: 0 }, { id: 2, index: 1 }, { id: 3, index: 2 }, { id: 4, index: 3 },
 	]) });
 	assert.equal(selectedOfShelf.get(1), undefined, "nothing unfolded on shelf 1");
-	assert.equal(ghostIds.has(2), false, "folded owner keeps its row hidden");
+	assert.deepEqual(shelves.get(2), [3], "the nested shelf does not depend on the owner being selected");
+	assert.equal(ownerIds.has(1), true, "1 still hosts its shelf in its own row");
 });
 
 test("highlight covers the active shelved tab and its shelved ancestors", () => {
@@ -361,4 +374,39 @@ test("the memory survives across windows' derivations", () => {
 	({ memory, } = resolveFavicons([{ id: 2, favIconUrl: "https://b/2.png", }], memory));
 	const { tabs, } = resolveFavicons([{ id: 1, }], memory);
 	assert.equal(tabs[0].favIconUrl, "https://a/1.png", "entries from other derivations persist");
+});
+
+// ---------------------------------------------------------------------------
+// rows that must never be reclaimed (the active tab and its ancestors)
+
+test("mustShowTabs spans the active tab and its whole ancestor chain", () => {
+	const tree = [node(1, [], [node(2, [], [node(3, [], [node(4)])]), node(5)]), node(6)];
+	assert.deepEqual([...mustShowTabs({ tree, activeId: 4 })].sort(), [1, 2, 3, 4],
+		"a nested shelved owner stays visible while a tab of its shelf is active");
+	assert.deepEqual([...mustShowTabs({ tree, activeId: 6 })], [6], "a root tab has no ancestors");
+	assert.deepEqual([...mustShowTabs({ tree, activeId: null })], [], "no active tab, nothing to protect");
+});
+
+test("mustShowTabs survives an unknown active id", () => {
+	const tree = [node(1, [], [node(2)])];
+	assert.deepEqual([...mustShowTabs({ tree, activeId: 99 })], [99],
+		"an untracked active id protects itself and the walk stops");
+});
+
+test("mustShowTabs protects a parent whose children are mid-animation", () => {
+	// C's children are collapsing: TST paints them until the animation
+	// ends (collapseDuration = 150 ms), so C must keep its row or they are
+	// orphaned.
+	const tree = [node(1, [], [node(2, [], [node(5, ["collapsing"]), node(6, ["expanding"])])])];
+	const must = mustShowTabs({ tree, activeId: 2 });
+	assert.equal(must.has(5), true, "the collapsing tab itself");
+	assert.equal(must.has(6), true, "the expanding tab itself");
+	assert.equal(must.has(2), true, "their parent — the shelved tab being switched away from");
+	assert.equal(must.has(1), true, "and its owner");
+});
+
+test("mustShowTabs ignores settled states", () => {
+	const tree = [node(1, [], [node(2, ["subtree-collapsed"], [node(5, ["collapsed-completely"])])]), node(3)];
+	const must = mustShowTabs({ tree, activeId: 3 });
+	assert.deepEqual([...must], [3], "a finished collapse protects nobody");
 });

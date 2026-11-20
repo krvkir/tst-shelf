@@ -110,7 +110,11 @@ async function buildTree () {
 	// moz-extension pages carry a real favicon (the favicon-in-strap route
 	// is under test) and never match TST's new-tab-command URL guesses.
 	const TREE_URL = browser.runtime.getURL("tree-tab.html");
-	const win = await browser.windows.create({ url: TREE_URL, });
+	// The owner gets a LONG title: a caption whose flex basis exceeds the
+	// row is the condition that exposed the shelf-shrinking bug.
+	const LONG_TITLE = "Shelf project — a deliberately long owner title that must be truncated by the shelf";
+	const OWNER_URL = `${TREE_URL}?title=${encodeURIComponent(LONG_TITLE)}`;
+	const win = await browser.windows.create({ url: OWNER_URL, });
 	const windowId = win.id;
 	const A = win.tabs[0].id;
 	const mk = async opener => (await browser.tabs.create({ windowId, openerTabId: opener, url: TREE_URL, })).id;
@@ -119,8 +123,11 @@ async function buildTree () {
 	const D = await mk(A);
 	const c1 = await mk(C);
 	const c2 = await mk(C);
+	// F: a second CHILDLESS child of A — switching between two childless
+	// members must be a pure row swap with zero net height change.
+	const F = await mk(A);
 	const E = (await browser.tabs.create({ windowId, url: TREE_URL, })).id;
-	const ids = { windowId, A, B, C, D, c1, c2, E, };
+	const ids = { windowId, A, B, C, D, c1, c2, E, F, };
 	await browser.storage.local.set({ "e2e-ids": ids, });
 	return ids;
 }
@@ -145,6 +152,21 @@ async function phaseOneAndTwo () {
 		return s.shelved.includes(ids.C) && shelf && shelf[1].includes(ids.C) ? s : null;
 	});
 	if (!stateC) { return; }
+	// 0.1.4: members have NO row at all — they are hidden tabs, the only
+	// lever that removes a tab from TST's renderable set without
+	// breaking its uniform-row arithmetic (a blank member row would be
+	// the "gaps" 0.1.3 shipped).
+	{
+		const settled = await eventually(null, async () => {
+			const hidden = {};
+			for (const id of [ids.B, ids.C]) { hidden[id] = (await browser.tabs.get(id)).hidden; }
+			return hidden[ids.B] === true && hidden[ids.C] === true ? hidden : null;
+		}, 8000);
+		const state = await send({ type: "test:state" });
+		record("members keep no row at all (hidden tabs)",
+			!!settled && state.hiddenByUs.includes(ids.B) && state.hiddenByUs.includes(ids.C),
+			`hidden=${JSON.stringify(settled)} hiddenByUs=${JSON.stringify(state.hiddenByUs)}`);
+	}
 
 	// Our context menu items must exist as OUR OWN browser.menus items
 	// (the contextMenu-create route is invisible in plain tab menus —
@@ -194,11 +216,35 @@ async function phaseOneAndTwo () {
 
 	// B goes back on the shelf: the driver will click C then B.
 	await send({ type: "test:put", tabId: ids.B });
+	// F is a second CHILDLESS member: switching B <-> F must be a pure row
+	// swap, so the driver can tell a real jump from a legitimate fold.
+	await send({ type: "test:put", tabId: ids.F });
+	await eventually("the childless member F lands on A's shelf", async () => {
+		const s = await send({ type: "test:state" });
+		const shelf = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);
+		return shelf && shelf[1].length == 3 ? s : null;
+	}, 8000);
 
 	// External add-tab-state probe: the smoke page sends it through the
 	// same external channel the background uses; the driver later checks
 	// whether it landed in TST's background model.
 	await tst("add-tab-state", { tab: ids.D, state: "tst-shelf-smoke-probe" });
+
+	// -- Firefox's hidden-tab invariant (characterization) -------------
+	// The member rows are reclaimed by hiding tabs, so the shelf lives
+	// with this rule: a hidden tab that becomes the ACTIVE tab is
+	// revealed, and the active tab cannot be hidden again.  Recorded so
+	// the design never assumes otherwise.
+	{
+		const probe = await send({ type: "test:probe-hidden", windowId: ids.windowId, });
+		record("Firefox reveals a hidden tab when it is activated",
+			probe && probe.hiddenAfterHide === true && probe.afterActivate && probe.afterActivate.hidden === false
+			&& probe.afterActivate.active === true,
+			JSON.stringify(probe));
+		record("Firefox refuses to hide the active tab again",
+			probe && probe.afterRehide && probe.afterRehide.hidden === false && probe.afterRehide.active === true,
+			JSON.stringify(probe));
+	}
 
 	// -- setup report for the driver (window id + expectations) --------
 	await download({
@@ -207,7 +253,8 @@ async function phaseOneAndTwo () {
 			owner: ids.A, members: [ids.B, ids.C], rootMember: ids.E,
 			children: [ids.c1, ids.c2],
 			clickFirst: ids.C, clickSecond: ids.B,
-			plain: ids.D,
+			plain: ids.D, f: ids.F,
+			nestedOwner: ids.C, nestedMember: ids.c1,
 		},
 		results,
 	}, "tst-shelf-e2e-setup.json");
@@ -220,6 +267,20 @@ async function phaseOneAndTwo () {
 	}, 90000);
 	const unfoldedC = await treeOf(ids.C);
 	record("selecting the icon unfolds its subtree", !(unfoldedC.states || []).includes("subtree-collapsed"), JSON.stringify(unfoldedC.states));
+	// The clicked member itself is hidden (0.1.4) unless Firefox chooses
+	// to reveal the tab it activates — either way the ICON is the shelf's
+	// presentation, and the derivation must highlight it.
+	{
+		const shelfState = await eventually(null, async () => {
+			const state = await send({ type: "test:state" });
+			const shelf = state.shelves[ids.windowId] && state.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);
+			const highlighted = state.shelves[ids.windowId].highlights.includes(ids.C);
+			return highlighted && shelf && shelf[1].includes(ids.C) ? state : null;
+		}, 8000);
+		const revealed = !(await browser.tabs.get(ids.C)).hidden;
+		record("the selected member is highlighted on the shelf", !!shelfState,
+			`revealed=${revealed} highlights=${JSON.stringify(shelfState && shelfState.shelves[ids.windowId].highlights)}`);
+	}
 
 	await eventually("clicking another tab of the same shelf folds the first", async () => {
 		const tab = await browser.tabs.get(ids.B);
@@ -227,6 +288,35 @@ async function phaseOneAndTwo () {
 	}, 90000);
 	const refoldedC = await treeOf(ids.C);
 	record("one subtree stays visible per shelf", (refoldedC.states || []).includes("subtree-collapsed"), JSON.stringify(refoldedC.states));
+
+	// A member is revealed by Firefox when it becomes the active tab (see
+	// the characterization probe below: the active tab cannot be hidden).
+	// What must hold is that the row goes away again IMMEDIATELY — not
+	// after the 120 ms re-derivation debounce — or a clicked childless
+	// member would leave a lingering row in the tree.
+	{
+		// NOTE: this page is a BACKGROUND tab, so setTimeout is throttled
+		// to 1000 ms — the poll must not use timers, or it measures the
+		// throttle instead of the re-hide.  IPC round-trips pace the loop.
+		const startedAt = Date.now();
+		await browser.tabs.update(ids.A, { active: true, });
+		let elapsed = -1;
+		for (let attempt = 0; attempt < 500; attempt++) {
+			const live = await browser.tabs.get(ids.B).catch(() => null);
+			if (live && live.hidden) { elapsed = Date.now() - startedAt; break; }
+			await Promise.resolve();
+		}
+		record("the member is hidden again the moment another tab becomes active", elapsed >= 0 && elapsed < 250,
+			`elapsed=${elapsed}ms (a full re-derivation costs 120ms of debounce on top)`);
+		record("a member's row disappears when it stops being active", elapsed >= 0, `elapsed=${elapsed}ms`);
+		const state = await eventually(null, async () => {
+			const s = await send({ type: "test:state" });
+			const shelf = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);
+			return shelf && shelf[1].length == 3 ? s : null;
+		}, 8000);
+		record("the member is still listed on the shelf after that", !!state,
+			JSON.stringify(state && state.shelves[ids.windowId].shelves));
+	}
 
 	// -- context menus --------------------------------------------------
 	// Native menus open only for TRUSTED events, which the headless rig
@@ -243,6 +333,17 @@ async function phaseOneAndTwo () {
 		menuPlain && menuPlain.menu.lastTabId == ids.A
 			&& menuPlain.menu.lastPutVisible === true && menuPlain.menu.lastTakeVisible === false,
 		JSON.stringify(menuPlain && menuPlain.menu));
+
+	// -- a shelf of shelves: shelve c1 on C's shelf ---------------------
+	// C is a member of A's shelf AND the owner of its own shelf.  The
+	// driver's last phase activates c1 and checks that C keeps its row
+	// (and with it the nested strap) instead of disappearing.
+	await send({ type: "test:put", tabId: ids.c1 });
+	await eventually("c1 lands on C's nested shelf", async () => {
+		const s = await send({ type: "test:state" });
+		const nested = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.C);
+		return nested && nested[1].includes(ids.c1) ? s : null;
+	}, 8000);
 
 	// -- favicon stickiness while a shelved tab reloads -----------------
 	// Navigate the shelved C to a page with no favicon: the icon must
@@ -287,7 +388,26 @@ async function phaseThree (ids) {
 		const s = await send({ type: "test:state" });
 		const shelf = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);
 		const root = s.shelves[ids.windowId].shelves.find(([owner]) => owner == "root");
-		return shelf && shelf[1].length == 2 && root && root[1].includes(ids.E) ? s : null;
+		const ok = shelf && shelf[1].length == 3 && root && root[1].includes(ids.E);
+		if (!ok && !phaseThree.diagnosed) {
+			phaseThree.diagnosed = true;
+			const tree = await tst("get-light-tree", { windowId: ids.windowId, }).catch(error => ({ error: String(error), }));
+			const eNode = (function find (nodes) {
+				for (const node of nodes || []) {
+					if (node.id == ids.E) { return node; }
+					const found = find(node.children);
+					if (found) { return found; }
+				}
+				return null;
+			})(Array.isArray(tree) ? tree : []);
+			const live = await browser.tabs.get(ids.E).catch(error => ({ error: String(error), }));
+			record("phase 3 diagnostic", true,
+				JSON.stringify({ shelves: s.shelves, shelved: s.shelved, hiddenByUs: s.hiddenByUs,
+					rootIds: (Array.isArray(tree) ? tree : []).map(node => node.id),
+					eNode, live: { hidden: live.hidden, active: live.active, index: live.index, error: live.error, },
+				}).slice(0, 380));
+		}
+		return ok ? s : null;
 	}, 15000);
 
 	const refoldedC = await treeOf(ids.C);

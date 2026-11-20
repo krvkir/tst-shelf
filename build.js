@@ -27,7 +27,7 @@ const STATIC_FILES = [
  * headless, unattended run).  Public builds never carry test code.
  */
 function applyE2EPatch () {
-	for (const rel of ["tests.html", "tests-smoke.js", "tree-tab.html", "favicon.svg"]) {
+	for (const rel of ["tests.html", "tests-smoke.js", "tree-tab.html", "tree-tab.js", "favicon.svg"]) {
 		fs.copyFileSync(path.join(SRC, rel), path.join(DIST, rel));
 	}
 	const manifestPath = path.join(DIST, "manifest.json");

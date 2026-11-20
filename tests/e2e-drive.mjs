@@ -231,8 +231,36 @@ const sidebarScript = String.raw`
 	});
 `;
 
+/** Conformance probe: TST's uniform-row law (the drop-zone guarantee).
+ *  TST never measures painted rows — drop zones, virtual scroll and
+ *  sticky all compute positions as itemSize * index over renderable
+ *  items (scroll.js getItemRect).  Every rendered row must therefore
+ *  sit exactly one rowH from its predecessor, and the first row must
+ *  sit at the content origin.  Any per-row height deviation (a grown
+ *  strap row, a negative-margin member row) breaks this — 0.1.1
+ *  shipped that way and drops below every shelf landed as siblings. */
+const conformanceScript = String.raw`
+	const container = document.querySelector("#normal-tabs-container");
+	const rows = [...container.querySelectorAll("tab-item[data-tab-id]")];
+	const plain = arguments[0] != null ? document.querySelector('tab-item[data-tab-id="' + arguments[0] + '"]') : null;
+	const rowH = plain ? plain.getBoundingClientRect().height : 0;
+	const containerTop = container.getBoundingClientRect().top;
+	const scrollTop = container.scrollTop;
+	const drift = [];
+	const origin = containerTop - scrollTop;
+	rows.forEach((row, index) => {
+		const paintedTop = row.getBoundingClientRect().top;
+		const expected = origin + index * rowH;
+		if (Math.abs(paintedTop - expected) > 1.5) {
+			drift.push({ id: row.dataset.tabId, index: index, painted: Math.round(paintedTop - containerTop), expected: Math.round(expected - containerTop) });
+		}
+	});
+	return JSON.stringify({ rows: rows.length, rowH: rowH, anchor: Math.abs((rows[0] ? rows[0].getBoundingClientRect().top : 0) - origin), drift: drift });
+`;
+
 /** Visibility probe for the selected shelved tab's children rows, plus
- *  the plain sibling for the dangle-position check (bug 2). */
+ *  the plain sibling for the dangle-position check (bug 2) and the owner
+ *  row (the shelf's space lies between the owner and the children). */
 const visibilityScript = String.raw`
 	const rowOf = id => document.querySelector('tab-item[data-tab-id="' + id + '"]');
 	const probe = id => {
@@ -244,7 +272,97 @@ const visibilityScript = String.raw`
 			classes: row ? [...row.classList].join(",") : "",
 		};
 	};
-	return JSON.stringify({ c1: probe(arguments[0]), c2: probe(arguments[1]), plain: probe(arguments[2]), });
+	return JSON.stringify({ c1: probe(arguments[0]), c2: probe(arguments[1]), plain: probe(arguments[2]), owner: probe(arguments[3]), });
+`;
+
+/** Strap geometry probe (0.1.4 spec: the shelf lives in the owner's OWN
+ *  row — at most 2/3 of its width, one line, horizontally scrollable —
+ *  and the row never grows).  The strap is inflated with cloned icons
+ *  so the overflow path is measured deterministically instead of
+ *  depending on how many members the fixture happens to have: the clone
+ *  set is removed before the script returns.  `arguments[0]` = owner id,
+ *  `arguments[1]` = a plain (shelfless) row id for the height baseline. */
+const strapGeometryScript = String.raw`
+	const owner = arguments[0];
+	const plainId = arguments[1];
+	const row = document.querySelector('tab-item[data-tab-id="' + owner + '"]');
+	const plain = document.querySelector('tab-item[data-tab-id="' + plainId + '"]');
+	const below = row && row.querySelector('.extra-items-container.below');
+	const strap = below && below.shadowRoot && below.shadowRoot.querySelector('[part~="shelf-strap"]');
+	const label = row && row.querySelector('tab-label');
+	if (!row || !strap) {
+		return JSON.stringify({ missing: true, row: !!row, strap: !!strap });
+	}
+	const rowWidth = row.getBoundingClientRect().width;
+	const naturalWidth = strap.getBoundingClientRect().width;
+	const naturalLabelTruncated = !!label && label.scrollWidth > label.clientWidth + 1;
+	const overflowX = getComputedStyle(strap).overflowX;
+	const template = strap.querySelector('[part~="shelf-icon"]');
+	// the shelf as it really is: the icons must fit without shrinking and
+	// without a scrollbar (0.1.4 shrank the shelf to less than one icon
+	// when the owner's title was long)
+	const naturalIcons = strap.querySelectorAll('[part~="shelf-icon"]').length;
+	const gap = parseFloat(getComputedStyle(strap).columnGap) || 0;
+	const ui = row.querySelector(".ui");
+	const uiWidth = ui ? ui.getBoundingClientRect().width : rowWidth;
+	const iconWidth = template ? template.getBoundingClientRect().width : 0;
+	// TST's own icon size: the size an UNSHRUNK cell must have (a shrunk
+	// shelf shrinks its cells too, so measuring the cell alone can pass
+	// vacuously — this is the independent reference).
+	const expectedIconSize = parseFloat(getComputedStyle(row).getPropertyValue("--faviconized-tab-size")) || 0;
+	const naturalScrolls = strap.scrollWidth > strap.clientWidth + 1;
+	const clones = [];
+	for (let index = 0; index < 40 && template; index++) {
+		const clone = template.cloneNode(true);
+		strap.appendChild(clone);
+		clones.push(clone);
+	}
+	const inflatedWidth = strap.getBoundingClientRect().width;
+	const scrolls = strap.scrollWidth > strap.clientWidth + 1;
+	const inflatedLabelTruncated = !!label && label.scrollWidth > label.clientWidth + 1;
+	const rowHeight = row.getBoundingClientRect().height;
+	const plainHeight = plain ? plain.getBoundingClientRect().height : -1;
+	const strapHeight = strap.getBoundingClientRect().height;
+	for (const clone of clones) { strap.removeChild(clone); }
+	return JSON.stringify({
+		rowWidth, naturalWidth, inflatedWidth, scrolls, overflowX,
+		naturalLabelTruncated, inflatedLabelTruncated,
+		naturalIcons, iconWidth, naturalScrolls, expectedIconSize, gap, uiWidth,
+		rowHeight, plainHeight, strapHeight,
+		ratio: rowWidth ? inflatedWidth / rowWidth : -1,
+		cleaned: strap.querySelectorAll('[part~="shelf-icon"]').length,
+	});
+`;
+
+/** Frame sampler: records, once per animation frame, where a marker row
+ *  sits and how many rows exist.  Starting it before a shelf-tab switch
+ *  and reading it afterwards yields the tree's motion in pixels — the
+ *  only honest way to tell "the tree stayed put" from "it jumped and
+ *  came back".  `arguments[0]` = marker tab id, `arguments[1]` = frames. */
+const sampleStartScript = String.raw`
+	window.__shelfSamples = [];
+	const marker = arguments[0];
+	const frames = arguments[1] || 120;
+	const t0 = performance.now();
+	const tick = () => {
+		const row = document.querySelector('tab-item[data-tab-id="' + marker + '"]');
+		const container = document.querySelector("#normal-tabs-container");
+		window.__shelfSamples.push({
+			t: Math.round(performance.now() - t0),
+			top: row ? Math.round(row.getBoundingClientRect().top) : -1,
+			rows: container ? container.querySelectorAll("tab-item[data-tab-id]").length : -1,
+			ids: container ? [...container.querySelectorAll("tab-item[data-tab-id]")].map(row => row.dataset.tabId).join(",") : "",
+			height: container ? Math.round(container.scrollHeight) : -1,
+		});
+		if (window.__shelfSamples.length < frames)
+			requestAnimationFrame(tick);
+	};
+	requestAnimationFrame(tick);
+	return "sampling";
+`;
+
+const sampleReadScript = String.raw`
+	return JSON.stringify(window.__shelfSamples || []);
 `;
 
 /** Model probe: dumps every tab's states from the TST background. */
@@ -387,15 +505,95 @@ async function main () {
 						process.exitCode = process.exitCode || 1;
 					}
 
-					// bug 1: the strap must EXTEND the owner row (a second
-					// line), not share it — measured against the plain sibling.
+					// uniform-row law (0.1.4): the strap lives INSIDE the
+					// owner's own row (beside the caption), so the owner row
+					// keeps its DEFAULT height and every rendered row sits
+					// exactly where TST's index arithmetic expects it (the
+					// drop-zone guarantee: 0.1.1 grew owner rows and collapsed
+					// member rows, shifting every computed rect below each
+					// shelf, and drops there always landed as siblings).
 					{
 						const ownerRow = dump.rows.find(row => row.id == String(e.owner));
 						const plainRow = dump.rows.find(row => row.id == String(e.plain));
-						if (ownerRow && plainRow && ownerRow.height > plainRow.height + 20) {
-							console.log(`PASS [driver] the strap extends the owner row to a second line (owner=${ownerRow.height.toFixed(1)} plain=${plainRow.height.toFixed(1)})`);
+						if (ownerRow && plainRow && Math.abs(ownerRow.height - plainRow.height) < 2) {
+							console.log(`PASS [driver] the owner row keeps its normal height (owner=${ownerRow.height.toFixed(1)} plain=${plainRow.height.toFixed(1)})`);
 						} else {
-							console.log(`FAIL [driver] the strap extends the owner row to a second line (owner=${ownerRow && ownerRow.height} plain=${plainRow && plainRow.height})`);
+							console.log(`FAIL [driver] the owner row keeps its normal height (owner=${ownerRow && ownerRow.height} plain=${plainRow && plainRow.height})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					{
+						const ownerRow = dump.rows.find(row => row.id == String(e.owner));
+						if (ownerRow && ownerRow.strap && ownerRow.classes.includes("tst-shelf-owner")) {
+							console.log("PASS [driver] the strap renders inside the owner's own row");
+						} else {
+							console.log(`FAIL [driver] the strap renders inside the owner's own row (${JSON.stringify(ownerRow)})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					// no member rows at all: a hidden tab has no row, so the
+					// shelf costs exactly one line (0.1.3's blank member boxes
+					// were the "vertical gaps").
+					{
+						const memberRows = e.members.filter(id => dump.rows.some(row => row.id == String(id)));
+						if (memberRows.length == 0) {
+							console.log("PASS [driver] members keep no rows — a shelf costs one line");
+						} else {
+							console.log(`FAIL [driver] members keep no rows — a shelf costs one line (rows=${JSON.stringify(memberRows)})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					// the owner's row: title on the left, shelf on the right,
+					// capped at 2/3 of the width, one line, horizontally
+					// scrollable when the icons do not fit, and the row still
+					// does not grow.
+					{
+						const geometry = await marionette.command("WebDriver:ExecuteScript", {
+							script: strapGeometryScript, args: [e.owner, e.plain,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] strap geometry probe failed: ${error.message}`); return null; });
+						const g = geometry && geometry.value ? JSON.parse(geometry.value) : null;
+						// the shelf exactly as it is: the icons must fit — a
+					// shrinkable shelf next to a long title collapsed to
+					// less than one icon and started scrolling (0.1.4 bug)
+					{
+						// the shelf must be as wide as it needs, or exactly as wide as
+						// its cap allows — never narrower (0.1.4 squeezed it to a
+						// scrolling sliver next to a long title)
+						const unit = g && g.expectedIconSize > 0 ? g.expectedIconSize : g && g.iconWidth;
+						const content = g ? g.naturalIcons * (unit + g.gap) - g.gap : 0;
+						const cap = g ? 0.66 * g.uiWidth : 0;
+						const fits = g && unit > 0 && g.naturalIcons > 0
+							&& g.iconWidth >= unit - 1
+							&& g.naturalWidth >= Math.min(content, cap) - 2;
+						console.log(`${fits ? "PASS" : "FAIL"} [driver] the natural shelf fits its icons without scrolling (icons=${g && g.naturalIcons} iconW=${g && g.iconWidth && g.iconWidth.toFixed(1)} unit=${g && g.expectedIconSize} shelfW=${g && g.naturalWidth && g.naturalWidth.toFixed(1)} scrolls=${g && g.naturalScrolls})`);
+						if (!fits) {
+							console.log(`       geometry detail: ${JSON.stringify(g)}`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					const capped = g && g.ratio > 0 && g.ratio <= 0.68;
+						const scrolls = g && g.overflowX == "auto" && g.scrolls;
+						const truncated = g && g.inflatedLabelTruncated;
+						const noGrowth = g && Math.abs(g.rowHeight - g.plainHeight) < 2;
+						const cleaned = g && g.cleaned >= 2;
+						console.log(`${capped ? "PASS" : "FAIL"} [driver] the shelf never exceeds 2/3 of the owner row (ratio=${g && g.ratio.toFixed(2)})`);
+						console.log(`${scrolls ? "PASS" : "FAIL"} [driver] a shelf that does not fit scrolls horizontally (overflowX=${g && g.overflowX} scrolls=${g && g.scrolls})`);
+						console.log(`${truncated ? "PASS" : "FAIL"} [driver] the owner title truncates to make room (label truncated=${g && g.inflatedLabelTruncated})`);
+						console.log(`${noGrowth ? "PASS" : "FAIL"} [driver] a full shelf still does not grow the owner row (row=${g && g.rowHeight} plain=${g && g.plainHeight})`);
+						if (!(capped && scrolls && truncated && noGrowth && cleaned)) {
+							console.log(`       geometry detail: ${JSON.stringify(g)}`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					{
+						const conformance = await marionette.command("WebDriver:ExecuteScript", {
+							script: conformanceScript, args: [e.plain,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] conformance probe failed: ${error.message}`); return null; });
+						const c = conformance && conformance.value ? JSON.parse(conformance.value) : null;
+						if (c && c.rows >= 2 && c.drift.length == 0 && c.rowH > 20) {
+							console.log(`PASS [driver] every rendered row sits at TST's computed position — drop zones exact (rows=${c.rows} rowH=${c.rowH.toFixed(1)} anchor=${c.anchor.toFixed(1)})`);
+						} else {
+							console.log(`FAIL [driver] every rendered row sits at TST's computed position — drop zones exact ${JSON.stringify(c)}`);
 							process.exitCode = process.exitCode || 1;
 						}
 					}
@@ -404,20 +602,13 @@ async function main () {
 					// RIGHTMOST icon; C kept its earlier block slot.
 					{
 						const order = (dump.icons || []).map(icon => icon.id);
-						const expected = [String(e.members[1]), String(e.members[0])];
+						const expected = [String(e.members[1]), String(e.members[0]), String(e.f)];
 						if (JSON.stringify(order) == JSON.stringify(expected)) {
 							console.log(`PASS [driver] the newest member is the rightmost icon (${order.join(",")})`);
 						} else {
 							console.log(`FAIL [driver] the newest member is the rightmost icon (got ${order.join(",")})`);
 							process.exitCode = process.exitCode || 1;
 						}
-					}
-
-					if (dump.rows.find(row => row.id == String(e.members[0]) && row.classes.includes("tst-shelf-shelved"))) {
-						console.log("PASS [driver] shelved rows hide via the tst-shelf-shelved class");
-					} else {
-						console.log("FAIL [driver] shelved rows hide via the tst-shelf-shelved class");
-						process.exitCode = process.exitCode || 1;
 					}
 
 					if (byId[String(e.members[0])] && byId[String(e.members[1])]) {
@@ -475,7 +666,7 @@ async function main () {
 					for (let i = 0; i < 10 && !(visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0); i++) {
 						const afterFirst = await marionette.command("WebDriver:ExecuteScript", {
 							script: visibilityScript,
-							args: [e.children[0], e.children[1], e.plain,], newSandbox: false,
+							args: [e.children[0], e.children[1], e.plain, e.owner,], newSandbox: false,
 						}).catch(error => { console.log(`[drive] visibility probe failed: ${error.message}`); return null; });
 						visibleInfo = afterFirst && afterFirst.value ? JSON.parse(afterFirst.value) : null;
 						if (visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0) { break; }
@@ -488,10 +679,12 @@ async function main () {
 						process.exitCode = process.exitCode || 1;
 					}
 
-					// bug 2: the children dangle from the SHELF — above the
-					// plain sibling that follows the member block, not below
-					// it.  Rows must EXIST (a missing row would make the
-					// top comparison vacuously true).
+					// bug 2 (0.1.4): the children dangle from the SHELF — the
+					// shelf is a single line inside the owner's row, so the
+					// children sit directly below that row and above the plain
+					// sibling that follows the member block, not below it.
+					// Rows must EXIST (a missing row would make the top
+					// comparison vacuously true).
 					if (visibleInfo && visibleInfo.c1.exists && visibleInfo.c1.height > 0
 						&& visibleInfo.c2.exists && visibleInfo.c2.height > 0
 						&& visibleInfo.plain && visibleInfo.plain.height > 0
@@ -501,12 +694,176 @@ async function main () {
 						console.log(`FAIL [driver] the selected member's subtree dangles from the shelf, above the following siblings ${JSON.stringify(visibleInfo && { c1: visibleInfo.c1, c2: visibleInfo.c2, plain: visibleInfo.plain && visibleInfo.plain.top })}`);
 						process.exitCode = process.exitCode || 1;
 					}
+					if (visibleInfo && visibleInfo.owner && visibleInfo.owner.height > 0
+						&& visibleInfo.c1.top >= visibleInfo.owner.top + visibleInfo.owner.height - 1) {
+						console.log("PASS [driver] the selected member's children render directly below the owner row");
+					} else {
+						console.log(`FAIL [driver] the selected member's children render directly below the owner row ${JSON.stringify(visibleInfo && { owner: visibleInfo.owner.top + visibleInfo.owner.height, c1: visibleInfo.c1.top })}`);
+						process.exitCode = process.exitCode || 1;
+					}
 
-					console.log("[drive] phase 2: clicking the B icon");
+					// -- switching between shelf tabs must not move the tree
+					// C is active and unfolded (its two children are rows);
+					// the plain sibling D is the marker below the shelf.
+					// Two distinct requirements, measured separately:
+					//  (1) a parent's row must never disappear while its
+					//      children are still painted — TST animates a
+					//      collapse for 150 ms before it removes the rows,
+					//      so reclaiming the parent's row mid-way orphans
+					//      them (0.1.4 did exactly that);
+					//  (2) switching between two CHILDLESS members is a pure
+					//      row swap: the tree must not move at all.
+					console.log("[drive] phase 2: clicking the B icon (switch sampling)");
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
+					}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 120));
 					await marionette.command("WebDriver:ExecuteScript", {
 						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
 					}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 3000));
+					await new Promise(resolve => setTimeout(resolve, 2600));
+					const readSamples = async label => {
+						const read = await marionette.command("WebDriver:ExecuteScript", {
+							script: sampleReadScript, args: [], newSandbox: false,
+						}).catch(error => { console.log(`[drive] sampler read failed: ${error.message}`); return null; });
+						const samples = read && read.value ? JSON.parse(read.value) : [];
+						const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
+						console.log(`[drive] ${label} trail: tops=${JSON.stringify([...new Set(tops)])} frames=${samples.length}`);
+						return samples;
+					};
+					{
+						const samples = await readSamples("switch");
+						// (1) orphan check: no frame where a child's row exists
+						// but its parent's row is gone
+						const parentOf = { [e.children[0]]: e.clickFirst, [e.children[1]]: e.clickFirst, };
+						const orphans = samples.filter(sample => {
+							const ids = String(sample.ids || "").split(",").filter(Boolean);
+							return Object.keys(parentOf).some(child => ids.includes(String(child)) && !ids.includes(String(parentOf[child])));
+						});
+						if (samples.length >= 30 && orphans.length == 0) {
+							console.log("PASS [driver] a parent's row never disappears while its children are still painted");
+						} else {
+							console.log(`FAIL [driver] a parent's row never disappears while its children are still painted (${orphans.length} frames of ${samples.length}: ${JSON.stringify(orphans.slice(0, 3))})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+
+					// (2) childless to childless: a pure row swap, no motion
+					console.log("[drive] phase 2: waiting for the childless member F's icon");
+					let sawF = false;
+					for (let attempt = 0; attempt < 20 && !sawF; attempt++) {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [null,], newSandbox: false,
+						}).catch(() => null);
+						const dump2 = response && response.value ? JSON.parse(response.value) : null;
+						sawF = !!dump2 && (dump2.icons || []).some(icon => icon.id == String(e.f));
+						if (!sawF) { await new Promise(resolve => setTimeout(resolve, 500)); }
+					}
+					if (!sawF) {
+						console.log("FAIL [driver] the childless member's icon appears (pure-swap switch)");
+						process.exitCode = process.exitCode || 1;
+					} else {
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [e.f,], newSandbox: false,
+						}).catch(error => console.log(`[drive] click-F failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 1500));
+						console.log("[drive] phase 2: clicking the B icon (pure swap sampling)");
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
+						}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 120));
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
+						}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 2600));
+						const samples = await readSamples("pure swap");
+						const seenSwap = [];
+						for (const sample of samples) {
+							const key = `${sample.rows}|${sample.ids}`;
+							if (!seenSwap.length || seenSwap[seenSwap.length - 1].key != key) { seenSwap.push({ key, t: sample.t, top: sample.top, }); }
+						}
+						console.log(`[drive] pure swap row sets: ${JSON.stringify(seenSwap.map(entry => [entry.t, entry.top, entry.key]))}`);
+						// the swap cannot be atomic: the incoming member is revealed by
+						// the activation and the outgoing one is hidden by us, two IPC
+						// messages that TST's sidebar paints in separate frames.  The
+						// measurable goal is therefore "one frame, not a visible jump":
+						// the tree returns to its exact position and is never displaced
+						// for more than a single sampled frame.
+						const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
+						const restingTop = tops.length ? tops[tops.length - 1] : null;
+						const displaced = samples.filter(sample => sample.top >= 0 && restingTop != null && Math.abs(sample.top - tops[0]) > 2);
+						const frameBudget = 2;
+						if (samples.length >= 30 && displaced.length <= frameBudget && restingTop != null && Math.abs(restingTop - tops[0]) <= 2) {
+							console.log(`PASS [driver] switching between childless shelf tabs displaces the tree for at most ${displaced.length} frame(s) and returns it (${displaced.length * 17}ms)`);
+						} else {
+							console.log(`FAIL [driver] switching between childless shelf tabs displaces the tree (${displaced.length} frames of ${samples.length}, trail ${JSON.stringify([...new Set(tops)])})`);
+							process.exitCode = process.exitCode || 1;
+						}
+
+					}
+
+					// -- a shelf of shelves: the owner must not vanish while a
+					// tab of ITS shelf is active.  Activate C (a member of A's
+					// shelf that owns a nested shelf), click c1 on that nested
+					// shelf, and check that C keeps its row — with it, the
+					// nested strap stays on screen.
+					console.log("[drive] phase 2: nested shelf check");
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
+					}).catch(error => console.log(`[drive] nested owner click failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 2000));
+					let nestedDump = null;
+					for (let attempt = 0; attempt < 20; attempt++) {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [null,], newSandbox: false,
+						}).catch(() => null);
+						nestedDump = response && response.value ? JSON.parse(response.value) : null;
+						const row = nestedDump && nestedDump.rows.find(candidate => candidate.id == String(e.nestedOwner));
+						if (row && row.strap) { break; }
+						await new Promise(resolve => setTimeout(resolve, 500));
+					}
+					{
+						const row = nestedDump && nestedDump.rows.find(candidate => candidate.id == String(e.nestedOwner));
+						const icon = nestedDump && (nestedDump.icons || []).find(candidate => candidate.id == String(e.nestedMember));
+						if (row && row.strap && icon) {
+							console.log("PASS [driver] a shelved tab that owns a shelf shows that shelf in its own row");
+						} else {
+							console.log(`FAIL [driver] a shelved tab that owns a shelf shows that shelf in its own row (owner=${JSON.stringify(row)} member=${JSON.stringify(icon)})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.nestedMember,], newSandbox: false,
+					}).catch(error => console.log(`[drive] nested member click failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 2500));
+					{
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [null,], newSandbox: false,
+						}).catch(() => null);
+						const dump3 = response && response.value ? JSON.parse(response.value) : null;
+						const row = dump3 && dump3.rows.find(candidate => candidate.id == String(e.nestedOwner));
+						const activeRow = dump3 && dump3.rows.find(candidate => candidate.id == String(e.nestedMember));
+						// 0.1.5 hid the owner here and the nested shelf vanished
+						// with it; the owner must keep its row instead
+						if (row && row.strap) {
+							console.log("PASS [driver] activating a tab of a nested shelf keeps that shelf's owner visible");
+						} else {
+							console.log(`FAIL [driver] activating a tab of a nested shelf keeps that shelf's owner visible (owner=${JSON.stringify(row)})`);
+							process.exitCode = process.exitCode || 1;
+						}
+						if (activeRow) {
+							console.log("PASS [driver] the activated nested member has a row of its own");
+						} else {
+							console.log("FAIL [driver] the activated nested member has a row of its own");
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+					// leave C folded again: phase 3 asserts that TST's native
+					// fold state survives the reinstall
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
+					}).catch(error => console.log(`[drive] refold click failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 1500));
 				}
 			}
 		}

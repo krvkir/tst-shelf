@@ -10,6 +10,12 @@
  *               { id, states: string[], children: node[] }
  *   shelved   — Set<number> of tab ids with the sticky flag
  *   tabsById  — Map<id, browser.tabs.Tab> (index, hidden, active, pinned…)
+ *   hiddenByUs — Set<number> of tab ids THIS addon hid (browser.tabs.hide)
+ *               to take their rows out of TST's flow.  The distinction
+ *               matters: a tab hidden by us still gets a shelf icon (we
+ *               hid it precisely because it lives on a shelf), while a
+ *               tab hidden by ANOTHER addon (tst-workspace container
+ *               filtering) must not appear at all.
  *
  * Terminology (openspec/openspec/project.md):
  *   shelf owner — the tab whose row hosts a strap; the root shelf is
@@ -79,13 +85,12 @@ export function resolveFavicons (tabs, memory) {
  *   shelfOf: Map<number, number|null>,    // member -> its shelf owner
  *   ownerIds: Set<number>,                 // owners with >=1 visible member
  *   selectedOfShelf: Map<number|null, number|null>,
- *   ghostIds: Set<number>,
  *   badgeIds: Set<number>,
  *   highlightIds: Set<number>,
  *   shelvedVisible: number[],
  * }}
  */
-export function derive ({ tree, shelved, tabsById, }) {
+export function derive ({ tree, shelved, tabsById, hiddenByUs = new Set, }) {
 	const { parentIdOf, hasChildIds, foldedIds, } = indexTree(tree);
 	// Member order = the TREE WALK order (treePositions), the order the
 	// TST sidebar renders rows in.  Physical browser.tabs indices lag
@@ -96,7 +101,10 @@ export function derive ({ tree, shelved, tabsById, }) {
 	const tabOf = id => tabsById.get(id) || { id, hidden: true, active: false, index: Number.MAX_SAFE_INTEGER, };
 	const visible = id => {
 		const tab = tabOf(id);
-		return !tab.pinned && !tab.hidden;
+		if (tab.pinned) { return false; }
+		// hidden by us: the row is gone on purpose, the icon stays;
+		// hidden by someone else (tst-workspace filtering): no icon.
+		return !tab.hidden || hiddenByUs.has(id);
 	};
 
 	// shelves: group every VISIBLE shelved tab under its derived owner
@@ -133,14 +141,10 @@ export function derive ({ tree, shelved, tabsById, }) {
 		selectedOfShelf.set(owner, active ?? expandedMembers[0]);
 	}
 
-	// ghost row: a selected shelved tab anchoring its own nested shelf —
-	// its row must stay in the flow to host the strap, caption hidden.
-	const ghostIds = new Set;
-	for (const selected of selectedOfShelf.values()) {
-		if (selected != null && ownerIds.has(selected)) {
-			ghostIds.add(selected);
-		}
-	}
+	// The strap targets the OWNER row (0.1.4): the shelf sits inside the
+	// owner's own line, beside the caption (style.esm.js rule 2), and
+	// members keep no row at all — they are hidden tabs.  Nothing to
+	// compute here: `render.esm.js` sends the strap to the owner.
 
 	// plus badge: children are folded (spec: the badge disappears while
 	// unfolded; childless shelved tabs carry no badge).
@@ -170,11 +174,47 @@ export function derive ({ tree, shelved, tabsById, }) {
 		shelfOf,
 		ownerIds,
 		selectedOfShelf,
-		ghostIds,
 		badgeIds,
 		highlightIds,
 		shelvedVisible,
 	};
+}
+
+/**
+ * The tabs that must keep their rows whatever else the extension does.
+ *
+ * Three facts force this list.  (1) Firefox reveals a hidden tab when it
+ * becomes the active tab and refuses to hide the active tab again, so
+ * the active tab always paints a row.  (2) A hidden tab's descendants
+ * are not rendered at all, so hiding an ANCESTOR of the active tab would
+ * take the active tab's own row away — and for a shelf of shelves it
+ * would also take the nested shelf's strap away, because that strap
+ * lives in its owner's row.  (3) TST animates collapse/expand for
+ * `configs.collapseDuration` (150 ms) *before* it removes the rows, so a
+ * parent whose children are mid-animation must keep its row too, or the
+ * animating children are orphaned (parent row gone, children still
+ * painted) — the visible "jump" when switching between shelf tabs.
+ *
+ * So: the active tab, every tab in a collapse/expand animation, and all
+ * their ancestors.
+ *
+ * @returns {Set<number>} ids that must stay visible
+ */
+export function mustShowTabs ({ tree, activeId, animationStates = ["collapsing", "expanding"], }) {
+	const { parentIdOf, statesById, } = indexTree(tree);
+	const must = new Set;
+	const protect = id => {
+		let node = id;
+		while (node != null && node != undefined && !must.has(node)) {
+			must.add(node);
+			node = parentIdOf.get(node) ?? null;
+		}
+	};
+	if (activeId != null) { protect(activeId); }
+	for (const [id, states] of statesById) {
+		if (animationStates.some(state => states.includes(state))) { protect(id); }
+	}
+	return must;
 }
 
 /**
@@ -256,10 +296,16 @@ export function treePositions (tree) {
 
 /**
  * The single next move that makes every shelf's members contiguous
- * directly under their owner, newest member last (spec
- * shelf-nesting/shelf-presentation: the selected member's children
- * render directly below the strap; a tab put on the shelf becomes the
- * rightmost icon).  Non-member tabs never change their relative order.
+ * directly under their owner, newest member last (spec shelf-pinning:
+ * a tab put on the shelf becomes the rightmost icon).  Non-member tabs
+ * never change their relative order.
+ *
+ * Members are contiguous so that the SELECTED member's subtree — the
+ * only rows a shelf shows — always renders directly below the owner
+ * row: every row between the owner and it belongs to a hidden member
+ * and therefore paints nothing (0.1.4; the members themselves have no
+ * rows at all, so the icon order can follow plain tab order and icons
+ * no longer jump when the selection changes).
  *
  * Ranks are positions in TST's INTERNAL order (treePositions), not
  * physical strip indices.  Returns ONE move per call — positions shift
@@ -278,22 +324,32 @@ export function treePositions (tree) {
  *     its subtree).  Defensive: unreachable under TST's contiguity
  *     invariants with a dense strip, kept as a failsafe.
  *
- * `appendTabId` forces that member to the END of its shelf regardless
- * of its current rank (put order; drags keep rank order).
+ * `appendOrder` (Map tabId -> sequence) forces the members that carry a
+ * sequence to the END of their shelf, in that sequence's order: it is the
+ * PUT order (a newly shelved tab becomes the rightmost icon).  A plain
+ * `appendTabId` slot could not express this — two puts in quick
+ * succession overwrote each other and the first one silently kept its
+ * old slot (caught by the E2E: `[B, C, F]` instead of `[C, B, F]`).
+ * Members without a sequence keep their rank order and come first, so a
+ * drag that re-parents a tab still decides its place.
  * @returns {null|{tabId: number, kind: string, referenceTabId: number, thenOutdent?: boolean}}
  */
-export function nextPlacementMove ({ ranks, sizes, shelves, appendTabId = null, }) {
+export function nextPlacementMove ({ ranks, sizes, shelves, appendOrder = null, }) {
 	const sorted = [...ranks].sort((a, b) => a.pos - b.pos);
 	const rankOf = new Map(sorted.map(rank => [rank.id, rank]));
 	const rankAt = pos => sorted.find(rank => rank.pos === pos) || null;
 	for (const [owner, members] of shelves) {
+		const seqOf = id => (appendOrder && appendOrder.has(id)) ? appendOrder.get(id) : null;
 		const ordered = members
 			.filter(id => rankOf.has(id) && !rankOf.get(id).pinned)
-			.sort((a, b) => rankOf.get(a).pos - rankOf.get(b).pos);
-		if (appendTabId != null && ordered.includes(appendTabId)) {
-			ordered.splice(ordered.indexOf(appendTabId), 1);
-			ordered.push(appendTabId);
-		}
+			.sort((a, b) => {
+				const aSeq = seqOf(a);
+				const bSeq = seqOf(b);
+				if (aSeq != null && bSeq != null) { return aSeq - bSeq; }
+				if (aSeq != null) { return 1; }
+				if (bSeq != null) { return -1; }
+				return rankOf.get(a).pos - rankOf.get(b).pos;
+			});
 		const ownerRank = owner === ROOT_SHELF ? null : rankOf.get(owner);
 		if (owner !== ROOT_SHELF && !ownerRank) { continue; }
 		let expected = owner === ROOT_SHELF ? firstNormalPos(sorted) : ownerRank.pos + 1;

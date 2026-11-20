@@ -25,21 +25,28 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
   on shelf-less tabs (their shelf auto-creates), re-parenting and
   window moves re-derive the target shelf; only the explicit
   "Take off the shelf" action ends shelving.
-- **Shelves render as favicon straps on a SECOND line of the owner's
-  row** (TST extra contents, place `tab-below`; the owner row grows —
-  the caption line is never squeezed); shelved root tabs go on the
-  root shelf, a fixed strap at the top of the tab bar (TST renders
-  `tabbar-top` above the global pinned box — the below-pinned
-  placement needs an upstream TST slot; recorded in the openspec
-  design). Icons wrap into more rows when they do not fit, and a
-  newly shelved tab becomes the rightmost icon.
+- **The shelf lives INSIDE the owner's row** (0.1.4): the owner keeps
+  its twisty, favicon and title on the left; the shelf's icons sit on
+  the right of the same line, take at most 2/3 of the row and scroll
+  horizontally past that. The title truncates with an ellipsis and
+  TST's tab tooltip still shows it in full on hover. The row keeps its
+  normal height, so nothing about TST's drag-and-drop geometry changes.
+  Shelved root tabs go on the root shelf, a fixed strap at the top of
+  the tab bar (TST renders `tabbar-top` above the global pinned box —
+  the below-pinned placement needs an upstream TST slot; recorded in
+  the openspec design). A newly shelved tab becomes the rightmost
+  icon.
+- **Shelved tabs have no rows at all** (0.1.4): they are hidden with
+  `browser.tabs.hide()`, the only lever that removes a tab from TST's
+  renderable set without breaking its uniform-row arithmetic. A shelf
+  therefore costs exactly one line, and the tree is exactly as tall as
+  the same tree with those tabs deleted.
 - **Members stay contiguous directly under their owner**, so the
-  selected member's children dangle right below the strap instead of
-  below the owner's whole subtree. Placement uses TST's own
-  subtree-preserving move API (`move-before`/`move-after` with
-  `followChildren`) — tree relations never change, non-member tabs
-  keep their relative order, and take-off returns the tab to the
-  position it had before shelving.
+  selected member's children appear right below the owner's row.
+  Placement uses TST's own subtree-preserving move API
+  (`move-before`/`move-after` with `followChildren`) — tree relations
+  never change, non-member tabs keep their relative order, and
+  take-off returns the tab to the position it had before shelving.
 - **Icons carry the tab's tooltip** (title and URL), its favicon, a
   plus badge while the member's subtree is folded, and a highlight
   while the member or one of its descendants is active. Right-click
@@ -64,6 +71,9 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
 
 - `tabs` — reading tab metadata (titles, URLs, favicons) for icons
   and tooltips.
+- `tabHide` — shelved tabs are hidden so they take no row; TST itself
+  requests this permission for its own hidden-tab support. Taking a tab
+  off the shelf shows it again.
 - `menus` — the two tab-context-menu items are the extension's OWN
   `browser.menus` items (see implementation notes); they appear in
   the TST sidebar's tab menu and in the native tab bar's menu.
@@ -85,13 +95,37 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
   `style` attribute of extra contents survives TST's DOMPurify pass —
   `background-image: url(...)` renders favicons without host
   permissions (verified in the shipped TST 4.4.x by the E2E).
-- **Variable row heights vs TST's virtual scroll.** TST computes the
-  scroll extent as rendered-count × `--tab-size`; CSS-hidden shelved
-  rows and auto-height owner rows drift the pixel stack (design.md,
-  risks). The drift is bounded by the number of shelf rows in the
-  rendered viewport; the designed fallback (quantized owner heights)
-  is not needed for v1 trees of the tested size but remains in the
-  task list for the 350-tab performance pass.
+- **The active tab and its ancestors always keep their rows.** Firefox
+  reveals a hidden tab when it becomes the active tab and refuses to
+  hide the active tab again (`tabs.hide` resolves with `[]`; MDN lists
+  the active tab as ineligible). A hidden tab's descendants are not
+  rendered either, so the extension also keeps every *ancestor* of the
+  active tab visible: activating a tab of a nested shelf therefore keeps
+  the nested shelf's owner on screen, with its strap. A member's row is
+  reclaimed as soon as nothing depends on it, and a member whose children
+  are folding away keeps its row until the animation ends (300 ms guard)
+  so no frame shows children without their parent.
+- **Switching between two shelf tabs moves the tree at most one frame.**
+  The swap cannot be atomic — the browser reveals the incoming tab, the
+  extension hides the outgoing one, and TST paints them in separate
+  frames — so the rows below the shelf shift by one row for 0–34 ms and
+  end exactly where they started. Two childless members swap in place
+  (measured: 0, 1 and 2 frames across E2E runs).
+- **Hiding is shared with other extensions.** A shelved tab is hidden
+  through the same mechanism tst-workspace uses for container
+  filtering. The extension re-applies its hides on every derivation
+  and remembers which hides are its own (in the tab's session value),
+  so a workspace switch visibly restores our tabs for at most one
+  debounce and never makes a foreign-filtered tab appear on a shelf.
+  Do not enable TST's expert option "Show hidden tabs which are hidden
+  by other extensions" (`renderHiddenTabs`): it puts shelved tabs back
+  into the flow and the shelf loses its compaction.
+- **Variable row heights vs TST's virtual scroll** (historical, 0.1.3
+  and earlier): TST computes the scroll extent as rendered-count ×
+  `--tab-size`; owner rows that grew and CSS-hidden member rows drifted
+  the pixel stack. 0.1.4 conforms — every rendered row keeps the
+  uniform height — and the E2E asserts the arithmetic row by row.
+  Open task 7.2 is the 350-tab performance pass.
 - **Private windows are untouched.** TST refuses external messages
   about private tabs unless the user enables both "Allow in private
   windows" and TST's own permission checkbox.
@@ -143,13 +177,30 @@ Marionette's `Addon:Install`, and runs three phases:
    derivation: the restart-persistence proxy (temporary installs
    never survive a real restart; the boot path is identical).
 
-Exit code 0 means every assertion passed (currently 50 across the
+Exit code 0 means every assertion passed (currently 55 across the
 three phases; two consecutive clean runs required before merging).
 `node tests/probe-mexec.mjs` is a standalone probe for Marionette
 `ExecuteScript` semantics on the current Firefox build.
 
 ## Implementation notes (verified against TST 4.4.10 sources)
 
+- **THE UNIFORM-ROW LAW (0.1.3): TST never measures painted rows.**
+  Drop zones, virtual scroll and sticky rows all COMPUTE geometry as
+  `renderedTabHeight * index over renderable items`
+  (`Scroll.getItemRect`, scroll.js:664-716; the drag zones quarter
+  that rect, drag-and-drop.js:458-500). Every renderable row must
+  therefore paint at exactly one `--tab-size`: 0.1.1 grew owner rows
+  (strap as a second line) and collapsed member rows (negative
+  margin), shifting every computed rect below each shelf by
+  `39*members + strap extra` — drops there always landed as siblings
+  and the attach marker stopped appearing. No CSS layout can both
+  save member-row space and keep the arithmetic true (space saved =
+  drift). 0.1.3 conforms: every row keeps the default height, member
+  rows stay in the flow as blank boxes, and the strap renders inside
+  the FIRST member's row (host state `tst-shelf-host`), wrapped lines
+  spilling visually (`overflow: visible` on the below container)
+  across the blank member rows. The E2E replays TST's arithmetic in
+  the sidebar as a permanent conformance gate.
 - **TST has three tab orders that disagree for ~250 ms after every
   internal move**: the physical strip, TST's internal index order,
   and the children-array walk that `get-light-tree` returns and the
@@ -166,15 +217,8 @@ three phases; two consecutive clean runs required before merging).
   favicon memory through every `tabs.query` (`resolveFavicons`,
   logic.esm.js); the diffing renderer then emits an unchanged strap
   during the load, so the sidebar never drops the style attribute.
-- **base.css:183 pins rows at
-  `tab-item:not(.faviconized):not(.dummy)`** — specificity (0,2,1);
-  a plain `.tst-shelf-owner` rule never wins the height. Match the
-  pseudo-class chain, force with `!important`, and remember
-  `tab-item-substance` is a ROW flex: the below container needs
-  `flex-basis: 100%` + substance `flex-wrap: wrap` to become a
-  second line.
 - **The only stored state is the sticky flag** (`tst-shelf` session
-  value). Shelf membership, ghosts, badges, highlight and selection
+  value). Shelf membership, hosts, badges, highlight and selection
   are derived from TST's light tree + `browser.tabs` on every
   structural event (debounced, whole-window, idempotent diff against
   what was last applied).
