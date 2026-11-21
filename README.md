@@ -101,6 +101,34 @@ extending, `scroll` always keeps one line and scrolls.
   unfolded subtree survives unrelated tab activations (a narrow
   `try-collapse-tree-from-other-expansion` cancellation protects only
   shelved victims).
+- **A folded owner reveals one branch only** (0.2.1, both companions since 0.2.2): activating a tab
+  from the shelf of a folded owner expands that owner — TST renders a
+  child row only if every ancestor is expanded — but every descendant
+  outside the activated tab's branch keeps no row, so an unshelved
+  sibling of the shelf block does not appear out of a fold. The branch
+  is anchored on the owner's direct child, so a nested shelf keeps the
+  row its strap lives in. TST's own over-expansion (it expands the tab
+  *and all its ancestors*) is cancelled only when a reveal takes over.
+  Leaving the owner's subtree folds it back.
+  - *With the `row-less` capability* the other descendants keep their
+    browser state: only the row goes, nothing is hidden.
+  - *On a stock TST* (0.2.2) the only lever is `browser.tabs.hide()`, so
+    the other descendants are hidden while the reveal lives. That state
+    is tracked separately from shelved tabs, restored when the reveal
+    ends, and released at boot if the browser stopped mid-reveal — a
+    reveal never leaves a tab invisible.
+  - Known limitation on both paths: a suppressed tab that owns its own
+    shelf loses that shelf's strap while it is suppressed (a strap lives
+    in its owner's row).
+- **A member's row comes back the moment it is activated** (0.2.2): the
+  row-less state lives in TST's model, so the row appears only when the
+  state is removed — waiting for the debounced re-derivation left the
+  children hanging under nothing for that window. Childless members keep
+  no row at all.
+- **A failed tree export is retried** (0.2.2): TST's tree export failing
+  once used to end a re-derivation silently, leaving the previous
+  decision in force (a member could keep a stale row-less claim). The
+  pass now retries up to five times.
 - **Workspace parity**: icons of tabs hidden by container-workspace
   extensions (e.g. tst-workspace) are not rendered; an empty shelf
   reserves no space. No messages are exchanged with them.

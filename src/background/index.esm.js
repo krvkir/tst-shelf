@@ -18,7 +18,7 @@
  * live TST light tree + browser.tabs on every structural event.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, mustShowTabs, danglingMembers, ROOT_SHELF } from "./logic.esm.js";
+import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, mustShowTabs, danglingMembers, planReveals, isSubtreeFolded, ROOT_SHELF } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
 import { SHELF_STYLE } from "./style.esm.js";
 
@@ -80,6 +80,56 @@ const shelfLines = new Map;
 /** @type {Set<number>} members rendered row-less through TST (feature 1:
  *  a childless shelved tab has no row at all, yet is never hidden). */
 const rowLessByUs = new Set;
+/** @type {Map<number, Map<number, {openedSeen: boolean}>>} windowId -> shelf
+ *  owner -> reveal.  A reveal keeps ONE folded owner expanded while a
+ *  descendant of it is active, and suppresses every other descendant's row
+ *  (planReveals), so activating a shelved tab from a folded owner's shelf
+ *  shows that tab's subtree only instead of the owner's whole subtree. */
+const reveals = new Map;
+/** @type {Map<number, number>} tabId -> times a row-less claim failed to
+ *  stick (the tab rendered anyway).  Bounded so a stubborn state cannot
+ *  spin: past MAX_ROW_LESS_TRIES the tab simply keeps its row. */
+const rowLessTries = new Map;
+const MAX_ROW_LESS_TRIES = 4;
+
+/** Set when a sidebar (re)appears: its initial import carries only TST's own
+ *  safe states, so every claim has to be sent again even though the ledger
+ *  says it was applied.  Consumed by the next derivation. */
+let forceRowLessResync = false;
+/** @type {Map<number, number>} windowId -> consecutive failed tree exports;
+ *  a failed pass must not silently keep the previous decision in force. */
+const treeFetchTries = new Map;
+const MAX_TREE_FETCH_TRIES = 5;
+/** Ring of the last diagnostics relevant to the E2E (no storage IPC). */
+const diagLog = [];
+function diag (text) {
+	diagLog.push(`${Date.now().toString(36)} ${text}`);
+	if (diagLog.length > 40) { diagLog.shift(); }
+}
+
+/** Last row-less decision trace (E2E diagnostics only). */
+let rowLessDebug = null;
+let rowLessTrace = null;
+
+/** @type {Set<number>} tabs whose row is currently suppressed by a reveal.
+ *  Never members: those are row-less already. */
+const suppressedByUs = new Set;
+/** @type {Set<number>} tabs whose row a reveal removed by HIDING them — the
+ *  stock-TST lever.  Separate from `hiddenByUs` on purpose: that set means
+ *  "hidden but still an icon on a shelf", and `reconcileHidden` shows such
+ *  tabs again. */
+const suppressedHiddenByUs = new Set;
+/** Per-tab session key: true while a reveal keeps the tab hidden.  A crash
+ *  mid-reveal must not leave an invisible tab behind (reveals are runtime
+ *  state), so the boot path shows every tab carrying it. */
+const SUPPRESSED_KEY = "tst-shelf-suppressed";
+/** @type {Map<number, number>} tabId -> timestamp until which a suppressed
+ *  tab keeps its suppression after the reveal that suppressed it ended.
+ *  The owner is folded back at that moment, and TST removes the rows of a
+ *  collapse only after `configs.collapseDuration` (150 ms) — lifting the
+ *  suppression sooner would paint the siblings for the length of the
+ *  animation (the "rows flash" jump). */
+const suppressHold = new Map;
 /** "auto" | "scroll" | "extend" — what a crowded shelf does.  "auto" extends
  *  the row in whole lines when TST supports it, and scrolls otherwise. */
 const SETTING_LAYOUT = "shelf-layout";
@@ -130,23 +180,38 @@ browser.storage.onChanged.addListener((changes, area) => {
 	scheduleRederiveAll();
 });
 
-/** Rebuild the shelved set from per-tab session values after (re)start. */
+/** Rebuild the shelved set from per-tab session values after (re)start, and
+ *  release any tab a reveal left hidden.
+ *
+ *  The suppressed-tab bit is only read for tabs that are actually hidden:
+ *  the stock lever sets `hidden`, the row-less one never does, so on a
+ *  patched companion this costs zero extra reads (a 350-tab boot reads 350
+ *  values, not 700). */
 async function loadShelvedFromSessions () {
 	const tabs = await browser.tabs.query({});
 	const values = await Promise.all(tabs.map(async tab => {
-		try { return await browser.sessions.getTabValue(tab.id, FLAG_KEY); }
-		catch (_error) { return null; }
+		const read = key => browser.sessions.getTabValue(tab.id, key).catch(() => null);
+		const [flag, suppressed,] = await Promise.all([
+			read(FLAG_KEY),
+			tab.hidden ? read(SUPPRESSED_KEY) : null,
+		]);
+		return { flag, suppressed, };
 	}));
+	const stale = [];
 	tabs.forEach((tab, index) => {
-		const value = values[index];
-		if (!value || !value.on) { return; }
+		const { flag, suppressed, } = values[index];
+		if (suppressed === true) { stale.push(tab.id); }
+		if (!flag || !flag.on) { return; }
 		shelved.add(tab.id);
 		// a member whose row we hid stays OURS across a restart: without
 		// this the boot derivation would read it as foreign-hidden
 		// (workspace filtering) and leave its icon off the shelf.
-		if (value.hidden) { hiddenByUs.add(tab.id); }
+		if (flag.hidden) { hiddenByUs.add(tab.id); }
 	});
 	logBoot("boot-shelved", `${shelved.size} of ${tabs.length} tabs`);
+	// a reveal that was running when the browser died left its suppressed
+	// tabs hidden; reveals never survive a restart, so show them now
+	if (stale.length) { await releaseSuppressed(stale); }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,8 +259,13 @@ const TST = tstApi({
 			// A sidebar that opens LATER missed every state we applied while it
 			// was closed: TST exports only its own safe states on a sidebar's
 			// initial import (common/TreeItem.js exportTab), so addon states are
-			// not in it.  Forget both ledgers and re-apply from scratch.
-			rowLessByUs.clear();
+			// not in it.  Do NOT drop the ledgers — they are our knowledge of
+			// what must be re-applied, and dropping them left rows behind with
+			// nothing to retry (measured: claimed=[] while members had rows).
+			// Force the next pass to re-send every claim instead.
+			forceRowLessResync = true;
+			// a fresh sidebar deserves fresh chances at making a state stick
+			rowLessTries.clear();
 			renderer.forceStateResync();
 			if (message?.windowId != null) { scheduleRederive(message.windowId); }
 			onTabsRendered([], message?.windowId);
@@ -204,6 +274,15 @@ const TST = tstApi({
 		"extra-contents-mousedown": message => onExtraContentsMousedown(message),
 		"extra-contents-clicked": message => onExtraContentsClicked(message),
 		"try-collapse-tree-from-other-expansion": message => shelved.has(message?.tab?.id),
+		// TST is about to expand the activated tab AND ALL ITS ANCESTORS
+		// (background/handle-tab-focus.js, toBeExpandedAncestors).  For a tab
+		// on the shelf of a FOLDED owner that is exactly the "wall of rows"
+		// the reveal prevents: we expand the owner ourselves, keep the
+		// activated tab's branch and suppress the rest.  Answer truthy ONLY
+		// when we take over (tst-api's tryOperationAllowed cancels on any
+		// truthy answer).
+		"try-expand-tree-from-focused-collapsed-tab": message =>
+			maybeBeginReveal(message?.tab?.windowId, message?.tab?.id),
 		"try-scroll-to-activated-tab": message => onTryScrollToActivatedTab(message),
 	},
 	onError: error => logBoot("tst-error", String(error && error.message || error).slice(0, 120)),
@@ -361,16 +440,47 @@ async function rederive (windowId, { reconcile = false, } = {}) {
 	// the active tab (mustShowTabs).  Hiding never changes the structure,
 	// so the tree stays valid across it.
 	const tree = await fetchLightTree(windowId, tabsById);
-	if (!tree) { return; }
+	if (!tree) {
+		// A failed tree export used to end the pass silently, leaving the
+		// previous decision in force: a member that had just been activated
+		// kept the row-less claim of the pass taken while ANOTHER tab was
+		// active, so its children rendered without their parent until some
+		// unrelated event re-derived (measured: the trace still named the
+		// previous active tab minutes later).  Retry, bounded.
+		const tries = (treeFetchTries.get(windowId) || 0) + 1;
+		treeFetchTries.set(windowId, tries);
+		logBoot("tree-fetch-fail", `window ${windowId} tries=${tries}`);
+		diag(`tree-fail w=${windowId} tries=${tries}`);
+		if (tries <= MAX_TREE_FETCH_TRIES) { scheduleRederive(windowId); }
+		return;
+	}
+	treeFetchTries.delete(windowId);
 	// members keep NO row: hide them (and bring back any we hid that
 	// left the shelf, or that must stay visible).
 	// FOLD FIRST: a member's subtree may stay unfolded only while its own
 	// row is on screen (logic.esm.js danglingMembers).  Folding arms the
 	// hide guard for exactly those members, so the hide below waits for
 	// TST's collapse animation instead of orphaning the children's rows.
-	const mustShow = mustShowTabs({ tree, activeId: tabs.find(tab => tab.active)?.id ?? null, });
+	// WHICH TAB IS ACTIVE is re-read here, not taken from the snapshot
+	// above: the snapshot is taken before the tree fetch, and a tab the
+	// user just activated (a shelf click, a Ctrl+Tab) is still inactive in
+	// it.  The row-less rule hangs on exactly that flag — a member with
+	// children must keep its row while it is active — so a stale snapshot
+	// took the row away from the tab that had just been activated and left
+	// its children dangling (measured: `5:anchor` in the trace while 5 was
+	// still claimed row-less).
+	const liveActive = await browser.tabs.query({ windowId, active: true, })
+		.then(list => list.shift(), () => null);
+	diag(`rederive w=${windowId} active=${liveActive?.id} shelved=${shelved.size}`);
+	const activeId = liveActive?.id ?? null;
+	const mustShow = mustShowTabs({ tree, activeId, });
 	foldDanglingMembers(windowId, tree, mustShow);
-	await reconcileHidden(windowId, tabs, mustShow, tree);
+	await reconcileHidden(windowId, tabs, mustShow, tree, activeId);
+	// 0.1.7/0.2.x: a folded owner that a reveal keeps open shows only the
+	// active tab's branch — every other descendant loses its row here.
+	await reconcileSuppressed(windowId, tree, tabsById, mustShow, activeId);
+	// one forced re-application per sidebar appearance (see sidebar-show)
+	forceRowLessResync = false;
 
 	const derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
 	// 0.2.0: a crowded shelf grows its row in whole lines instead of
@@ -461,7 +571,7 @@ function foldDanglingMembers (windowId, tree, mustShow) {
 /** Hide the members of this window; bring back members we hid that left
  *  the shelf.  Mutates the `tabs` records so the derivation sees the
  *  truth: tabs.query snapshots taken before a hide are stale. */
-async function reconcileHidden (windowId, tabs, mustShow = new Set, tree = null) {
+async function reconcileHidden (windowId, tabs, mustShow = new Set, tree = null, activeId = null) {
 	if (!tabs.length) { return; }
 	const byId = new Map(tabs.map(tab => [tab.id, tab]));
 
@@ -481,26 +591,42 @@ async function reconcileHidden (windowId, tabs, mustShow = new Set, tree = null)
 	let deferredUntil = 0;
 	const wantRowLess = new Set;
 	const rowLessMode = tstShelfCapabilities.rowLess && !!tree;
+
 	if (rowLessMode) {
 		const { hasChildIds, } = indexTree(tree);
+		const trace = [];
 		for (const id of shelved) {
 			const tab = byId.get(id);
 			if (!tab || tab.pinned) { continue; }
 			const childless = !hasChildIds.has(id);
-			if (!childless && mustShow.has(id)) { continue; } // row is the subtree's anchor
+			if (!childless && mustShow.has(id)) { trace.push(`${id}:anchor`); continue; } // row is the subtree's anchor
 			if (!childless) {
 				const guardedUntil = hideGuard.get(id);
 				if (guardedUntil && now < guardedUntil) {
 					deferredUntil = Math.max(deferredUntil, guardedUntil);
+					trace.push(`${id}:guarded`);
 					continue;
 				}
 				if (guardedUntil) { hideGuard.delete(id); }
 			}
 			wantRowLess.add(id);
+			trace.push(`${id}:rowless`);
 		}
+		rowLessTrace = `w=${windowId} active=${activeId} kids=${[...hasChildIds].join(",")} ${trace.join(" ")} must=${[...mustShow].join(",")}`;
 	}
-	const toRowLess = [...wantRowLess].filter(id => !rowLessByUs.has(id));
-	const offRowLess = [...rowLessByUs].filter(id => !wantRowLess.has(id));
+	const toRowLess = [...wantRowLess].filter(id => forceRowLessResync || !rowLessByUs.has(id));
+	// ONLY tabs of THIS window: the ledger is global (a tab id is unique
+	// across windows), and a derivation of a window that does not contain a
+	// tab would otherwise read it as "no longer a member" and strip every
+	// other window's row-less states — the member rows then reappeared on
+	// any event in the second window (same class of bug as the renderer's
+	// global state cleanup; caught by E2E flakiness, diagnosed from
+	// claimed=[] while members had rows).
+	const offRowLess = [...rowLessByUs].filter(id => !wantRowLess.has(id) && tabsById.has(id));
+	if (rowLessTrace) {
+		rowLessDebug = `${rowLessTrace} | +${toRowLess.join(",") || "-"} -${offRowLess.join(",") || "-"} force=${forceRowLessResync}`;
+		rowLessTrace = null;
+	}
 	if (toRowLess.length) {
 		await Promise.all(toRowLess.map(id => TST.methods.addTabState({ tab: id, state: "row-less", windowId, })
 			.catch(error => logBoot("rowless-fail", `${id} ${error && error.message || error}`))));
@@ -603,6 +729,211 @@ async function rememberHidden (tabIds, hidden) {
 	}));
 }
 
+// ---------------------------------------------------------------------------
+// 3b. reveals: a folded shelf owner shows only the active tab's branch
+//
+// A folded owner's shelf is the folded view of its subtree.  Activating a
+// tab from that shelf needs the owner EXPANDED (TST renders a child row
+// only if every ancestor is expanded), and TST's own reaction is to expand
+// the tab and all its ancestors — which paints the owner's whole subtree.
+// The user vetoed that: only the activated tab's branch may appear, the
+// rest of the subtree must stay as folded as it was.  So the reveal
+// expands the owner and takes the row away from every other descendant
+// (row-less, never hidden), and folds the owner back when the active tab
+// leaves its subtree.
+
+/** Why the last reveal attempt declined — E2E diagnostics only. */
+let revealDebug = null;
+
+function revealsFor (windowId) {
+	let map = reveals.get(windowId);
+	if (!map) { map = new Map; reveals.set(windowId, map); }
+	return map;
+}
+
+/**
+ * Start (or keep) a reveal for the shelf owner of `tabId`.
+ *
+ * Returns true when a reveal covers this activation, which is also the
+ * cancel verdict for `try-expand-tree-from-focused-collapsed-tab`: TST's
+ * expansion of the tab plus its ancestors would reveal the siblings.
+ * False lets TST do its normal thing.
+ *
+ * Works on both companions, with one difference: WITH the row-less
+ * capability the suppressed tabs keep their browser state untouched (only
+ * their row goes), WITHOUT it the only lever is browser.tabs.hide() —
+ * declared by this addon anyway for member rows — so there the suppressed
+ * tabs are hidden, tracked in their own ledger, and restored on the next
+ * derivation and after a restart (`SUPPRESSED_KEY`).
+ */
+function maybeBeginReveal (windowId, tabId) {
+	const bail = reason => { revealDebug = `${reason} w=${windowId} t=${tabId}`; return false; };
+	if (!tstUsable) { return bail("tst-unusable"); }
+	if (windowId == null || tabId == null) { return bail("no-ids"); }
+	const cached = windows.get(windowId);
+	if (!cached) { return bail("no-cache"); }
+	if (!shelved.has(tabId)) { return bail("not-shelved"); }
+	const { tree, derivation, } = cached;
+	const { hasChildIds, statesById, } = indexTree(tree);
+	// a childless member never has a row (feature 1): nothing to reveal
+	if (!hasChildIds.has(tabId)) { return bail("childless"); }
+	const owner = derivation.shelfOf.get(tabId);
+	if (owner == null) { return bail("no-owner"); } // the root shelf owns no row to expand
+	const map = revealsFor(windowId);
+	if (!isSubtreeFolded(statesById.get(owner))) {
+		// owner already expanded: TST shows its whole subtree, which is the
+		// expected behaviour there — but a reveal we started earlier still
+		// decides what else is visible
+		revealDebug = `owner-open w=${windowId} t=${tabId} o=${owner} states=${JSON.stringify(statesById.get(owner))}`;
+		return map.has(owner);
+	}
+	if (!map.has(owner)) {
+		map.set(owner, { openedSeen: false, });
+		logBoot("reveal", `window ${windowId} owner ${owner} tab ${tabId}`);
+		TST.methods.expandTree({ tab: owner, windowId, })
+			.catch(error => logBoot("reveal-fail", `${owner} ${error && error.message || error}`));
+		// TST's cancelled reaction also used to unfold this tab's own
+		// subtree; the branch must come back whole, children included
+		TST.methods.expandTree({ tab: tabId, windowId, }).catch(() => {});
+	}
+	return true;
+}
+
+/** End a reveal: forget it and fold the owner back.  Only ever called for
+ *  owners WE expanded — a reveal exists only if its owner read folded when
+ *  it was created, and a fold the user applies ends the reveal through
+ *  planReveals (see `openedSeen`). */
+function endReveal (windowId, owner) {
+	const map = reveals.get(windowId);
+	if (!map || !map.delete(owner)) { return; }
+	logBoot("reveal-end", `window ${windowId} owner ${owner}`);
+	// The siblings' rows disappear with TST's collapse animation, which
+	// runs for `configs.collapseDuration` BEFORE the rows go.  Lifting
+	// their suppression now would paint them for the length of the
+	// animation (the bounce the user reported for row swaps).
+	const until = Date.now() + COLLAPSE_ANIMATION_GRACE_MS;
+	for (const id of suppressedByUs) { suppressHold.set(id, until); }
+	for (const id of suppressedHiddenByUs) { suppressHold.set(id, until); }
+	if (!tstUsable) { return; }
+	TST.methods.collapseTree({ tab: owner, windowId, })
+		.catch(error => logBoot("reveal-fold-fail", `${owner} ${error && error.message || error}`));
+}
+
+/**
+ * Apply the running reveals: every descendant of a revealed owner that is
+ * not on the active tab's branch loses its row.  Members are excluded —
+ * their row-less state is the member rule's business, and lifting it here
+ * would resurrect a shelf icon's blank row.
+ *
+ * Two levers, chosen by capability:
+ *   - row-less (patched TST): the tab keeps its browser state, only the row
+ *     goes.  Tracked in `suppressedByUs`.
+ *   - browser.tabs.hide() (stock TST): the only way to drop a row there.
+ *     Tracked in `suppressedHiddenByUs` — deliberately NOT in `hiddenByUs`,
+ *     because that set means "hidden, but still shown as a shelf icon" and
+ *     `reconcileHidden` would show such a tab right back.  The session key
+ *     `SUPPRESSED_KEY` makes a crash mid-reveal recoverable at boot.
+ */
+async function reconcileSuppressed (windowId, tree, tabsById, mustShow, activeIdHint = undefined) {
+	if (!tree) { return; }
+	const useRowLess = tstShelfCapabilities.rowLess;
+	const now = Date.now();
+	// the live active id when the caller has a fresher one than its snapshot
+	const activeId = activeIdHint !== undefined ? activeIdHint :
+		[...tabsById.values()].find(tab => tab.active && !tab.hidden)?.id ?? null;
+	const map = reveals.get(windowId) || new Map;
+	const { suppress, prune, } = planReveals({ tree, activeId, reveals: map, mustShow, });
+	for (const owner of prune) { endReveal(windowId, owner); }
+	// once a derivation has SEEN the owner expanded, a later `collapsed`
+	// state on it can only be the user's own fold
+	const { statesById, } = indexTree(tree);
+	for (const [owner, info] of map) {
+		if (!isSubtreeFolded(statesById.get(owner))) { info.openedSeen = true; }
+	}
+	// the ledger of whichever lever is in use
+	const applied = useRowLess ? suppressedByUs : suppressedHiddenByUs;
+	// a tab another addon hid has no row anyway; hiding it would make this
+	// addon answer for someone else's state
+	const isHiddenForUs = id => useRowLess ? false : suppressedHiddenByUs.has(id);
+	const want = new Set(suppress.filter(id => {
+		if (rowLessByUs.has(id) || shelved.has(id) || !tabsById.has(id)) { return false; }
+		return useRowLess ? !tabsById.get(id).hidden : (!tabsById.get(id).hidden || isHiddenForUs(id));
+	}));
+	const toSuppress = [...want].filter(id => forceRowLessResync || !applied.has(id));
+	// never empty the window: Firefox refuses it and the whole hide call
+	// would fail (the member path guards the same way)
+	const visibleCount = [...tabsById.values()].filter(tab => !tab.hidden).length;
+	if (!useRowLess) {
+		while (toSuppress.length && visibleCount - toSuppress.length < 1) { toSuppress.pop(); }
+	}
+	if (toSuppress.length) {
+		if (useRowLess) {
+			await Promise.all(toSuppress.map(id => TST.methods.addTabState({ tab: id, state: "row-less", windowId, })
+				.catch(error => logBoot("suppress-fail", `${id} ${error && error.message || error}`))));
+			for (const id of toSuppress) { suppressedByUs.add(id); }
+		}
+		else {
+			try {
+				const hid = await browser.tabs.hide(toSuppress);
+				const actuallyHidden = (Array.isArray(hid) ? hid : toSuppress).filter(id => tabsById.has(id));
+				for (const id of actuallyHidden) { suppressedHiddenByUs.add(id); }
+				await rememberSuppressed(actuallyHidden, true);
+				logBoot("suppress-hide", `window ${windowId} tabs=${actuallyHidden.join(",")}`);
+			}
+			catch (error) { logBoot("suppress-hide-fail", `window ${windowId} ${error && error.message || error}`); }
+		}
+		logBoot("suppress", `window ${windowId} tabs=${toSuppress.join(",")} rowless=${useRowLess}`);
+	}
+	// tabs that must keep their row are never suppressed; lift only within
+	// this window's tabs (the ledgers are global, a foreign window's
+	// derivation must not strip them — same rule as offRowLess)
+	const toLift = [...applied].filter(id => !want.has(id) && tabsById.has(id));
+	let deferredUntil = 0;
+	const lift = [];
+	for (const id of toLift) {
+		const until = suppressHold.get(id) || 0;
+		if (until > now) {
+			deferredUntil = Math.max(deferredUntil, until);
+			continue;
+		}
+		suppressHold.delete(id);
+		lift.push(id);
+	}
+	if (deferredUntil) {
+		setTimeout(() => scheduleRederive(windowId), Math.max(20, deferredUntil - now + 20));
+	}
+	if (lift.length) {
+		if (useRowLess) {
+			await Promise.all(lift.map(id => TST.methods.removeTabState({ tab: id, state: "row-less", windowId, })
+				.catch(() => {})));
+			for (const id of lift) { suppressedByUs.delete(id); }
+		}
+		else {
+			await browser.tabs.show(lift).catch(error => logBoot("suppress-show-fail", String(error && error.message || error)));
+			for (const id of lift) { suppressedHiddenByUs.delete(id); }
+			await rememberSuppressed(lift, false);
+		}
+		logBoot("suppress-off", `window ${windowId} tabs=${lift.join(",")}`);
+	}
+}
+
+/** Persist "this tab is hidden by a reveal" so a crash mid-reveal does not
+ *  leave an invisible tab behind: the boot path shows such tabs again. */
+async function rememberSuppressed (tabIds, suppressed) {
+	await Promise.all(tabIds.map(id =>
+		browser.sessions.setTabValue(id, SUPPRESSED_KEY, suppressed)
+			.catch(error => logBoot("suppress-memory-fail", `${id} ${error && error.message || error}`))));
+}
+
+/** Boot: any tab still hidden because a reveal was running when the browser
+ *  died comes back.  Reveals are runtime state and never survive a restart,
+ *  so nothing else would ever show such a tab. */
+async function releaseSuppressed (tabIds) {
+	await browser.tabs.show(tabIds).catch(error => logBoot("suppress-restore-fail", String(error && error.message || error)));
+	await rememberSuppressed(tabIds, false);
+	logBoot("suppress-restore", `tabs=${tabIds.join(",")}`);
+}
+
 /** Immediate variant of the member reconcile, with NO re-derivation
  *  debounce.  Firefox reveals a hidden tab the instant it becomes the
  *  active tab and refuses to hide the active tab again (measured:
@@ -621,11 +952,12 @@ async function rehideMembersNow (windowId) {
 	// on activation), and the debounced re-derivation corrects any drift.
 	const cached = windows.get(windowId)?.tree ?? null;
 	if (!cached) { return; }
-	const mustShow = mustShowTabs({ tree: cached, activeId: tabs.find(tab => tab.active)?.id ?? null, });
+	const cachedActiveId = tabs.find(tab => tab.active)?.id ?? null;
+	const mustShow = mustShowTabs({ tree: cached, activeId: cachedActiveId, });
 	// the member that just lost activation may still have an unfolded
 	// subtree: fold it before reclaiming its row (danglingMembers)
 	foldDanglingMembers(windowId, cached, mustShow);
-	await reconcileHidden(windowId, tabs, mustShow, cached).catch(error =>
+	await reconcileHidden(windowId, tabs, mustShow, cached, cachedActiveId).catch(error =>
 		logBoot("rehide-fail", `${windowId} ${error && error.message || error}`));
 }
 
@@ -741,10 +1073,27 @@ async function onTabsRendered (tabs, windowIdHint) {
 	if (!tstUsable) { return; }
 	const windowIds = new Set;
 	if (windowIdHint != null) { windowIds.add(windowIdHint); }
+	const renderedIds = new Set;
 	for (const tab of tabs) {
 		if (tab && tab.windowId != null) { windowIds.add(tab.windowId); }
+		if (tab && tab.id != null) { renderedIds.add(tab.id); }
 	}
 	logBoot("tabs-rendered", `windows=${[...windowIds]} tabs=${tabs.length}`);
+	// A tab we keep row-less RENDERED anyway: the state did not stick in
+	// that sidebar (its initial import carries only TST's own safe states,
+	// and a re-apply can land before the import finishes).  Forget the
+	// claim so the next derivation re-sends it — observed reality, not the
+	// ledger, decides.  Bounded per tab so a stubborn state cannot loop.
+	const stubborn = [...renderedIds].filter(id => rowLessByUs.has(id) || suppressedByUs.has(id));
+	for (const id of stubborn) {
+		const tries = (rowLessTries.get(id) || 0) + 1;
+		rowLessTries.set(id, tries);
+		if (tries > MAX_ROW_LESS_TRIES) { continue; }
+		rowLessByUs.delete(id);
+		suppressedByUs.delete(id);
+		logBoot("rowless-retry", `tab ${id} tries=${tries}`);
+	}
+	if (stubborn.length) { for (const windowId of windowIds) { scheduleRederive(windowId); } }
 	for (const windowId of windowIds) {
 		const cached = windows.get(windowId);
 		if (cached) {
@@ -884,6 +1233,24 @@ async function onExtraContentsClicked (message) {
 	return true;
 }
 
+/** A shelved tab that just became active and HAS children must show its row:
+ *  its subtree hangs from it (spec shelf-nesting).  Row-less is a TST state,
+ *  so the row appears only when the state is removed — waiting for the
+ *  debounced re-derivation leaves the children hanging under nothing in the
+ *  meantime.  Childless members keep their row-less state: their icon is
+ *  their whole presentation (feature 1).  A no-op for tabs we never marked. */
+function restoreMemberRow (windowId, tabId) {
+	if (!tstShelfCapabilities.rowLess || !rowLessByUs.has(tabId)) { return; }
+	const tree = windows.get(windowId)?.tree;
+	if (!tree) { return; }
+	const { hasChildIds, } = indexTree(tree);
+	if (!hasChildIds.has(tabId)) { return; } // childless: no row is the point
+	rowLessByUs.delete(tabId);
+	logBoot("rowless-lift", `window ${windowId} tab ${tabId} (activated)`);
+	TST.methods.removeTabState({ tab: tabId, state: "row-less", windowId, })
+		.catch(error => logBoot("rowless-lift-fail", `${tabId} ${error && error.message || error}`));
+}
+
 /** Selection on the shelf: fold the previous member, unfold this one,
  *  activate it — one subtree visible per shelf (spec shelf-nesting). */
 async function selectShelfTab (memberId) {
@@ -909,6 +1276,13 @@ async function selectShelfTab (memberId) {
 		}
 	}
 	await TST.methods.expandTree({ tab: memberId, windowId, }).catch(() => {});
+	// The activated member's own row must come back NOW, not after the
+	// debounced re-derivation: a member that was row-less keeps that state
+	// in TST's model, and the row appears only when the state is removed.
+	// (Measured: the model carried `row-less` on an ACTIVE member with an
+	// unfolded subtree, so its children rendered with no parent row.)  A
+	// childless member stays row-less — its icon is its whole presentation.
+	restoreMemberRow(windowId, memberId);
 	// The row swap must look atomic: the sidebar renders in batched
 	// frames, so the outgoing member's row has to be reclaimed in the
 	// SAME batch as the incoming one's appears.  Both calls are therefore
@@ -1041,10 +1415,25 @@ browser.tabs.onRemoved.addListener(tabId => {
 	foldTries.delete(tabId);
 	hiddenByUs.delete(tabId);
 	rowLessByUs.delete(tabId);
+	suppressedByUs.delete(tabId);
+	suppressedHiddenByUs.delete(tabId);
+	suppressHold.delete(tabId);
+	rowLessTries.delete(tabId);
+	// a closed owner ends its reveal; a closed active tab prunes it on the
+	// next derivation (planReveals)
+	for (const map of reveals.values()) { map.delete(tabId); }
 	if (shelved.delete(tabId)) { scheduleRederiveAll(); }
 });
 
 browser.tabs.onActivated.addListener(activeInfo => {
+	// a shelved tab activated inside a FOLDED owner's subtree: reveal its
+	// branch only (see section 3b).  This covers every activation route —
+	// the shelf icon's mousedown, Ctrl+Tab, Firefox's own tab bar.
+	maybeBeginReveal(activeInfo.windowId, activeInfo.tabId);
+	// a member that becomes active through ANY route (Ctrl+Tab, the tab
+	// bar, a shelf click) gets its own row back immediately when its
+	// subtree hangs from it
+	restoreMemberRow(activeInfo.windowId, activeInfo.tabId);
 	// end the previous member's reveal immediately (see rehideMembersNow)
 	rehideMembersNow(activeInfo.windowId);
 	scheduleRederive(activeInfo.windowId);
@@ -1079,6 +1468,7 @@ browser.tabs.onDetached.addListener((_tabId, detachInfo) => {
 browser.windows.onRemoved.addListener(async windowId => {
 	timers.delete(windowId);
 	windows.delete(windowId);
+	reveals.delete(windowId);
 	const live = new Set((await browser.tabs.query({})).map(tab => tab.id));
 	renderer.forgetWindow(windowId, live);
 });
@@ -1129,10 +1519,21 @@ function onTestMessage (message) {
 				}
 			}
 			const menuItems = menuTelemetry.items;
+			const revealState = {};
+			for (const [windowId, map] of reveals.entries()) {
+				revealState[windowId] = [...map.entries()].map(([owner, info]) => [owner, !!info.openedSeen]);
+			}
 			return {
 				registered: TST.isRegistered, usable: tstUsable,
 				shelved: [...shelved], hiddenByUs: [...hiddenByUs],
 				rowLessByUs: [...rowLessByUs],
+			rowLessDebug,
+			diagLog,
+				suppressedByUs: [...suppressedByUs],
+				suppressedHiddenByUs: [...suppressedHiddenByUs],
+				rowLessTries: [...rowLessTries.entries()],
+				reveals: revealState,
+				revealDebug,
 				capabilities: tstShelfCapabilities,
 				layout: shelfLayoutMode(),
 				widths: [...sidebarWidths.entries()],
@@ -1188,6 +1589,14 @@ function onTestMessage (message) {
 			const ok = await TST.methods[method]({ tab: message.tabId, state: message.state, windowId: message.windowId, })
 				.catch(error => { logBoot("test-tab-state-fail", String(error && error.message || error)); return false; });
 			return { ok, capabilities: tstShelfCapabilities, };
+		}
+		case "test:collapse": {
+			// Drive TST's own fold state (the reveal gate is built on it).
+			const method = message.collapsed === false ? "expandTree" : "collapseTree";
+			const ok = await TST.methods[method]({ tab: message.tabId, windowId: message.windowId, })
+				.catch(error => { logBoot("test-collapse-fail", String(error && error.message || error)); return false; });
+			await rederive(message.windowId);
+			return { ok, };
 		}
 		case "test:redrive": {
 			await rederive(message.windowId, { reconcile: !!message.reconcile, });

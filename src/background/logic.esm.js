@@ -30,6 +30,7 @@ export const ROOT_SHELF = null;
 /** One walk of the light tree: parent map, child counts, fold states. */
 export function indexTree (tree) {
 	const parentIdOf = new Map;   // id -> parent id (null for roots)
+	const childrenById = new Map; // id -> node[] (only ids with children)
 	const hasChildIds = new Set;  // ids with >=1 child
 	const foldedIds = new Set;    // ids with 'subtree-collapsed' state
 	const statesById = new Map;
@@ -40,11 +41,12 @@ export function indexTree (tree) {
 			if (isFolded(node.states)) { foldedIds.add(node.id); }
 			if (node.children && node.children.length) {
 				hasChildIds.add(node.id);
+				childrenById.set(node.id, node.children);
 				walk(node.children, node.id);
 			}
 		}
 	})(tree, null);
-	return { parentIdOf, hasChildIds, foldedIds, statesById };
+	return { parentIdOf, childrenById, hasChildIds, foldedIds, statesById };
 }
 
 /** Light-tree nodes carry TST's "safe" states; folded = subtree-collapsed. */
@@ -246,6 +248,96 @@ export function danglingMembers ({ tree, shelved, mustShow, }) {
 		ids.push(id);
 	}
 	return ids;
+}
+
+/** Is this tab's subtree FOLDED away?
+ *
+ *  TST marks a fold in two places, and which one appears depends on the
+ *  tab's role in it (measured, not assumed):
+ *    - the tab the fold was applied to (`collapse-tree` → `$TST.subtreeCollapsed`)
+ *      carries `subtree-collapsed`;
+ *    - every tab INSIDE that fold carries `collapsed`
+ *      (collapseExpandTabAndSubtree → collapseExpandTab).
+ *  Both mean "this tab's subtree is not rendered", which is all a reveal
+ *  needs to know. */
+export function isSubtreeFolded (states) {
+	return Array.isArray(states) &&
+		(states.includes("subtree-collapsed") || states.includes("collapsed"));
+}
+
+function isDescendantOf ({ parentIdOf, }, id, ancestorId) {
+	for (let node = parentIdOf.get(id); node != null; node = parentIdOf.get(node)) {
+		if (node == ancestorId) { return true; }
+	}
+	return false;
+}
+
+function addSubtree (childrenById, id, into) {
+	into.add(id);
+	for (const child of childrenById.get(id) || []) { addSubtree(childrenById, child.id, into); }
+}
+
+function forEachInSubtree (childrenById, id, fn) {
+	for (const child of childrenById.get(id) || []) {
+		fn(child.id);
+		forEachInSubtree(childrenById, child.id, fn);
+	}
+}
+
+/**
+ * What the active REVEALS suppress.
+ *
+ * A reveal keeps one folded shelf owner expanded for as long as a
+ * descendant of that owner is the active tab.  TST's own reaction to
+ * activating a tab inside a fold is to expand the tab AND ALL ITS
+ * ANCESTORS (background/handle-tab-focus.js, toBeExpandedAncestors) —
+ * correct for a plain tree, but for a shelf owner it turns the folded
+ * view into a wall of rows.  So the owner is expanded mechanically (its
+ * children must be renderable at all) and every descendant of it that is
+ * not on the active tab's branch — ancestors-or-self plus descendants —
+ * gets no row (row-less: the tab stays visible to the browser).
+ *
+ * The branch follows the ACTIVE TAB, not the reveal's creation time: a
+ * reveal outlives the activation that created it, so switching between
+ * two descendants of the same folded owner just moves the branch.
+ *
+ * A reveal ends (and its owner is folded back) when the active tab
+ * leaves the owner's subtree, when the owner is gone, or when the user
+ * folds the owner themselves — `openedSeen` distinguishes that user
+ * action from our own expansion still being in flight.
+ *
+ * @param {{tree: any[], activeId: number|null,
+ *          reveals: Map<number, {openedSeen?: boolean}>,
+ *          mustShow?: Set<number>}} args
+ * @returns {{suppress: number[], prune: number[]}} ids to take the row
+ *          away from, and owners whose reveal must end
+ */
+export function planReveals ({ tree, activeId, reveals, mustShow = new Set, }) {
+	const { parentIdOf, childrenById, statesById, } = indexTree(tree);
+	const suppress = new Set;
+	const prune = [];
+	for (const [owner, info] of reveals) {
+		if (!parentIdOf.has(owner)) { prune.push(owner); continue; } // owner closed
+		if (info?.openedSeen && isSubtreeFolded(statesById.get(owner))) { prune.push(owner); continue; }
+		if (activeId == null || !isDescendantOf({ parentIdOf, }, activeId, owner)) { prune.push(owner); continue; }
+		const branch = new Set;
+		// The branch is the whole subtree of the owner's DIRECT child that
+		// leads to the active tab.  Anchoring on the direct child (rather
+		// than on the active tab itself) is what makes "the activated
+		// child's subtree is revealed" true: a member with children brings
+		// all of them along, and activating one of them later does not
+		// start hiding its siblings.
+		let anchor = activeId;
+		while (anchor != null && anchor != owner && parentIdOf.get(anchor) != owner) {
+			anchor = parentIdOf.get(anchor);
+		}
+		if (anchor != null && anchor != owner) { addSubtree(childrenById, anchor, branch); }
+		forEachInSubtree(childrenById, owner, id => {
+			if (branch.has(id) || mustShow.has(id)) { return; }
+			suppress.add(id);
+		});
+	}
+	return { suppress: [...suppress], prune, };
 }
 
 /**

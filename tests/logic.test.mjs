@@ -9,6 +9,7 @@ import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
 	subtreeSizes, treePositions, nextPlacementMove, resolveFavicons,
 	mustShowTabs, danglingMembers, ROOT_SHELF,
+	planReveals, isSubtreeFolded,
 } from "../src/background/logic.esm.js";
 
 /** Light-tree node helper. */
@@ -456,4 +457,140 @@ test("a member already collapsing is not dangling again", () => {
 	const must = mustShowTabs({ tree, activeId: 1 });
 	assert.equal(must.has(3), true, "protected mid-animation");
 	assert.deepEqual(danglingMembers({ tree, shelved, mustShow: must }), []);
+});
+
+// ---------------------------------------------------------------------------
+// reveals: a folded shelf owner shows only the active tab's branch
+
+/** A <- (B, C <- (c1, c2), D), E — the tree the user reported the bug on:
+ *  B and C sit on A's shelf (row-less), D is an ordinary unshelved child.
+ *  A is FOLDED: the state at the moment the reveal is created.  Measured
+ *  marker placement: the fold point carries `subtree-collapsed`, every tab
+ *  inside the fold carries `collapsed`. */
+const foldedTree = () => [
+	node(1, ["subtree-collapsed"], [
+		node(2, ["collapsed"]),
+		node(3, ["collapsed"], [node(5, ["collapsed"]), node(6, ["collapsed"])]),
+		node(4, ["collapsed"]),
+	]),
+	node(7),
+];
+
+/** The same tree one derivation later: the reveal expanded A, so the
+ *  owner and its children are renderable — which is exactly why the
+ *  siblings must lose their rows. */
+const revealedTree = () => [
+	node(1, [], [
+		node(2),
+		node(3, [], [node(5), node(6)]),
+		node(4),
+	]),
+	node(7),
+];
+
+test("isSubtreeFolded reads BOTH of TST's fold markers", () => {
+	// measured: the fold point carries `subtree-collapsed`, every tab inside
+	// the fold carries `collapsed` — both mean the subtree is not rendered
+	assert.equal(isSubtreeFolded(["subtree-collapsed"]), true, "the tab the fold was applied to");
+	assert.equal(isSubtreeFolded(["collapsed"]), true, "a tab inside that fold");
+	assert.equal(isSubtreeFolded(["collapsed", "newtab-command-tab"]), true);
+	assert.equal(isSubtreeFolded(["newtab-command-tab"]), false);
+	assert.equal(isSubtreeFolded(undefined), false);
+});
+
+test("a reveal keeps the active tab's branch and suppresses the rest of the owner's subtree", () => {
+	// activating the shelved child C (which has children) must reveal C
+	// and c1/c2 only — D, the unshelved sibling, keeps NO row, and B stays
+	// row-less on the shelf.
+	const { suppress, prune, } = planReveals({
+		tree: revealedTree(), activeId: 3,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	});
+	assert.deepEqual(prune, []);
+	assert.deepEqual(suppress.sort(), [2, 4], "the siblings outside the branch, never C or its children");
+});
+
+test("the branch follows the active tab while the reveal lives", () => {
+	const reveals = new Map([[1, { openedSeen: true, }]]);
+	// the unshelved child D becomes active: its own row replaces the branch
+	assert.deepEqual(planReveals({ tree: revealedTree(), activeId: 4, reveals, }).suppress.sort(),
+		[2, 3, 5, 6]);
+	// a grandchild: the branch is still C's whole subtree, so c1 keeps its
+	// row even though c2 is the active tab
+	assert.deepEqual(planReveals({ tree: revealedTree(), activeId: 6, reveals, }).suppress.sort(),
+		[2, 4], "C is the owner's direct child on the path, so its subtree is the branch");
+});
+
+test("a reveal ends when the active tab leaves the owner's subtree", () => {
+	const { suppress, prune, } = planReveals({
+		tree: revealedTree(), activeId: 7,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	});
+	assert.deepEqual(prune, [1], "the owner is folded back");
+	assert.deepEqual(suppress, []);
+});
+
+test("a reveal ends when the owner itself becomes active", () => {
+	assert.deepEqual(planReveals({
+		tree: revealedTree(), activeId: 1,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	}).prune, [1]);
+});
+
+test("the user folding the owner ends the reveal", () => {
+	assert.deepEqual(planReveals({
+		tree: foldedTree(), activeId: 3,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	}).prune, [1], "the owner reads `collapsed` again: that fold is the user's");
+});
+
+test("our own expansion still in flight does not end the reveal", () => {
+	// openedSeen is false until a derivation has SEEN the owner expanded —
+	// otherwise the first pass after creating the reveal would mistake the
+	// not-yet-expanded owner for a user fold and cancel the reveal.
+	const { prune, suppress, } = planReveals({
+		tree: foldedTree(), activeId: 3,
+		reveals: new Map([[1, { openedSeen: false, }]]),
+	});
+	assert.deepEqual(prune, []);
+	assert.deepEqual(suppress.sort(), [2, 4]);
+});
+
+test("a reveal of a closed owner is dropped", () => {
+	assert.deepEqual(planReveals({
+		tree: foldedTree(), activeId: 3,
+		reveals: new Map([[99, { openedSeen: true, }]]),
+	}).prune, [99]);
+});
+
+test("tabs that must keep their row are never suppressed", () => {
+	// mid-animation tabs are in mustShowTabs; taking their row away would
+	// orphan whatever is animating under them
+	const { suppress, } = planReveals({
+		tree: revealedTree(), activeId: 3,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+		mustShow: new Set([4]),
+	});
+	assert.deepEqual(suppress, [2], "D is protected");
+});
+
+test("nested reveals each suppress their own owner's subtree", () => {
+	// G <- (P <- (B, C), X): G and P both own shelves, both are expanded by
+	// their reveal (no `collapsed` state — that would mean the user folded
+	// them back), and the active tab lives under P.
+	const tree = [
+		node(1, [], [
+			node(2, [], [
+				node(3),
+				node(4),
+			]),
+			node(5),
+		]),
+	];
+	const { suppress, prune, } = planReveals({
+		tree, activeId: 4,
+		reveals: new Map([[1, { openedSeen: true, }], [2, { openedSeen: true, }]]),
+	});
+	assert.deepEqual(prune, []);
+	assert.deepEqual(suppress.sort(), [3, 5], "X from the outer owner, B from the inner one");
 });

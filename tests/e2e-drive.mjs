@@ -552,6 +552,27 @@ const rowPresenceScript = String.raw`
 	return JSON.stringify(out);
 `;
 
+/** Rows AND browser visibility for a set of tabs.  `hidden` is the
+ *  capability-sensitive half of a reveal: on a patched companion the row
+ *  goes through `row-less` and the tab stays visible, on a stock one the
+ *  row goes through browser.tabs.hide().  (Async IIFE: Marionette runs the
+ *  script as a *body*, so a top-level await is a syntax error.) */
+const rowAndStateScript = String.raw`
+	return (async () => {
+		const ids = arguments[0];
+		const out = {};
+		for (const id of ids) {
+			out[id] = !!document.querySelector('tab-item[data-tab-id="' + id + '"]');
+		}
+		const live = await Promise.all(ids.map(id => browser.tabs.get(id).catch(() => null)));
+						return JSON.stringify({
+			rows: out,
+			hidden: Object.fromEntries(ids.map((id, index) => [id, !!(live[index] && live[index].hidden)])),
+			active: Object.fromEntries(ids.map((id, index) => [id, !!(live[index] && live[index].active)])),
+		});
+	})();
+`;
+
 /** Model probe: dumps every tab's states from the TST background. */
 const stateProbeScript = String.raw`
 	return (async () => {
@@ -736,12 +757,35 @@ async function main () {
 					}
 					// no member rows at all: a hidden tab has no row, so the
 					// shelf costs exactly one line (0.1.3's blank member boxes
-					// were the "vertical gaps").
+					// were the "vertical gaps").  The invariant is about the
+					// SETTLED sidebar — the addon re-applies addon states when a
+					// sidebar appears (TST's initial import carries only its own
+					// safe states), and that pass is debounced — so poll instead
+					// of reading the very first frame that has icons.
 					{
-						const memberRows = e.members.filter(id => dump.rows.some(row => row.id == String(id)));
+						let memberRows = [];
+						for (let attempt = 0; attempt < 6; attempt++) {
+							const fresh = await marionette.command("WebDriver:ExecuteScript", {
+								script: sidebarScript, args: [null,], newSandbox: false,
+							}).catch(() => null);
+							const again = fresh && fresh.value ? JSON.parse(fresh.value) : null;
+							if (!again) { break; }
+							memberRows = e.members.filter(id => again.rows.some(row => row.id == String(id)));
+							if (memberRows.length == 0) { break; }
+							await new Promise(resolve => setTimeout(resolve, 500));
+						}
 						if (memberRows.length == 0) {
 							console.log("PASS [driver] members keep no rows — a shelf costs one line");
 						} else {
+							const diag = await marionette.command("WebDriver:ExecuteScript", {
+								script: shelfCallScript, args: [{ type: "test:state", },], newSandbox: false,
+							}).catch(() => null);
+							const diagState = diag && diag.value ? JSON.parse(diag.value) : null;
+							console.log(`[driver] member-row diagnostic: ${JSON.stringify({
+								claimed: diagState && diagState.rowLessByUs,
+								retries: diagState && diagState.rowLessTries,
+								caps: diagState && diagState.capabilities,
+							})}`);
 							console.log(`FAIL [driver] members keep no rows — a shelf costs one line (rows=${JSON.stringify(memberRows)})`);
 							process.exitCode = process.exitCode || 1;
 						}
@@ -1019,6 +1063,21 @@ async function main () {
 					// painted under a parent row that no longer existed
 					// (user-reported).  The subtree must fold FIRST, so that no
 					// frame ever shows a child without its parent.
+					const diagC = await marionette.command("WebDriver:ExecuteScript", {
+						script: shelfCallScript, args: [{ type: "test:state", },], newSandbox: false,
+					}).catch(() => null);
+					const diagCState = diagC && diagC.value ? JSON.parse(diagC.value) : null;
+					// the member's row must be back BEFORE the next activation
+					// (0.2.2: it is restored at activation time, not by the
+					// debounced re-derivation) — diagnostic on failure only
+					const memberRowBack = await marionette.command("WebDriver:ExecuteScript", {
+						script: rowPresenceScript, args: [[e.clickFirst,],], newSandbox: false,
+					}).catch(() => null);
+					const memberRowState = memberRowBack && memberRowBack.value ? JSON.parse(memberRowBack.value) : null;
+					if (!(memberRowState && memberRowState[e.clickFirst])) {
+						console.log(`[driver] member row missing after the click: ${JSON.stringify({ row: memberRowState, claimed: diagCState && diagCState.rowLessByUs, trace: diagCState && diagCState.rowLessDebug, diag: diagCState && diagCState.diagLog, })}`);
+						process.exitCode = process.exitCode || 1;
+					}
 					console.log("[drive] phase 2: sampling while the plain sibling D is activated");
 					await marionette.command("WebDriver:ExecuteScript", {
 						script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
@@ -1289,6 +1348,109 @@ async function main () {
 						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
 					}).catch(error => console.log(`[drive] refold click failed: ${error.message}`));
 					await new Promise(resolve => setTimeout(resolve, 1500));
+
+					// -- reveal: from a FOLDED owner's shelf, only the activated
+					// tab's branch may appear (0.2.1).  Before this, TST expanded
+					// the tab AND ALL ITS ANCESTORS (handle-tab-focus.js), so the
+					// owner's whole subtree — the unshelved sibling D included —
+					// popped into view.  Runs on BOTH companions: the suppressed
+					// rows go through `row-less` on a patched TST and through
+					// browser.tabs.hide() on a stock one, so the assertions split
+					// by capability.
+					{
+						const call = async message => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: shelfCallScript, args: [message,], newSandbox: false,
+							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+							return response && response.value ? JSON.parse(response.value) : null;
+						};
+						const presence = async ids => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: rowPresenceScript, args: [ids,], newSandbox: false,
+							}).catch(() => null);
+							return response && response.value ? JSON.parse(response.value) : {};
+						};
+						const state0 = await call({ type: "test:state", });
+						const rowLess = !!(state0 && state0.capabilities && state0.capabilities.rowLess);
+						console.log(`[drive] reveal on ${rowLess ? "a patched" : "a stock"} companion`);
+						await call({ type: "test:collapse", tabId: e.owner, windowId, collapsed: true, });
+						await new Promise(resolve => setTimeout(resolve, 2000));
+						const folded = await presence([e.owner, e.clickFirst, e.children[0], e.children[1], e.plain]);
+						console.log(`[drive] rows while the owner is folded: ${JSON.stringify(folded)}`);
+						console.log(`${folded[e.clickFirst] === false && folded[e.plain] === false ? "PASS" : "FAIL"} [driver] a folded owner renders no rows for its subtree`);
+						// click C's icon: C's branch comes back, D must not
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
+						}).catch(error => console.log(`[drive] reveal click failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 2500));
+						const revealed = await presence([e.owner, e.clickFirst, e.children[0], e.children[1], e.plain, e.clickSecond, e.f]);
+						console.log(`[drive] rows after the reveal: ${JSON.stringify(revealed)}`);
+						// c1 is a member of C's OWN shelf, so it stays row-less;
+						// the branch that must appear is the owner, C and c2.
+						const branchOk = revealed[e.owner] && revealed[e.clickFirst] && revealed[e.children[1]];
+						console.log(`${branchOk ? "PASS" : "FAIL"} [driver] the activated shelf tab's branch has rows (owner, member, its plain child)`);
+						console.log(`${revealed[e.children[0]] === false ? "PASS" : "FAIL"} [driver] a nested member of the branch stays row-less (c1)`);
+						console.log(`${revealed[e.plain] === false ? "PASS" : "FAIL"} [driver] the unshelved sibling keeps NO row under a reveal`);
+						const state = await call({ type: "test:state", });
+						const revealState = (state && state.reveals && state.reveals[windowId]) || [];
+						const suppressed = (state && state.suppressedByUs) || [];
+						const suppressedHidden = (state && state.suppressedHiddenByUs) || [];
+						console.log(`[driver] reveal state: ${JSON.stringify({ reveal: revealState, suppressed, suppressedHidden, retries: state && state.rowLessTries, debug: state && state.revealDebug, })}`);
+						const revealOk = revealState.some(([owner]) => owner == e.owner) &&
+							(rowLess ? suppressed.includes(e.plain) : suppressedHidden.includes(e.plain));
+						console.log(`${revealOk ? "PASS" : "FAIL"} [driver] the addon keeps the owner expanded and accounts for the suppressed sibling (${rowLess ? "row-less" : "hidden"})`);
+						const hiddenSibling = (state && state.hiddenByUs) || [];
+						console.log(`${hiddenSibling.includes(e.plain) ? "FAIL" : "PASS"} [driver] a suppressed tab is never counted as a member hide`);
+						// capability split: no hiding at all on a patched TST; the
+						// browser reports `hidden` on a stock one
+						const live = await marionette.command("WebDriver:ExecuteScript", {
+							script: rowAndStateScript, args: [[e.plain,],], newSandbox: false,
+						}).catch(() => null);
+						const liveState = live && live.value ? JSON.parse(live.value) : null;
+						const hiddenFlag = !!(liveState && liveState.hidden[e.plain]);
+						const hidingOk = rowLess ? hiddenFlag === false : hiddenFlag === true;
+						console.log(`${hidingOk ? "PASS" : "FAIL"} [driver] the suppressed sibling is ${rowLess ? "not hidden (row-less only)" : "hidden (the stock lever)"}`);
+						if (!(branchOk && revealed[e.plain] === false && revealOk && !hiddenSibling.includes(e.plain) && hidingOk)) {
+							process.exitCode = process.exitCode || 1;
+						}
+						// nested shelf: c1 is a member of C's OWN shelf, whose strap
+						// lives in C's row.  Clicking c1 must keep C's row — the
+						// branch is anchored on the owner's DIRECT child, so the
+						// whole nested shelf stays visible.
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [e.nestedMember,], newSandbox: false,
+						}).catch(error => console.log(`[drive] nested reveal click failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 2500));
+						const nested = await presence([e.clickFirst, e.nestedMember, e.plain]);
+						console.log(`[driver] rows after the nested click: ${JSON.stringify(nested)}`);
+						const nestedOk = nested[e.clickFirst] === true && nested[e.plain] === false;
+						console.log(`${nestedOk ? "PASS" : "FAIL"} [driver] clicking a nested shelf member keeps the nested owner's row (its strap host)`);
+						if (!nestedOk) { process.exitCode = process.exitCode || 1; }
+						// leaving the owner's subtree ends the reveal and folds it back
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: activateScript, args: [e.rootMember,], newSandbox: false,
+						}).catch(error => console.log(`[drive] root activation failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 2500));
+						const afterState = await call({ type: "test:state", });
+						const revealAfter = (afterState && afterState.reveals && afterState.reveals[windowId]) || [];
+						const suppressedAfter = (afterState && afterState.suppressedByUs) || [];
+						const suppressedHiddenAfter = (afterState && afterState.suppressedHiddenByUs) || [];
+						const backRows = await presence([e.owner, e.clickFirst, e.plain]);
+						const backLive = await marionette.command("WebDriver:ExecuteScript", {
+							script: rowAndStateScript, args: [[e.plain,],], newSandbox: false,
+						}).catch(() => null);
+						const backState = backLive && backLive.value ? JSON.parse(backLive.value) : null;
+						console.log(`[driver] after leaving: ${JSON.stringify({ revealAfter, suppressedAfter, suppressedHiddenAfter, backRows, backState, })}`);
+						const ended = revealAfter.length == 0 &&
+							suppressedAfter.length == 0 &&
+							suppressedHiddenAfter.length == 0 &&
+							backRows[e.clickFirst] === false;
+						console.log(`${ended ? "PASS" : "FAIL"} [driver] leaving the owner's subtree ends the reveal and the owner folds back`);
+						// the suppressed sibling must come back to the browser too
+						const siblingBack = !(backState && backState.hidden[e.plain]);
+						console.log(`${siblingBack ? "PASS" : "FAIL"} [driver] ending the reveal restores the suppressed sibling's visibility`);
+						if (!(ended && siblingBack)) { process.exitCode = process.exitCode || 1; }
+					}
 				}
 			}
 		}
