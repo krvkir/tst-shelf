@@ -170,6 +170,7 @@ const mirrorScript = String.raw`
  *  shadow root).  No backticks: this is one big String.raw template. */
 const sidebarScript = String.raw`
 	const clickId = arguments[0];
+	const clickPart = arguments[1];
 	const flat = [];
 	const icons = [];
 	for (const row of document.querySelectorAll("tab-item[data-tab-id]")) {
@@ -189,18 +190,24 @@ const sidebarScript = String.raw`
 		if (strap) {
 			info.strap = true;
 			for (const icon of strap.querySelectorAll('[part~="shelf-icon"]')) {
+				const glyph = icon.querySelector('[part~="shelf-sound"]');
 				const record = {
 					id: icon.dataset.tabId,
 					title: (icon.getAttribute("title") || "").split("\n")[0],
 					hasBg: /background-image/.test(icon.getAttribute("style") || ""),
 					draggable: icon.getAttribute("draggable"),
-					badge: !!icon.querySelector('[part~="shelf-badge"][part~="tst-shelf-badge-on"]'),
+					badgeText: icon.querySelector('[part~="shelf-badge"]') ?
+						icon.querySelector('[part~="shelf-badge"]').textContent : null,
+					sound: !glyph ? null :
+						(glyph.getAttribute("part") || "").includes("tst-shelf-sound-muted") ? "muted" : "playing",
 					active: (icon.getAttribute("part") || "").includes("tst-shelf-icon-active"),
 				};
 				icons.push(record);
 				if (clickId != null && record.id == String(clickId)) {
-					const rect = icon.getBoundingClientRect();
-					icon.dispatchEvent(new MouseEvent("mousedown", {
+					const target = clickPart === "sound" ? glyph : icon;
+					if (!target) { throw new Error("no click target for " + clickId + " " + clickPart); }
+					const rect = target.getBoundingClientRect();
+					target.dispatchEvent(new MouseEvent("mousedown", {
 						bubbles: true, composed: true, button: 0,
 						clientX: rect.x + 5, clientY: rect.y + 5,
 					}));
@@ -714,7 +721,100 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 				const iconC = byId[String(e.members[1])];
 				check("icons carry title tooltips", iconB && iconB.title == "shelf tree tab", () => `icons carry title tooltips ${iconB && iconB.title}`);
 
-				check("the folded member carries the plus badge", iconC && iconC.badge, () => `the folded member carries the plus badge ${JSON.stringify(iconC)}`);
+				check("the member with descendants carries the plus badge (always, folded or not)",
+					iconC && iconC.badgeText == "+" && !(iconB && iconB.badgeText),
+					() => `the member with descendants carries the plus badge ${JSON.stringify(iconC)}`);
+
+				// badge mode: the option (storage.badgeMode) switches every
+				// badge to the descendant count, live
+				{
+					const call = async message => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfCallScript, args: [message,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+						return response && response.value ? JSON.parse(response.value) : null;
+					};
+					const strapIcons = async () => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [null,], newSandbox: false,
+						}).catch(() => null);
+						const d = response && response.value ? JSON.parse(response.value) : null;
+						return d ? Object.fromEntries((d.icons || []).map(icon => [icon.id, icon])) : null;
+					};
+					let icons = null;
+					await call({ type: "test:badge-mode", mode: "count", windowId, });
+					for (let attempt = 0; attempt < 10; attempt++) {
+						icons = await strapIcons();
+						if (icons && icons[String(e.nestedOwner)] && icons[String(e.nestedOwner)].badgeText === "2") { break; }
+						await new Promise(resolve => setTimeout(resolve, 800));
+					}
+					// C owns the nested shelf: c1 and c2 are its descendants
+					check("count mode shows the descendant count in every fold badge",
+						icons && icons[String(e.nestedOwner)] && icons[String(e.nestedOwner)].badgeText === "2",
+						() => `count mode shows the descendant count ${JSON.stringify(icons && icons[String(e.nestedOwner)])}`);
+					await call({ type: "test:badge-mode", mode: "plus", windowId, });
+					for (let attempt = 0; attempt < 10; attempt++) {
+						icons = await strapIcons();
+						if (icons && icons[String(e.nestedOwner)] && icons[String(e.nestedOwner)].badgeText === "+") { break; }
+						await new Promise(resolve => setTimeout(resolve, 800));
+					}
+					check("switching back restores the plus",
+						icons && icons[String(e.nestedOwner)] && icons[String(e.nestedOwner)].badgeText === "+",
+						() => `switching back restores the plus ${JSON.stringify(icons && icons[String(e.nestedOwner)])}`);
+				}
+
+				// audio indicator: the muted glyph appears on the muted
+				// member (headless Firefox never reports audible — measured,
+				// tests/probe-favicon.mjs), a primary click on the glyph
+				// unmutes WITHOUT activating the tab
+				{
+					const call = async message => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfCallScript, args: [message,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+						return response && response.value ? JSON.parse(response.value) : null;
+					};
+					const strapIcon = async id => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [null,], newSandbox: false,
+						}).catch(() => null);
+						const d = response && response.value ? JSON.parse(response.value) : null;
+						return d ? (d.icons || []).find(icon => icon.id == String(id)) || null : null;
+					};
+					let icon = null;
+					await call({ type: "test:mute", tabId: e.nestedOwner, muted: true, windowId, });
+					for (let attempt = 0; attempt < 10; attempt++) {
+						icon = await strapIcon(e.nestedOwner);
+						if (icon && icon.sound === "muted") { break; }
+						await new Promise(resolve => setTimeout(resolve, 800));
+					}
+					check("a muted shelf member shows the muted indicator (favicon untouched)",
+						!!(icon && icon.sound === "muted" && icon.hasBg),
+						() => `a muted shelf member shows the muted indicator ${JSON.stringify(icon)}`);
+					// the click goes to the glyph (arguments[1] = "sound")
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.nestedOwner, "sound",], newSandbox: false,
+					}).catch(error => console.log(`[drive] glyph click failed: ${error.message}`));
+					let iconAfter = null;
+					const activeAfter = [];
+					for (let attempt = 0; attempt < 10; attempt++) {
+						await new Promise(resolve => setTimeout(resolve, 800));
+						iconAfter = await strapIcon(e.nestedOwner);
+						const state = await call({ type: "test:state", });
+						if (iconAfter && iconAfter.sound === null) {
+							activeAfter.push(state && state.shelves[windowId].active);
+							break;
+						}
+					}
+					check("clicking the indicator unmutes the member", !!(iconAfter && iconAfter.sound === null),
+						() => `clicking the indicator unmutes the member ${JSON.stringify(iconAfter)}`);
+					check("clicking the indicator does not activate the tab",
+						activeAfter.length > 0 && !activeAfter[activeAfter.length - 1].includes(e.nestedOwner),
+						() => `clicking the indicator does not activate the tab (active=${JSON.stringify(activeAfter[activeAfter.length - 1])}, tabId=${e.nestedOwner})`);
+					// leave the member unmuted: the rest of the phases run on
+					// an ordinary audible/mutable member set
+					await call({ type: "test:mute", tabId: e.nestedOwner, muted: false, windowId, });
+				}
 
 				check("icons are native drag sources", iconB && iconB.draggable == "true", () => `icons are native drag sources ${iconB && iconB.draggable}`);
 

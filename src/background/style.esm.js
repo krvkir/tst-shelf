@@ -149,10 +149,11 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
   box-shadow: inset 0 0 0 1px var(--tab-border-color, currentColor);
 }
 
-/* 6. The folded-subtree plus badge: shown only while children are
-     folded (it disappears when the subtree is unfolded — no minus). */
+/* 6. The fold badge: shown whenever the shelved tab has descendants,
+     whether the subtree is folded or unfolded (it carries the same
+     descendant count TST writes on its own rows).  The markup emits it
+     only when a count exists, so nothing to hide here. */
 ::part(%EXTRA_CONTENTS_PART% shelf-badge) {
-  display: none;
   position: absolute;
   inset-inline-end: 0;
   inset-block-end: 0;
@@ -165,7 +166,25 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
   border-start-start-radius: 3px;
   pointer-events: none;
 }
-::part(%EXTRA_CONTENTS_PART% shelf-badge tst-shelf-badge-on) {
-  display: block;
+
+/* 7. The audio indicator: the playing/muted glyph in the tab's own
+     corner, exactly like Firefox marks media tabs.  Theme-colored
+     without any network resource: the glyph is a mask-image data URL
+     and the paint color is currentColor.  The muted glyph (speaker with
+     a bar) replaces the playing one (speaker with arcs).  pointer-events
+     is re-enabled: a primary click on the glyph mutes/unmutes the
+     member (index.esm.js routes on the part). */
+::part(%EXTRA_CONTENTS_PART% shelf-sound) {
+  position: absolute;
+  inset-inline-start: 1px;
+  inset-block-end: 1px;
+  width: 9px;
+  height: 9px;
+  pointer-events: auto;
+  background-color: currentColor;
+  mask: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3Cpath%20d%3D%22M1%206h3l4-3.5v11L4%2010H1zM10%205.5a3.5%203.5%200%200%201%200%205M12%203a6.5%206.5%200%200%201%200%2010%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%222%22%20stroke-linejoin%3D%22round%22%2F%3E%3C%2Fsvg%3E") no-repeat center / contain;
+}
+::part(%EXTRA_CONTENTS_PART% shelf-sound tst-shelf-sound-muted) {
+  mask: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3Cpath%20d%3D%22M1%206h3l4-3.5v11L4%2010H1z%22%20fill%3D%22black%22%2F%3E%3Cpath%20d%3D%22M3%202l11%2012M14%202L3%2014%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%222%22%2F%3E%3C%2Fsvg%3E") no-repeat center / contain;
 }
 `;

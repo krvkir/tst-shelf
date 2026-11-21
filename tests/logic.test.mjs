@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
-	subtreeSizes, treePositions, nextPlacementMove, resolveFavicons,
+	subtreeSizes, treePositions, nextPlacementMove, planExtremePlacementMove, resolveFavicons,
 	mustShowTabs, danglingMembers, ROOT_SHELF,
 	planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf,
 } from "../src/background/logic.esm.js";
@@ -84,15 +84,18 @@ test("an empty shelf (all members hidden by someone else) reserves no owner", ()
 	assert.equal(ownerIds.has(1), false);
 });
 
-test("selection is the member with an unfolded subtree", () => {
-	const tree = [node(1, [], [node(2, ["subtree-collapsed"], [node(5)]), node(4, [], [node(6)])])];
+test("every member with descendants carries a fold badge, folded or not", () => {
+	const tree = [node(1, [], [node(2, ["subtree-collapsed"], [node(5), node(6)]), node(4, [], [node(7)])])];
 	const shelved = new Set([2, 4]);
-	const { selectedOfShelf, badgeIds } = derive({ tree, shelved, tabsById: tabsById([
-		{ id: 1, index: 0 }, { id: 2, index: 1 }, { id: 4, index: 2 }, { id: 5, index: 3 }, { id: 6, index: 4 },
+	const { selectedOfShelf, badgeIds, badgeCounts, } = derive({ tree, shelved, tabsById: tabsById([
+		{ id: 1, index: 0 }, { id: 2, index: 1 }, { id: 4, index: 2 },
+		{ id: 5, index: 3 }, { id: 6, index: 4 }, { id: 7, index: 5 },
 	]) });
 	assert.equal(selectedOfShelf.get(1), 4, "the unfolded member is selected");
-	assert.equal(badgeIds.has(2), true, "folded member carries the plus badge");
-	assert.equal(badgeIds.has(4), false, "unfolded member carries none");
+	assert.equal(badgeIds.has(2), true, "folded member carries the badge");
+	assert.equal(badgeIds.has(4), true, "an UNFOLDED member with children carries it too (TST's counter shows always)");
+	assert.deepEqual([...badgeCounts.entries()].sort((a, b) => a[0] - b[0]), [[2, 2], [4, 1]],
+		"the count is the descendants, the tab itself excluded (TST's tab-counter number)");
 });
 
 test("the active member wins a selection tie", () => {
@@ -484,15 +487,15 @@ test("an all-pinned shelf member is left alone", () => {
 test("resolveFavicons records tabs that have a favicon", () => {
 	const memory = new Map;
 	const { tabs, memory: next, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/img.png", }], memory);
-	assert.equal(next.get(1), "https://a/img.png");
+	assert.deepEqual(next.get(1), { favIconUrl: "https://a/img.png", pageUrl: undefined });
 	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "no patching needed");
 });
 
 test("a loading tab without a favicon renders the remembered one", () => {
-	const memory = new Map([[1, "https://a/img.png",]]);
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
 	const { tabs, } = resolveFavicons([{ id: 1, favIconUrl: undefined, }], memory);
 	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "the blank tab carries the remembered favicon");
-	assert.equal(memory.get(1), "https://a/img.png", "the memory is not consumed");
+	assert.equal(memory.get(1).favIconUrl, "https://a/img.png", "the memory is not consumed");
 });
 
 test("a never-seen tab without a favicon stays favicon-less", () => {
@@ -502,19 +505,81 @@ test("a never-seen tab without a favicon stays favicon-less", () => {
 });
 
 test("the memory follows favicon changes; blanks fall back to the newest one", () => {
-	let { tabs, memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/1.png", }], new Map);
-	assert.equal(memory.get(1), "https://a/1.png");
-	({ tabs, memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://b/2.png", }], memory));
-	assert.equal(memory.get(1), "https://b/2.png", "a new favicon overwrites the memory");
+	let { tabs, memory, } = resolveFavicons([
+		{ id: 1, favIconUrl: "https://a/1.png", }, { id: 1, url: "https://a/x", },
+	], new Map);
+	// a delivered favicon pairs with its page url
+	({ memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/1.png", url: "https://a/x", }], memory));
+	assert.deepEqual(memory.get(1), { favIconUrl: "https://a/1.png", pageUrl: "https://a/x", });
+	({ tabs, memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://b/2.png", url: "https://b/y", }], memory));
+	assert.deepEqual(memory.get(1), { favIconUrl: "https://b/2.png", pageUrl: "https://b/y", },
+		"a cross-site favicon overwrites the memory");
 	({ tabs, memory, } = resolveFavicons([{ id: 1, }], memory));
 	assert.equal(tabs[0].favIconUrl, "https://b/2.png", "a blank falls back to the NEW favicon, not the oldest one");
 });
 
 test("the memory survives across windows' derivations", () => {
-	let { memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/1.png", }], new Map);
-	({ memory, } = resolveFavicons([{ id: 2, favIconUrl: "https://b/2.png", }], memory));
+	let { memory, } = resolveFavicons([{ id: 1, favIconUrl: "https://a/1.png", url: "https://a/x", }], new Map);
+	({ memory, } = resolveFavicons([{ id: 2, favIconUrl: "https://b/2.png", url: "https://b/y", }], memory));
 	const { tabs, } = resolveFavicons([{ id: 1, }], memory);
 	assert.equal(tabs[0].favIconUrl, "https://a/1.png", "entries from other derivations persist");
+});
+
+test("a default-favicon delivery (the error page) never overwrites or wins (measured: info.svg)", () => {
+	// Firefox 158: a blocked page settles with chrome://global/skin/icons/info.svg
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
+	const { tabs, memory: next, } = resolveFavicons([
+		{ id: 1, favIconUrl: "chrome://global/skin/icons/info.svg", url: "http://unreachable:9/", status: "complete", },
+	], memory);
+	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "the failed navigation keeps the previous site's icon");
+	assert.deepEqual(next.get(1), { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", },
+		"the placeholder never enters the memory");
+});
+
+test("a cross-site page that settles with no favicon drops the stale icon", () => {
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
+	const { tabs, memory: next, } = resolveFavicons([
+		{ id: 1, favIconUrl: undefined, url: "https://other/plain.txt", status: "complete", },
+	], memory);
+	assert.equal(tabs[0].favIconUrl == null, true, "the old icon would be a lie on the new document");
+	assert.equal(next.size, 0, "the stale entry is dropped");
+});
+
+test("an internal page that settles with no favicon keeps the remembered icon", () => {
+	// the E2E parks shelved tabs on about:blank; it is nobody's site
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
+	const { tabs, memory: next, } = resolveFavicons([
+		{ id: 1, favIconUrl: undefined, url: "about:blank", status: "complete", },
+	], memory);
+	assert.equal(tabs[0].favIconUrl, "https://a/img.png");
+	assert.equal(next.size, 1);
+});
+
+test("a same-origin page that settles with no favicon keeps the remembered icon", () => {
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
+	const { tabs, memory: next, } = resolveFavicons([
+		{ id: 1, favIconUrl: undefined, url: "https://a/z", status: "complete", },
+	], memory);
+	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "the site's own settled reload keeps it");
+	assert.equal(next.size, 1, "the same-origin entry stays");
+});
+
+test("a data: favicon is a real site favicon, not a placeholder (measured)", () => {
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
+	const { tabs, memory: next, } = resolveFavicons([
+		{ id: 1, favIconUrl: "data:image/svg+xml;base64,AAAA", url: "https://b/x", status: "complete", },
+	], memory);
+	assert.equal(tabs[0].favIconUrl, "data:image/svg+xml;base64,AAAA", "it renders");
+	assert.equal(next.get(1).favIconUrl, "data:image/svg+xml;base64,AAAA", "it wins the memory");
+});
+
+test("while a foreign page is still loading, the remembered icon stays", () => {
+	const memory = new Map([[1, { favIconUrl: "https://a/img.png", pageUrl: "https://a/x", }]]);
+	const { tabs, memory: next, } = resolveFavicons([
+		{ id: 1, favIconUrl: undefined, url: "https://other/x", status: "loading", },
+	], memory);
+	assert.equal(tabs[0].favIconUrl, "https://a/img.png", "an icon may still arrive");
+	assert.equal(next.size, 1, "the memory is intact until the settle");
 });
 
 // ---------------------------------------------------------------------------
@@ -733,4 +798,58 @@ test("nested reveals each suppress their own owner's subtree", () => {
 	});
 	assert.deepEqual(prune, []);
 	assert.deepEqual(suppress.sort(), [3, 5], "X from the outer owner, B from the inner one");
+});
+
+// ---------------------------------------------------------------------------
+// extreme placements ("Place leftmost" / "Place rightmost")
+
+test("a mid-shelf member moves left before the first member", () => {
+	const tree = [node(1, [], [node(2), node(3), node(4), node(5)])];
+	assert.deepEqual(planExtremePlacementMove({
+		members: [2, 3, 4], tabId: 3, side: "left", sizes: subtreeSizes(tree),
+	}), { tabId: 3, kind: "move-before", referenceTabId: 2 });
+});
+
+test("a mid-shelf member moves right after the last member", () => {
+	const tree = [node(1, [], [node(2), node(3), node(4), node(5)])];
+	assert.deepEqual(planExtremePlacementMove({
+		members: [2, 3, 4], tabId: 3, side: "right", sizes: subtreeSizes(tree),
+	}), { tabId: 3, kind: "move-after", referenceTabId: 4, thenOutdent: false });
+});
+
+test("the rightward move outdents past a last member with descendants", () => {
+	// A <- (B, C, D <- (d1)); "Place rightmost" on C references D; landing
+	// after it would re-parent C as D's child, so the plan adds an outdent
+	const tree = [node(1, [], [node(2), node(3), node(4, [], [node(5)])])];
+	assert.deepEqual(planExtremePlacementMove({
+		members: [2, 3, 4], tabId: 3, side: "right", sizes: subtreeSizes(tree),
+	}), { tabId: 3, kind: "move-after", referenceTabId: 4, thenOutdent: true });
+});
+
+test("an already-extreme member plans no move", () => {
+	const sizes = subtreeSizes([node(1, [], [node(2), node(3), node(4)])]);
+	assert.equal(planExtremePlacementMove({ members: [2, 3, 4], tabId: 2, side: "left", sizes, }), null);
+	assert.equal(planExtremePlacementMove({ members: [2, 3, 4], tabId: 4, side: "right", sizes, }), null);
+});
+
+test("a single-member shelf plans no move at either end", () => {
+	const sizes = subtreeSizes([node(1, [], [node(2)])]);
+	assert.equal(planExtremePlacementMove({ members: [2], tabId: 2, side: "left", sizes, }), null);
+	assert.equal(planExtremePlacementMove({ members: [2], tabId: 2, side: "right", sizes, }), null);
+});
+
+test("a tab that is not a member of the block plans no move", () => {
+	assert.equal(planExtremePlacementMove({ members: [2, 3], tabId: 99, side: "left", sizes: new Map, }), null);
+});
+
+test("the reference stays inside the member block (the re-parent trap)", () => {
+	// the block B, C sits under A with a plain sibling X after it: a right
+	// move must reference C (the last MEMBER), never X — move-after X
+	// would carry the subtree out of the block
+	const tree = [node(1, [], [node(2), node(3), node(4)])];
+	const plan = planExtremePlacementMove({
+		members: [2, 3], tabId: 2, side: "right", sizes: subtreeSizes(tree),
+	});
+	assert.equal(plan.referenceTabId, 3, "the last member of the block, not the sibling after it");
+	assert.equal(plan.thenOutdent, false);
 });

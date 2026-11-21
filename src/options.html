@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- tst-shelf options: the fold badge mode. Inline script (no CSP
+     exemptions needed: MV2 default CSP allows a local file's own
+     script); one storage.local key, applied live via the background's
+     storage.onChanged listener. -->
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>TST Shelf options</title>
+	<style>
+		body { color-scheme: light dark; font: message-box; padding: 1em 1.5em; }
+		h1 { font-size: 1.1em; }
+		fieldset { border: 1px solid currentcolor; border-radius: 4px; }
+		label { display: block; padding: 2px 0; }
+	</style>
+</head>
+<body>
+	<h1>TST Shelf</h1>
+	<fieldset>
+		<legend>Fold badge on shelf icons</legend>
+		<label>
+			<input type="radio" name="badgeMode" value="plus">
+			plus — the fold badge shows a plus while the tab has descendants
+		</label>
+		<label>
+			<input type="radio" name="badgeMode" value="count">
+			count — the fold badge shows the number of the tab's descendants,
+			the same number Tree Style Tab writes in parentheses on its rows
+		</label>
+	</fieldset>
+	<script src="options.js"></script>
+</body>
+</html>

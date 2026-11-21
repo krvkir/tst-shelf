@@ -72,11 +72,18 @@ What that leaves:
   never change, non-member tabs keep their relative order, and
   take-off returns the tab to the position it had before shelving.
 - **Icons carry the tab's tooltip** (title and URL), its favicon, a
-  plus badge while the member's subtree is folded, and a highlight
-  while the member or one of its descendants is active. Right-click
-  opens the tab's own native context menu (TST routes `data-tab-id`),
-  including "Take off the shelf". Drags from an icon are TST-native
-  tab drags with the whole subtree following.
+  fold badge while the member has descendants — a plus, or the
+  descendant count when the user selects count mode in the options
+  (the same number TST writes as its subtree counter on tab rows,
+  folded or unfolded) — and a highlight while the member or one of its
+  descendants is active. A member that plays audio shows a sound glyph
+  in its icon; a muted member shows the muted glyph, and clicking the
+  glyph (not the icon) mutes or unmutes the tab without activating it.
+  Right-click opens the tab's own native context menu (TST routes
+  `data-tab-id`), including the "Shelf" submenu with "Place leftmost"
+  and "Place rightmost" for shelved tabs, and "Take off the shelf".
+  Drags from an icon are TST-native tab drags with the whole subtree
+  following.
 - **Folding is delegated to TST**: putting a tab on the shelf sends
   `collapse-tree`; the close-confirmation dialog, the twisty state and
   restart persistence of the fold are TST's own machinery. The
@@ -123,14 +130,17 @@ What that leaves:
   hides the siblings it suppresses; TST itself requests this permission
   for its own hidden-tab support. Taking a tab off the shelf shows it
   again.
-- `menus` — the two tab-context-menu items are the extension's OWN
-  `browser.menus` items (see implementation notes); they appear in
-  the TST sidebar's tab menu and in the native tab bar's menu.
+- `menus` — the tab-context-menu items are the extension's OWN
+  `browser.menus` items (see implementation notes): "Put on shelf",
+  "Take off the shelf", and the "Shelf" submenu with "Place
+  leftmost"/"Place rightmost"; they appear in the TST sidebar's tab
+  menu and in the native tab bar's menu.
 - `sessions` — the sticky shelved flag is a per-tab session value
   (`browser.sessions.setTabValue`); it survives restarts under
   session restore and travels with the tab across window moves.
-- `storage` — a rolling diagnostics log (the last 80 boot events),
-  nothing else.
+- `storage` — a rolling diagnostics log (the last 80 boot events) and
+  the one user option (`badgeMode`, the fold badge mode), nothing
+  else.
 - No host permissions, no content scripts, no network code: the
   extension has no way to send data anywhere.
 
@@ -237,14 +247,20 @@ an isolated headless Firefox on a copy of that profile, temporary-installs
    `-e2e` builds) builds a tree A ← (B, C, D), C ← (c1, c2), plus a
    root tab E, puts B and C on A's shelf and E on the root shelf, and
    asserts the state machine (sticky session values, shelf
-   derivation, tab order, badge-on-fold, native subtree-collapsed,
-   take-off) — then downloads a setup report.
+   derivation, tab order, badge-on-descendants, native
+   subtree-collapsed, take-off, the Shelf submenu's visibility, the
+   "Place leftmost"/"Place rightmost" swings) — then downloads a
+   setup report.
 2. **Sidebar DOM** — the driver opens TST's own sidebar page in a tab
    (`sidebar/sidebar.html?windowId=N`, where TST runs its complete
    sidebar including the extra-contents shadow roots), asserts the
    rendered shelves (row state classes, icons with `data-tab-id`,
-   title tooltips, favicon styles, draggable, the plus badge, the
-   root strap), then dispatches synthetic mousedown events on the
+   title tooltips, favicon styles, draggable, the fold badge, the
+   root strap), the count mode (flip through the internal hook —
+   every badge becomes the descendant number, and back), and the
+   muted glyph (mute through the hook; then a synthetic mousedown on
+   the glyph itself, which must unmute without activating the tab),
+   then dispatches synthetic mousedown events on the
    shelf icons; the smoke page asserts the selection choreography
    (C activates and unfolds, its children render below the strap;
    clicking B refolds C — one subtree per shelf).
@@ -296,6 +312,44 @@ green.  Two consecutive clean runs are required before merging.
   favicon memory through every `tabs.query` (`resolveFavicons`,
   logic.esm.js); the diffing renderer then emits an unchanged strap
   during the load, so the sidebar never drops the style attribute.
+  Measured on Firefox 158 (tests/probe-favicon.mjs, timeline in
+  2026-11-21-fixes/favicon-probe.json):
+  - a navigation that cannot reach the site settles as `status:
+    complete` with `favIconUrl = chrome://global/skin/icons/info.svg`
+    — the error page's own icon, which is exactly the "circled i" —
+    while `tab.url` still names the site. A delivery of such a
+    placeholder never overwrites the memory and never wins the render:
+    the icon keeps the previous page's favicon.
+  - a page that loads successfully with no favicon delivers nothing at
+    all; when its url is an HTTP(S) url of another origin at `complete`,
+    the remembered icon is dropped (a stale site icon must not lie).
+    Internal pages (about:blank, extension pages) are not site
+    documents — the remembered icon stays.
+  - `data:` favicons are real site favicons on this Firefox (the probe's
+    `<link rel="icon">` page was reported as
+    `data:image/svg+xml;base64,…`); they are never treated as
+    placeholders.
+  - Still undetectable from the background: an icon that fails to
+    *decode* (a 404 icon, corrupt SVG) — a `background-image` load
+    failure is invisible without content scripts. Documented as out of
+    scope.
+- **Shelf icons mark audio** the same way Firefox marks media tabs:
+  `tab.audible` shows a sound glyph, `tab.mutedInfo.muted` a muted
+  one; clicking the glyph toggles the mute (the mousedown payload's
+  `originalTargetPart` names the glyph's part, verified in TST 4.4.10
+  tst-api-frontend.js). Measured: headless Firefox 158 never reports
+  `audible: true` for a playing `<audio loop>` page, so the playing
+  glyph is asserted on unit tests and GUI — the muted one is fully
+  headless-E2E'd.
+- **The tab context menu carries a "Shelf" submenu** with "Place
+  leftmost"/"Place rightmost" for shelved tabs. Pointer reordering
+  INSIDE the strap remains out of reach on stock TST 4.4.x: no
+  dragover/drop notifications exist for addon extra contents, and no
+  extra-contents event carries pointer coordinates
+  (drag-and-drop.js:868-871, event-utils.js:69-77) — the menu commands
+  and a native TST icon drag (drop onto the shelf owner = subtree
+  reattach) are the available reorder paths until upstream gains
+  drop-target notifications for extra contents.
 - **The only stored state is the sticky flag** (`tst-shelf` session
   value). Shelf membership, hosts, badges, highlight and selection
   are derived from TST's light tree + `browser.tabs` on every

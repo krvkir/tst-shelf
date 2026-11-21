@@ -19,7 +19,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.dirname(HERE);
 const DIR = path.resolve(REPO, process.argv[2] || "dist");
 
-const REQUIRED = ["manifest.json", "background.js", "icons/48.png", "icons/96.png"];
+const REQUIRED = ["manifest.json", "background.js", "icons/48.png", "icons/96.png", "options.html", "options.js"];
 const FORBIDDEN = ["tests.html", "tests-smoke.js", "tree-tab.html", "tree-tab.js", "favicon.svg"];
 
 const problems = [];

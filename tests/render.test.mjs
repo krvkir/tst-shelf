@@ -12,12 +12,13 @@ import assert from "node:assert/strict";
 import { createRenderer, strapHtml, iconHtml, escapeHtml } from "../src/background/render.esm.js";
 
 /** A derivation with one shelf owned by tab 1 holding tabs 2 and 3. */
-function derivationOf ({ owner = 1, members = [2, 3], } = {}) {
+function derivationOf ({ owner = 1, members = [2, 3], badgeCounts = new Map, } = {}) {
 	return {
 		shelves: new Map([[owner, members]]),
 		ownerIds: new Set(members.length ? [owner] : []),
 		highlightIds: new Set,
-		badgeIds: new Set,
+		badgeIds: new Set(badgeCounts.keys()),
+		badgeCounts,
 	};
 }
 
@@ -155,12 +156,70 @@ test("windowId and the root shelf are routed to the right target", async () => {
 
 test("titles and attribute values are escaped", () => {
 	assert.equal(escapeHtml(`<b>"x"&'y'</b>`), "&lt;b&gt;&quot;x&quot;&amp;&#39;y&#39;&lt;/b&gt;");
-	const html = iconHtml({ tab: { id: 4, title: `<script>`, url: `https://e/?a="b"`, }, active: false, folded: false, });
+	const html = iconHtml({ tab: { id: 4, title: `<script>`, url: `https://e/?a="b"`, }, active: false, badgeCount: 0, });
 	assert.equal(html.includes("<script>"), false);
 	assert.equal(html.includes("&lt;script&gt;"), true);
 });
 
 test("a strap with no resolvable members is empty markup", () => {
-	assert.equal(strapHtml({ members: [99], tabsById, highlightIds: new Set, badgeIds: new Set, }),
+	assert.equal(strapHtml({ members: [99], tabsById, highlightIds: new Set, }),
 		`<div part="shelf-strap"></div>`);
+});
+
+// ---------------------------------------------------------------------------
+// fold badge (plus or the TST-side descendant count)
+
+test("a member with descendants shows a plus badge in plus mode", () => {
+	const html = strapHtml({
+		members: [2], tabsById, highlightIds: new Set,
+		badgeCounts: new Map([[2, 3]]), badgeMode: "plus",
+	});
+	assert.ok(html.includes(`part="shelf-badge"`), "the badge is present");
+	assert.match(html, /<span part="shelf-badge">\+<\/span>/);
+});
+
+test("count mode shows the descendant number instead of the plus", () => {
+	const html = strapHtml({
+		members: [2], tabsById, highlightIds: new Set,
+		badgeCounts: new Map([[2, 12]]), badgeMode: "count",
+	});
+	assert.match(html, /<span part="shelf-badge">12<\/span>/);
+});
+
+test("a childless member shows no badge at all", () => {
+	const html = strapHtml({
+		members: [2], tabsById, highlightIds: new Set,
+		badgeCounts: new Map, badgeMode: "plus",
+	});
+	assert.ok(!html.includes("shelf-badge"), "no badge markup for a count of 0");
+});
+
+// ---------------------------------------------------------------------------
+// audio indicator
+
+test("a playing tab's icon carries the sound glyph, the favicon stays", () => {
+	const html = iconHtml({
+		tab: { id: 2, audible: true, mutedInfo: { muted: false, }, favIconUrl: "https://a/i.png", },
+		active: false, badgeCount: 0,
+	});
+	assert.match(html, /<span part="shelf-sound" data-tab-id="2"><\/span>/,
+		"the glyph carries the tab id for the mute click");
+	assert.match(html, /background-image: url/, "the favicon background is untouched");
+	assert.ok(!html.includes("tst-shelf-sound-muted"), "no muted variant while playing");
+});
+
+test("a muted tab's icon carries the muted glyph", () => {
+	const html = iconHtml({
+		tab: { id: 2, audible: false, mutedInfo: { muted: true, }, },
+		active: false, badgeCount: 0,
+	});
+	assert.match(html, /part="shelf-sound tst-shelf-sound-muted"/);
+});
+
+test("a silent unmuted tab shows no audio glyph", () => {
+	const html = iconHtml({
+		tab: { id: 2, audible: false, mutedInfo: { muted: false, }, },
+		active: false, badgeCount: 0,
+	});
+	assert.ok(!html.includes("shelf-sound"));
 });

@@ -66,15 +66,69 @@ export function isFolded (states) {
  * this._favIconUrl ||= this.raw?.favIconUrl`).  This mirrors that with
  * a per-session memory threaded through every query: tabs that have a
  * favicon update the memory, tabs that do not render the remembered
- * one.  Pure — returns patched tab records (shallow copies, favIconUrl
- * filled in) plus the updated memory.
+ * one.
+ *
+ * Placeholders and foreign documents (measured on Firefox 158,
+ * tests/probe-favicon.mjs):
+ *   - a BLOCKED page (connection refused, DNS failure) settles as
+ *     `status: complete` with `chrome://global/skin/icons/info.svg` —
+ *     the error page's own icon, never a site's.  A delivery of such a
+ *     placeholder never overwrites the memory and never wins the render.
+ *   - a page that settles `complete` WITHOUT any delivery may be a
+ *     genuinely iconless page: when its url's origin differs from the
+ *     remembered entry's, the old site's icon would be a lie, so the
+ *     entry is dropped; a same-origin settle (a reload of the site's own
+ *     page that reports nothing) keeps it.
+ *   - `data:` URLs are REAL favicons here: Firefox reports site SVG/PNG
+ *     icons as data: URLs (measured for the same probe's `<link
+ *     rel="icon">` page).  They are never placeholders.
+ * Pure — returns patched tab records (shallow copies, favIconUrl filled
+ * in) plus the updated memory.
  */
+export function isDefaultFaviconUrl (url) {
+	return /^(?:chrome:\/\/(?:global|browser)\/(?:skin|content\/skin|browser\/skin)\/icons\/|chrome:\/\/browser\/skin\/|moz-anno:)/
+		.test(String(url || ""));
+}
+
+/** The origin part of a url, or null when unparsable. */
+function originOf (url) {
+	try { return new URL(url).origin; }
+	catch (_error) { return null; }
+}
+
+/** Only web pages can be "a different site": about:blank, internal and
+ *  extension pages are not site documents, and the E2E drives exactly
+ *  such navigations (a shelved tab parked on about:blank must keep its
+ *  remembered icon). */
+function isWebSiteUrl (url) {
+	return /^https?:/i.test(String(url || ""));
+}
+
 export function resolveFavicons (tabs, memory) {
 	const next = new Map(memory);
 	const patched = tabs.map(tab => {
-		if (tab.favIconUrl) { next.set(tab.id, tab.favIconUrl); return tab; }
+		const delivered = tab.favIconUrl;
+		if (isDefaultFaviconUrl(delivered)) {
+			// the error/chrome page's placeholder: no site icon came — keep
+			// rendering the remembered one, never overwrite the memory
+			const remembered = next.get(tab.id);
+			return remembered ? { ...tab, favIconUrl: remembered.favIconUrl, } : tab;
+		}
+		if (delivered) {
+			next.set(tab.id, { favIconUrl: delivered, pageUrl: tab.url, });
+			return tab;
+		}
+		// no delivery: navigating/loading (an icon may still arrive), or a
+		// settled page whose page simply has none
 		const remembered = next.get(tab.id);
-		return remembered ? { ...tab, favIconUrl: remembered, } : tab;
+		if (remembered && tab.status === "complete" && isWebSiteUrl(tab.url) &&
+			originOf(tab.url) !== originOf(remembered.pageUrl)) {
+			// a settled web page of another origin must not wear the
+			// previous site's icon
+			next.delete(tab.id);
+			return tab;
+		}
+		return remembered ? { ...tab, favIconUrl: remembered.favIconUrl, } : tab;
 	});
 	return { tabs: patched, memory: next, };
 }
@@ -88,6 +142,7 @@ export function resolveFavicons (tabs, memory) {
  *   ownerIds: Set<number>,                 // owners with >=1 visible member
  *   selectedOfShelf: Map<number|null, number|null>,
  *   badgeIds: Set<number>,
+ *   badgeCounts: Map<number, number>,      // id -> descendant tabs
  *   highlightIds: Set<number>,
  *   shelvedVisible: number[],
  * }}
@@ -148,13 +203,18 @@ export function derive ({ tree, shelved, tabsById, hiddenByUs = new Set, }) {
 	// members keep no row at all — they are hidden tabs.  Nothing to
 	// compute here: `render.esm.js` sends the strap to the owner.
 
-	// plus badge: children are folded (spec: the badge disappears while
-	// unfolded; childless shelved tabs carry no badge).
+	// badge: every shelved tab with descendants carries a fold badge
+	// (spec: the badge shows regardless of the fold state, and the count
+	// is the same number TST writes on its own rows — the tab's
+	// descendants, the tab itself not counted; TabCounterElement sets
+	// `textContent = descendants.length`).
+	const sizes = subtreeSizes(tree);
 	const badgeIds = new Set;
+	const badgeCounts = new Map;
 	for (const id of shelvedVisible) {
-		if (hasChildIds.has(id) && foldedIds.has(id)) {
-			badgeIds.add(id);
-		}
+		if (!hasChildIds.has(id)) { continue; }
+		badgeIds.add(id);
+		badgeCounts.set(id, Math.max(0, (sizes.get(id) || 1) - 1));
 	}
 
 	// active highlight: the active tab itself, and every shelved ancestor
@@ -177,6 +237,7 @@ export function derive ({ tree, shelved, tabsById, hiddenByUs = new Set, }) {
 		ownerIds,
 		selectedOfShelf,
 		badgeIds,
+		badgeCounts,
 		highlightIds,
 		shelvedVisible,
 	};
@@ -508,6 +569,47 @@ function firstNormalPos (sortedRanks) {
 		if (!rank.pinned) { return rank.pos; }
 	}
 	return 0;
+}
+
+/**
+ * The single move that puts a shelved tab at an extreme slot of its
+ * shelf's member block ("Place leftmost" / "Place rightmost", spec
+ * shelf-pinning).  Same move conventions as nextPlacementMove: one move
+ * per call, references chosen INSIDE the member block only (TST
+ * re-derives the mover's parent from the landing position), and the
+ * block stays contiguous.
+ *
+ *   left   — `move-before` the first member;
+ *   right  — `move-after` the last member, with an `outdent` when that
+ *            member has descendants (move-after re-parents the mover
+ *            into it; the outdent re-attaches it past the subtree, as
+ *            the owner's child again).
+ *
+ * @param {{members: number[], tabId: number, side: "left"|"right",
+ *          sizes?: Map<number, number>}} args `members` is the shelf's
+ *        member block in tree-walk order (derive().shelves).
+ * @returns {null|{tabId: number, kind: string, referenceTabId: number,
+ *          thenOutdent?: boolean}} null when the tab is already at the
+ *          requested end of the block or is not on the shelf
+ */
+export function planExtremePlacementMove ({ members, tabId, side, sizes = new Map, }) {
+	const index = (members || []).indexOf(tabId);
+	if (index < 0) { return null; }
+	if (side === "left") {
+		if (index === 0) { return null; }
+		return { tabId, kind: "move-before", referenceTabId: members[0], };
+	}
+	if (side === "right") {
+		const last = members[members.length - 1];
+		if (tabId === last) { return null; }
+		return {
+			tabId,
+			kind: "move-after",
+			referenceTabId: last,
+			thenOutdent: (sizes.get(last) ?? 1) > 1,
+		};
+	}
+	return null;
 }
 
 /** The tab's parent and its ordered sibling list (the tab included), from

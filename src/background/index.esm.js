@@ -18,11 +18,13 @@
  * live TST light tree + browser.tabs on every structural event.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, mustShowTabs, danglingMembers, planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf, ROOT_SHELF } from "./logic.esm.js";
+import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, planExtremePlacementMove, resolveFavicons, mustShowTabs, danglingMembers, planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf, ROOT_SHELF } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
 import { SHELF_STYLE } from "./style.esm.js";
 
 const RECOMPUTE_DELAY_MS = 120;
+/** The fold badge: "plus" (default) | "count" (the descendant number). */
+const BADGE_MODE_KEY = "badgeMode";
 
 /** The smoke page and the E2E driver only exist in `make e2e` builds. */
 const E2E_BUILD = String(browser.runtime.getManifest().version).endsWith("-e2e");
@@ -61,6 +63,9 @@ const preparedWindows = new Set;
 /** @type {Map<number, any>} per-window re-derivation timers */
 const timers = new Map;
 let tstUsable = false;
+/** The badge mode is the ONE user option (storage.local.badgeMode); its
+ *  change re-renders the straps through the next re-derivations. */
+let badgeMode = "plus";
 /** @type {Map<number, Map<number, {openedSeen: boolean}>>} windowId -> shelf
  *  owner -> reveal.  A reveal keeps ONE folded owner expanded while a
  *  descendant of it is active, and suppresses every other descendant's row
@@ -112,6 +117,21 @@ async function logBoot (kind, detail) {
 		await browser.storage.local.set({ bootlog: entries.slice(-80), });
 	}).catch(() => { /* diagnostics must never break the caller */ });
 }
+
+/** The one user option is in storage.local; the options page writes it
+ *  and this listener re-renders the straps immediately (a mode flip
+ *  changes the badge text in every strap's markup, so the diffing
+ *  renderer sends exactly the changed straps). */
+async function loadOptions () {
+	const stored = await browser.storage.local.get({ [BADGE_MODE_KEY]: "plus", }).catch(() => null);
+	badgeMode = stored?.[BADGE_MODE_KEY] === "count" ? "count" : "plus";
+}
+browser.storage.onChanged.addListener((changes, areaName) => {
+	if (areaName !== "local" || !(BADGE_MODE_KEY in changes)) { return; }
+	badgeMode = changes[BADGE_MODE_KEY].newValue === "count" ? "count" : "plus";
+	logBoot("badge-mode", badgeMode);
+	scheduleRederiveAll();
+});
 
 /** Rebuild the shelved set from per-tab session values after (re)start, and
  *  release any tab a reveal left hidden.
@@ -865,6 +885,45 @@ async function reconcilePlacement (windowId, { tree = null, tabsById = null, der
 	finally { placing.delete(windowId); }
 }
 
+/**
+ * The menu-driven extreme placements ("Place leftmost"/"Place rightmost").
+ * Plans against the CACHED tree (a ≤120 ms-stale walk order is exact
+ * inside a settled shelf; the post-move re-derivation repairs anything the
+ * move disturbed) and applies one TST move with followChildren — the same
+ * conventions the automatic placement loop uses.
+ */
+async function placeOnShelfEdge (tabId, side) {
+	if (!tstUsable || !shelved.has(tabId)) { return false; }
+	const tab = await browser.tabs.get(tabId).catch(() => null);
+	if (!tab) { return false; }
+	const windowId = tab.windowId;
+	const cached = windows.get(windowId);
+	const owner = cached?.derivation.shelfOf.get(tabId);
+	if (cached == null || owner == null) { return false; }
+	const members = cached.derivation.shelves.get(owner) || [];
+	const move = planExtremePlacementMove({
+		members,
+		tabId,
+		side,
+		sizes: subtreeSizes(cached.tree),
+	});
+	if (!move) { return true; } // already at the requested extreme
+	const params = { tab: tabId, windowId, referenceTabId: move.referenceTabId, followChildren: true, };
+	const sent = move.kind == "move-before"
+		? TST.methods.moveBefore(params)
+		: TST.methods.moveAfter(params)
+			.then(move.thenOutdent
+				? () => TST.methods.outdent({ tab: tabId, windowId, followChildren: true, })
+				: null);
+	const ok = await sent.then(() => true, error => {
+		logBoot(`place-${side}-fail`, `${tabId} ${error && error.message || error}`);
+		return false;
+	});
+	logBoot(`place-${side}`, `tab ${tabId}`);
+	scheduleRederive(windowId);
+	return ok;
+}
+
 /** tabs-rendered: rows were (re)rendered — restore their straps. */
 async function onTabsRendered (tabs, windowIdHint) {
 	if (!tstUsable) { return; }
@@ -907,6 +966,7 @@ const renderer = createRenderer({
 		return promise;
 	},
 	log: logBoot,
+	badgeModeOf: () => badgeMode,
 });
 
 // ---------------------------------------------------------------------------
@@ -914,6 +974,9 @@ const renderer = createRenderer({
 
 const MENU_PUT = "tst-shelf:put";
 const MENU_TAKE = "tst-shelf:take";
+const MENU_SHELF = "tst-shelf:shelf";
+const MENU_PLACE_LEFT = "tst-shelf:place-left";
+const MENU_PLACE_RIGHT = "tst-shelf:place-right";
 
 /** Menu items are OUR OWN browser.menus items, not TST-registered ones.
  * TST's contextMenu-create items are created `visible: false` and no TST
@@ -928,16 +991,21 @@ const MENU_TAKE = "tst-shelf:take";
  * the items also appear in the native tab bar's menu, as More Tree
  * Commands' do. */
 function createMenuItems () {
-	for (const item of [
+	// the parent must exist before the children attach to it
+	const items = [
 		{ id: MENU_PUT, title: "Put on shelf", },
 		{ id: MENU_TAKE, title: "Take off the shelf", },
-	]) {
+		{ id: MENU_SHELF, title: "Shelf", },
+		{ id: MENU_PLACE_LEFT, title: "Place leftmost", parentId: MENU_SHELF, },
+		{ id: MENU_PLACE_RIGHT, title: "Place rightmost", parentId: MENU_SHELF, },
+	];
+	for (const item of items) {
 		try {
 			browser.menus.create({ ...item, contexts: ["tab"], });
 			// menus.getAll() does not exist in Firefox — track the
 			// created items ourselves (menus.create throws on invalid
 			// params, so reaching here means the item is registered).
-			menuTelemetry.items.push({ id: item.id, title: item.title, });
+			menuTelemetry.items.push({ id: item.id, title: item.title, parentId: item.parentId, });
 		}
 		catch (error) { logBoot("menu-create-fail", `${item.id} ${error && error.message || error}`); }
 	}
@@ -948,7 +1016,10 @@ function createMenuItems () {
  *  sidebar, the native tab bar, and TST's overridden icon menus alike).
  *  Native menus only open for TRUSTED events, so the E2E drives this
  *  same function through the internal test hook instead. */
-const menuTelemetry = { shownCount: 0, lastTabId: null, lastPutVisible: null, lastTakeVisible: null, items: [], };
+const menuTelemetry = {
+	shownCount: 0, lastTabId: null, lastPutVisible: null, lastTakeVisible: null,
+	lastShelfVisible: null, items: [],
+};
 
 async function applyMenuVisibility (tabId) {
 	const isShelved = shelved.has(tabId);
@@ -957,13 +1028,18 @@ async function applyMenuVisibility (tabId) {
 	catch (_error) { /* closed meanwhile */ }
 	try {
 		const putVisible = !isShelved && !pinned;
+		const shelfVisible = isShelved && !pinned;
 		await browser.menus.update(MENU_PUT, { visible: putVisible, });
 		await browser.menus.update(MENU_TAKE, { visible: isShelved, });
+		await browser.menus.update(MENU_SHELF, { visible: shelfVisible, });
+		await browser.menus.update(MENU_PLACE_LEFT, { visible: shelfVisible, });
+		await browser.menus.update(MENU_PLACE_RIGHT, { visible: shelfVisible, });
 		await browser.menus.refresh();
 		menuTelemetry.shownCount++;
 		menuTelemetry.lastTabId = tabId;
 		menuTelemetry.lastPutVisible = putVisible;
 		menuTelemetry.lastTakeVisible = isShelved;
+		menuTelemetry.lastShelfVisible = shelfVisible;
 	}
 	catch (error) { logBoot("menu-update-fail", `${tabId} ${error && error.message || error}`); }
 }
@@ -978,6 +1054,8 @@ browser.menus.onClicked.addListener((info, tab) => {
 	if (tabId == null) { return; }
 	if (info.menuItemId == MENU_PUT) { putOnShelf(tabId); }
 	else if (info.menuItemId == MENU_TAKE) { takeOffShelf(tabId); }
+	else if (info.menuItemId == MENU_PLACE_LEFT) { placeOnShelfEdge(tabId, "left"); }
+	else if (info.menuItemId == MENU_PLACE_RIGHT) { placeOnShelfEdge(tabId, "right"); }
 });
 
 // ---------------------------------------------------------------------------
@@ -990,8 +1068,31 @@ function shelfTargetOf (message) {
 	return match ? Number(match[1]) : null;
 }
 
+/** Is the click on the audio indicator?  The payload's
+ *  originalTargetPart carries the deepest [part] element's part list
+ *  (tst-api-frontend getExtraContentsInfo) with this addon's part name
+ *  stripped; the sound glyph's own element matches first. */
+function onSoundGlyph (message) {
+	return String(message?.originalTargetPart || "").split(/\s+/)[0] === "shelf-sound";
+}
+
+/** Toggle the mute of the tab the clicked sound glyph belongs to. */
+async function toggleMemberMute (memberId) {
+	const tab = await browser.tabs.get(memberId).catch(() => null);
+	const muted = !!tab?.mutedInfo?.muted;
+	await browser.tabs.update(memberId, { muted: !muted, }).catch(() => {});
+	return !muted;
+}
+
 async function onExtraContentsMousedown (message) {
 	if (!tstUsable) { return false; }
+	if (onSoundGlyph(message)) {
+		const memberId = shelfTargetOf(message);
+		if (memberId != null && shelved.has(memberId)) {
+			await toggleMemberMute(memberId);
+			return true; // cancel: clicking the glyph must not select the tab
+		}
+	}
 	const memberId = shelfTargetOf(message);
 	if (memberId == null || !shelved.has(memberId)) { return false; }
 	const button = message?.button;
@@ -1012,6 +1113,11 @@ async function onExtraContentsClicked (message) {
 	const memberId = shelfTargetOf(message);
 	if (memberId == null || !shelved.has(memberId)) { return false; }
 	if (message?.button == 1) { return true; }
+	if (onSoundGlyph(message)) {
+		// the mousedown already toggled the mute: cancel the selection
+		// path for the click that follows the glyph
+		return true;
+	}
 	await selectShelfTab(memberId);
 	return true;
 }
@@ -1300,8 +1406,9 @@ browser.windows.onRemoved.addListener(async windowId => {
 // boot
 
 (async () => {
-	// menu items are TST-independent: create them even when TST is absent
-	// or broken, so the menu is present from the very first moment.
+	// options and menu items are TST-independent: load/create them even
+	// when TST is absent or broken.
+	await loadOptions();
 	createMenuItems();
 	await loadShelvedFromSessions();
 	await register();
@@ -1330,8 +1437,10 @@ function onTestMessage (message) {
 				shelves[windowId] = {
 					shelves: [...derivation.shelves.entries()].map(([owner, members]) => [owner == ROOT_SHELF ? "root" : owner, members]),
 					badges: [...derivation.badgeIds],
+					badgeCounts: [...derivation.badgeCounts.entries()],
 					highlights: [...derivation.highlightIds],
 					selected: [...derivation.selectedOfShelf.entries()].map(([owner, id]) => [owner == ROOT_SHELF ? "root" : owner, id]),
+					active: [...tabsById.values()].filter(tab => tab.active && !tab.hidden).map(tab => tab.id),
 				};
 				// the favicon the derivation renders for each member —
 				// the sticky one while the tab is loading (resolveFavicons)
@@ -1358,6 +1467,19 @@ function onTestMessage (message) {
 		}
 		case "test:put": return { ok: await putOnShelf(message.tabId), };
 		case "test:take": return { ok: await takeOffShelf(message.tabId), };
+		case "test:place": return {
+			ok: await placeOnShelfEdge(message.tabId, message.side === "left" ? "left" : "right"),
+		};
+		case "test:mute": {
+			await browser.tabs.update(message.tabId, { muted: !!message.muted, }).catch(() => {});
+			await rederive(message.windowId);
+			return { ok: true, };
+		}
+		case "test:badge-mode": {
+			await browser.storage.local.set({ [BADGE_MODE_KEY]: message.mode === "count" ? "count" : "plus", });
+			await rederive(message.windowId);
+			return { ok: true, mode: badgeMode, };
+		}
 		case "test:probe-hidden": {
 			// Characterize Firefox's invariant: can a hidden tab become
 			// the active tab without being revealed, and can an active

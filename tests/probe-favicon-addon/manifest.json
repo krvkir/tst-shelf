@@ -1,0 +1,14 @@
+{
+	"manifest_version": 2,
+	"name": "favicon probe",
+	"version": "0.1.0",
+	"description": "Measures what Firefox reports for favIconUrl/audible/mutedInfo on failed navigations, successful iconless pages, and playing audio. Test tooling only; not part of any build.",
+	"browser_specific_settings": {
+		"gecko": {
+			"id": "favicon-probe@example.com",
+			"strict_min_version": "115.0"
+		}
+	},
+	"permissions": ["tabs", "tabHide", "storage", "downloads"],
+	"background": { "persistent": true, "scripts": ["background.js"] }
+}

@@ -37,6 +37,7 @@ const E2E = !!process.env.E2E;
 const STATIC_FILES = [
 	"manifest.json",
 	"icons/48.png", "icons/96.png",
+	"options.html", "options.js",
 ];
 /** Files that only the E2E flavor carries (copied by applyE2EPatch). */
 const E2E_FILES = ["tests.html", "tests-smoke.js", "tree-tab.html", "tree-tab.js", "favicon.svg"];

@@ -370,11 +370,51 @@ async function phaseOneAndTwo () {
 		menuShelved && menuShelved.menu.lastTabId == ids.C
 			&& menuShelved.menu.lastTakeVisible === true && menuShelved.menu.lastPutVisible === false,
 		JSON.stringify(menuShelved && menuShelved.menu));
+	record("the Shelf submenu is visible for a shelved tab",
+		menuShelved && menuShelved.menu.lastShelfVisible === true
+			&& menuShelved.menu.items.some(item => item.id == "tst-shelf:place-left")
+			&& menuShelved.menu.items.some(item => item.id == "tst-shelf:place-right"),
+		JSON.stringify(menuShelved && menuShelved.menu));
 	const menuPlain = await send({ type: "test:menu-shown", tabId: ids.A });
 	record("menu visibility on a plain tab: Put visible, Take hidden",
 		menuPlain && menuPlain.menu.lastTabId == ids.A
 			&& menuPlain.menu.lastPutVisible === true && menuPlain.menu.lastTakeVisible === false,
 		JSON.stringify(menuPlain && menuPlain.menu));
+	record("the Shelf submenu is hidden for an unshelved tab",
+		menuPlain && menuPlain.menu.lastShelfVisible === false,
+		JSON.stringify(menuPlain && menuPlain.menu));
+
+	// -- extreme placements ("Place leftmost" / "Place rightmost") ------
+	// At this point the strap order is [C, B, F] (B was re-put, forcing it
+	// to the end; F followed).  "Place rightmost" moves C to the last slot
+	// and "Place leftmost" returns it to the front; the shelf ends where
+	// it started, so the driver's later icon-order assertion holds.
+	{
+		const shelfOrder = async () => {
+			const s = await send({ type: "test:state" });
+			const shelf = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);
+			return shelf ? shelf[1] : null;
+		};
+		const movedRight = await send({ type: "test:place", tabId: ids.C, side: "right", });
+		const swung = await eventually(null, async () => {
+			const order = await shelfOrder();
+			return order && JSON.stringify(order) == JSON.stringify([ids.B, ids.F, ids.C]) ? order : null;
+		}, 8000);
+		record("Place rightmost makes C the last icon of its shelf", !!swung,
+			`ok=${movedRight && movedRight.ok} order=${JSON.stringify(swung)}`);
+		const movedLeft = await send({ type: "test:place", tabId: ids.C, side: "left", });
+		const restored = await eventually(null, async () => {
+			const order = await shelfOrder();
+			return order && JSON.stringify(order) == JSON.stringify([ids.C, ids.B, ids.F]) ? order : null;
+		}, 8000);
+		record("Place leftmost puts C back at the front of its shelf", !!restored,
+			`ok=${movedLeft && movedLeft.ok} order=${JSON.stringify(restored)}`);
+		const already = await send({ type: "test:place", tabId: ids.C, side: "left", });
+		const unchanged = await shelfOrder();
+		record("an already-extreme member does not move (no-op returns ok)",
+			already && already.ok === true && JSON.stringify(unchanged) == JSON.stringify([ids.C, ids.B, ids.F]),
+			`ok=${already && already.ok} order=${JSON.stringify(unchanged)}`);
+	}
 
 	// -- a shelf of shelves: shelve c1 on C's shelf ---------------------
 	// C is a member of A's shelf AND the owner of its own shelf.  The
@@ -424,6 +464,11 @@ async function phaseThree (ids) {
 
 	record("menu items exist after the reinstall (boot-time creation)",
 		state.menu.items.some(item => item.id == "tst-shelf:put") && state.menu.items.some(item => item.id == "tst-shelf:take"),
+		JSON.stringify(state.menu.items));
+	record("the Shelf submenu items exist after the reinstall",
+		state.menu.items.some(item => item.id == "tst-shelf:place-left")
+			&& state.menu.items.some(item => item.id == "tst-shelf:place-right")
+			&& state.menu.items.some(item => item.id == "tst-shelf:shelf"),
 		JSON.stringify(state.menu.items));
 
 	await eventually("the shelf derivation re-lands", async () => {

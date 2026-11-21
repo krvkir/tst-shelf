@@ -53,29 +53,46 @@ export function faviconStyleOf (tab) {
 	return ` style="background-image: url(&quot;${escapeAttributeValue(tab.favIconUrl)}&quot;)"`;
 }
 
-/** One shelf icon (a favicon cell). */
-export function iconHtml ({ tab, active, folded, }) {
+/**
+ * One shelf icon (a favicon cell).
+ *
+ * The fold badge shows whenever the shelved tab has descendants (the
+ * count is TST's own subtree-counter number: the descendants, the tab
+ * itself excluded) — the mode picks the plus or the number.  The audio
+ * indicator (`shelf-sound`) takes the other bottom corner; it carries
+ * the tab's id again so a click on the glyph alone identifies the target
+ * in the mousedown payload's closest-part HTML.
+ */
+export function iconHtml ({ tab, active, badgeMode = "plus", badgeCount = 0, }) {
 	const parts = ["shelf-icon"];
 	if (active) { parts.push("tst-shelf-icon-active"); }
-	const badgeParts = folded ? ["shelf-badge", "tst-shelf-badge-on"] : ["shelf-badge"];
+	const muted = !!tab.mutedInfo?.muted;
+	const playing = !muted && !!tab.audible;
+	const soundSpan = muted || playing
+		? `<span part="shelf-sound${muted ? " tst-shelf-sound-muted" : ""}" data-tab-id="${tab.id}"></span>`
+		: "";
+	const badgeSpan = badgeCount > 0
+		? `<span part="shelf-badge">${badgeMode === "count" ? badgeCount : "+"}</span>`
+		: "";
 	const title = `${tab.title || tab.url || ""}\n${tab.url || ""}`;
 	return `<div part="${parts.join(" ")}" data-tab-id="${tab.id}"`
 		+ ` draggable="true"`
 		+ ` data-drag-data='{"type":"tab","data":{"id":${tab.id},"asTree":true}}'`
 		+ ` title="${escapeAttributeValue(title)}"`
 		+ faviconStyleOf(tab)
-		+ `><span part="${badgeParts.join(" ")}">+</span></div>`;
+		+ `>${soundSpan}${badgeSpan}</div>`;
 }
 
 /** The strap of one shelf (its whole extra-contents markup). */
-export function strapHtml ({ members, tabsById, highlightIds, badgeIds, }) {
+export function strapHtml ({ members, tabsById, highlightIds, badgeCounts = new Map, badgeMode = "plus", }) {
 	const icons = members
 		.map(id => tabsById.get(id))
 		.filter(Boolean)
 		.map(tab => iconHtml({
 			tab,
 			active: highlightIds.has(tab.id),
-			folded: badgeIds.has(tab.id),
+			badgeMode,
+			badgeCount: badgeCounts.get(tab.id) || 0,
 		}))
 		.join("");
 	return `<div part="shelf-strap">${icons}</div>`;
@@ -87,7 +104,7 @@ export function strapHtml ({ members, tabsById, highlightIds, badgeIds, }) {
  * request that rejects is not recorded, so the next derivation retries it.
  * `send(type, params)` is TST's message route; the caller injects it.
  */
-export function createRenderer ({ send, log, }) {
+export function createRenderer ({ send, log, badgeModeOf = () => "plus", }) {
 	const renderedStraps = new Map; // `${windowId}:${owner}` -> { owner, contents } | null (cleared)
 	const tabStates = new Map;      // tabId -> Set of ACKNOWLEDGED tst-shelf-* states
 	/** Re-send every wanted state even if the ledger says it is applied: a
@@ -118,6 +135,17 @@ export function createRenderer ({ send, log, }) {
 		}
 	}
 
+	/** Build one shelf's strap markup from the current derivation state. */
+	function strapFor ({ members, tabsById, highlightIds, badgeCounts, }) {
+		return strapHtml({
+			members,
+			tabsById,
+			highlightIds,
+			badgeCounts,
+			badgeMode: badgeModeOf(),
+		});
+	}
+
 	/** Apply one window's derivation: straps first, then state classes. */
 	async function applyDerivation ({ windowId, derivation, tabsById, }) {
 		const desired = new Map;
@@ -125,11 +153,11 @@ export function createRenderer ({ send, log, }) {
 			if (!members.length) { continue; }
 			desired.set(strapKey(windowId, owner), {
 				owner,
-				contents: strapHtml({
+				contents: strapFor({
 					members,
 					tabsById,
 					highlightIds: derivation.highlightIds,
-					badgeIds: derivation.badgeIds,
+					badgeCounts: derivation.badgeCounts,
 				}),
 			});
 		}
@@ -231,11 +259,11 @@ export function createRenderer ({ send, log, }) {
 			writes.push(writeStrap({
 				key: strapKey(windowId, owner),
 				owner,
-				contents: strapHtml({
+				contents: strapFor({
 					members,
 					tabsById,
 					highlightIds: derivation.highlightIds,
-					badgeIds: derivation.badgeIds,
+					badgeCounts: derivation.badgeCounts,
 				}),
 				windowId,
 			}));

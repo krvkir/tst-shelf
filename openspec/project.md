@@ -83,9 +83,11 @@ Constraints:
   (extra contents), the addon state `tst-shelf-owner`, TST's
   `collapse-tree` / `expand-tree`, and `browser.tabs.hide()`.
 - Permission surface: `tabs`, `tabHide` (member rows, and the rows a
-  reveal suppresses), `storage` (boot diagnostics only), `sessions` (the
-  sticky per-tab flag), `menus` (the two context-menu items, which TST's
-  own item API cannot make visible for plain tab rows), no host
+  reveal suppresses), `storage` (boot diagnostics and the one user
+  option, `badgeMode`), `sessions` (the sticky per-tab flag), `menus`
+  (the tab-context-menu items — Put on shelf, Take off the shelf, and
+  the "Shelf" submenu with the two place commands — which TST's own
+  item API cannot make visible for plain tab rows), no host
   permissions, no content scripts.
 - Interop with tst-workspace goes through the native hidden state of
   tabs only; the two extensions do not message each other.
