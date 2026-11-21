@@ -27,7 +27,7 @@
  */
 import {
 	derive, indexTree, mustShowTabs, danglingMembers, planReveals,
-	treePositions, subtreeSizes, nextPlacementMove, ROOT_SHELF,
+	treePositions, subtreeSizes, nextPlacementMove, assignHints, ROOT_SHELF,
 } from "../src/background/logic.esm.js";
 
 const argv = process.argv.slice(2);
@@ -87,7 +87,8 @@ const { tree, shelved, tabsById, } = fixture(TABS);
 const activeId = [...tabsById.values()].find(tab => tab.active)?.id ?? null;
 const reveals = new Map;
 
-/** One full derivation pass, as the background runs it. */
+/** One full derivation pass, as the background runs it — plus the hint
+ *  assignment a mode start runs against the same tree (task 1.3). */
 function fullPass () {
 	const indexed = indexTree(tree);
 	const mustShow = mustShowTabs({ tree, activeId, });
@@ -105,7 +106,8 @@ function fullPass () {
 		sizes: subtreeSizes(tree),
 		shelves: derivation.shelves,
 	});
-	return { indexed, mustShow, dangling, plan, derivation, move, };
+	const hints = assignHints([...positions.keys()]);
+	return { indexed, mustShow, dangling, plan, derivation, move, hints, };
 }
 
 // warm-up (JIT), then measure

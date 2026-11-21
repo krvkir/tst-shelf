@@ -55,23 +55,28 @@ test("an unchanged markup is not sent again", async () => {
 
 	assert.equal(strapCalls(calls).length, first,
 		"the second pass had nothing new to say, so it sent no strap at all");
-	assert.equal(first, 1, "the first pass sent exactly one strap for the one shelf");
+	// the owner shelf's strap + the ALWAYS-present root strap (the key
+	// catcher rides it: tab-hints)
+	assert.equal(first, 2, "the first pass sent the owner strap and the catcher");
 });
 
 test("a rejected strap write is retried by the next derivation", async () => {
+	// call 0: the owner strap (rejects), call 1: the root catcher strap
 	const { calls, send, } = recorder({ failAt: [0], });
 	const renderer = createRenderer({ send, log: (kind, detail) => logs.push(`${kind} ${detail}`), });
 
 	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
 	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
 
-	assert.equal(strapCalls(calls).length, 2, "the failed write did not enter the ledger");
+	// owner (failed, retried) + catcher (always acknowledged) = 3 sends
+	assert.equal(strapCalls(calls).length, 3, "the failed write did not enter the ledger");
 	assert.ok(logs.some(entry => entry.startsWith("strap-send-fail")), "the failure is logged");
 });
 
 test("a rejected state add is retried and never recorded as applied", async () => {
-	// call 0: the strap, call 1: the owner state — reject the state.
-	const { calls, send, } = recorder({ failAt: [1], });
+	// calls: 0 the owner strap, 1 the root catcher, 2 the owner state —
+	// reject that one.
+	const { calls, send, } = recorder({ failAt: [2], });
 	const renderer = createRenderer({ send, log: (kind, detail) => logs.push(`${kind} ${detail}`), });
 
 	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
@@ -83,10 +88,10 @@ test("a rejected state add is retried and never recorded as applied", async () =
 });
 
 test("a state remove that fails stays in the ledger", async () => {
-	// calls: 0 strap, 1 owner state, 2 clear (the shelf is gone), 3 the
-	// state removal — reject that one.
+	// calls: 0 owner strap, 1 catcher, 2 owner state add, 3 the shelf's
+	// clear, 4 the state removal — reject that one.
 	const derivation = derivationOf();
-	const { calls, send, } = recorder({ failAt: [3], });
+	const { calls, send, } = recorder({ failAt: [4], });
 	const renderer = createRenderer({ send, log: (kind, detail) => logs.push(`${kind} ${detail}`), });
 
 	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
@@ -112,8 +117,8 @@ test("a vanished shelf is cleared once and then left alone", async () => {
 });
 
 test("a failed clear is retried", async () => {
-	// calls: 0 strap, 1 owner state, 2 clear (rejects)
-	const { calls, send, } = recorder({ failAt: [2], });
+	// calls: 0 owner strap, 1 catcher, 2 state add, 3 the clear (rejects)
+	const { calls, send, } = recorder({ failAt: [3], });
 	const renderer = createRenderer({ send, log: () => {}, });
 
 	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
@@ -131,9 +136,10 @@ test("restoreStraps re-sends and re-acknowledges the straps", async () => {
 	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
 	const before = strapCalls(calls).length;
 	await renderer.restoreStraps({ windowId: 7, derivation, tabsById, });
-	assert.equal(strapCalls(calls).length, before + 1, "a virtual-scroll restore is unconditional");
+	// a virtual-scroll restore is unconditional: the owner strap + the catcher
+	assert.equal(strapCalls(calls).length, before + 2, "a virtual-scroll restore is unconditional");
 	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
-	assert.equal(strapCalls(calls).length, before + 1, "the restore updated the ledger, so no redundant send");
+	assert.equal(strapCalls(calls).length, before + 2, "the restore updated the ledger, so no redundant send");
 });
 
 test("windowId and the root shelf are routed to the right target", async () => {
@@ -149,6 +155,36 @@ test("windowId and the root shelf are routed to the right target", async () => {
 	assert.deepEqual(strapCalls(calls)[0].params.place, "tabbar-top");
 	assert.equal(strapCalls(calls)[0].params.windowId, 9);
 	assert.equal(stateCalls(calls).length, 0, "the root shelf hosts no owner row");
+});
+
+// ---------------------------------------------------------------------------
+// the key catcher (tab-hints)
+
+test("the root strap carries the key catcher; other straps do not", () => {
+	const root = strapHtml({ members: [2], tabsById, highlightIds: new Set, keyCatcher: true, });
+	assert.ok(root.includes('part="shelf-keycatcher" tabindex="0"'), () => root);
+	const owner = strapHtml({ members: [2], tabsById, highlightIds: new Set, });
+	assert.equal(owner.includes("shelf-keycatcher"), false, "a shelf's strap has no catcher");
+});
+
+test("a member-less root strap renders the part-less idle wrapper with the catcher", () => {
+	const idle = strapHtml({ members: [], tabsById, highlightIds: new Set, keyCatcher: true, });
+	assert.equal(idle, `<div class="shelf-strap-idle"><span part="shelf-keycatcher" tabindex="0"></span></div>`);
+	const plain = strapHtml({ members: [], tabsById, highlightIds: new Set, });
+	assert.equal(plain, `<div part="shelf-strap"></div>`);
+});
+
+test("the catcher strap is written even when the derivation has no root shelf, and only once", async () => {
+	const { calls, send, } = recorder();
+	const renderer = createRenderer({ send, log: () => {}, });
+
+	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
+	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
+
+	const top = strapCalls(calls).filter(call => call.params.place === "tabbar-top");
+	assert.equal(top.length, 1, "the catcher strap is sent once and kept");
+	assert.ok(top[0].params.contents.includes("shelf-keycatcher"), "the catcher rides it");
+	assert.ok(top[0].params.contents.includes("shelf-strap-idle"), "a member-less root strap is the idle wrapper");
 });
 
 // ---------------------------------------------------------------------------
@@ -222,4 +258,89 @@ test("a silent unmuted tab shows no audio glyph", () => {
 		active: false, badgeCount: 0,
 	});
 	assert.ok(!html.includes("shelf-sound"));
+});
+
+// ---------------------------------------------------------------------------
+// hint chips (tab-hints)
+
+test("a hinted icon carries the code chip; an unhinted one does not", () => {
+	const tab = { id: 2, title: "a", url: "https://a.example", };
+	const html = strapHtml({
+		members: [2], tabsById, highlightIds: new Set, hints: new Map([[2, "ab"]]),
+	});
+	assert.match(html, /data-hint="ab">ab<\/span>/, () => html);
+	const plain = strapHtml({ members: [2], tabsById, highlightIds: new Set, });
+	assert.equal(plain.includes("shelf-hint"), false, "no hint chip outside the mode");
+	const narrowed = strapHtml({
+		members: [2], tabsById, highlightIds: new Set, hints: new Map,
+	});
+	assert.equal(narrowed.includes("shelf-hint"), false, "a narrowed-out code renders nothing");
+});
+
+test("hint codes are escaped like any other markup", () => {
+	// a hostile code can only come from a bug; the escape must hold anyway
+	const html = iconHtml({
+		tab: { id: 2, title: "x", url: "https://x.example", },
+		active: false, badgeCount: 0, hint: `<b>"ab"</b>`,
+	});
+	assert.equal(html.includes('<b>"ab"</b>'), false);
+	assert.ok(html.includes("&lt;b&gt;&quot;ab&quot;&lt;/b&gt;"), () => html);
+});
+
+// ---------------------------------------------------------------------------
+// row hints (tab-above label ledger)
+
+test("row hints are written once, updated on change and blanked on exit", async () => {
+	const { calls, send, } = recorder();
+	const renderer = createRenderer({ send, log: () => {}, });
+
+	await renderer.setRowHints({ windowId: 7, labels: new Map([[11, "ab"], [12, "cd"],]), });
+	await renderer.setRowHints({ windowId: 7, labels: new Map([[11, "ab"], [12, "cd"],]), });
+	assert.equal(strapCalls(calls).length, 2, "unchanged labels are not re-sent");
+	// the ROW chip's own part (NOT the icon chip's "shelf-hint"): the two
+	// anchor to different containers and carry different geometry rules
+	assert.ok(strapCalls(calls)[0].params.contents.includes('part="shelf-rowhint"'),
+		() => strapCalls(calls)[0].params.contents);
+
+	await renderer.setRowHints({ windowId: 7, labels: new Map([[11, "ab"], [12, ""],]), });
+	assert.equal(strapCalls(calls).length, 3, "only the narrowed-out label is blanked");
+	const blank = strapCalls(calls).at(-1);
+	assert.equal(blank.params.place, "tab-above");
+	assert.equal(blank.params.tab, 12);
+	assert.equal(blank.params.contents, "");
+
+	await renderer.clearRowHints({ windowId: 7, });
+	const blanks = strapCalls(calls).filter(call => call.params.contents === "");
+	assert.equal(blanks.length, 2, "exit blanks every acknowledged label once");
+	await renderer.clearRowHints({ windowId: 7, });
+	assert.equal(strapCalls(calls).length, 4, "a second clear is a no-op");
+
+	// a rejected write is retried, never recorded as applied
+	const failing = recorder({ failAt: [0], });
+	const renderer2 = createRenderer({ send: failing.send, log: () => {}, });
+	await renderer2.setRowHints({ windowId: 8, labels: new Map([[21, "xy"],]), });
+	assert.equal(strapCalls(failing.calls).length, 1);
+	await renderer2.setRowHints({ windowId: 8, labels: new Map([[21, "xy"],]), });
+	assert.equal(strapCalls(failing.calls).length, 2, "the failed label write is retried");
+});
+
+test("hint chips ride restoreStraps while the mode is on, and vanish after setHints(null)", async () => {
+	const { calls, send, } = recorder();
+	const renderer = createRenderer({ send, log: () => {}, });
+	const derivation = derivationOf();
+
+	renderer.setHints(new Map([[2, "ab"], [3, "cd"],]));
+	await renderer.applyDerivation({ windowId: 7, derivation: derivationOf(), tabsById, });
+	let ownerStrap = strapCalls(calls).filter(call => call.params.place === "tab-below").at(-1);
+	assert.ok(ownerStrap.params.contents.includes('data-hint="ab"'), () => ownerStrap.params.contents);
+
+	// a virtual-scroll restore keeps the chips while the mode is on
+	await renderer.restoreStraps({ windowId: 7, derivation, tabsById, });
+	ownerStrap = strapCalls(calls).filter(call => call.params.place === "tab-below").at(-1);
+	assert.ok(ownerStrap.params.contents.includes('data-hint="cd"'), () => ownerStrap.params.contents);
+
+	renderer.setHints(null);
+	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
+	ownerStrap = strapCalls(calls).filter(call => call.params.place === "tab-below").at(-1);
+	assert.equal(ownerStrap.params.contents.includes("shelf-hint"), false, "exit removes every chip");
 });

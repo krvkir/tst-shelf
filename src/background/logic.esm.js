@@ -691,3 +691,193 @@ export function planRestoreMove ({ order = [], tabId, subtree = [], savedIndex =
 	if (index >= base.length) { return planOf("move-after", base[base.length - 1]); }
 	return planOf("move-before", base[index]);
 }
+
+// ---------------------------------------------------------------------------
+// hint mode (tab-hints capability)
+
+/** The default letters hint codes may be built from.  These six are
+ *  exactly the lowercase letters that start NO default Vimium mapping
+ *  (background_scripts/commands.js of the Vimium the user runs: j k h
+ *  l g z d u r y p i v f n o b t x m and their capitals are all taken) —
+ *  Vimium hangs its keydown listener on window with capture:true and
+ *  consumes mapped keys with stopImmediatePropagation, so a code letter
+ *  Vimium maps is eaten before this extension's document-level catcher
+ *  can ever see it.  With this default no such collision exists; the
+ *  charset is user-configurable (storage.local.hintCharset) for anyone
+ *  whose Vimium config differs.  Lowercase single characters only: the
+ *  keydown payload carries `event.key`, and a one-character key is
+ *  lower-cased before it enters the buffer. */
+export const HINT_CHARSET = "acqsew";
+
+/** Normalize a user-supplied charset (options page): unique lowercase
+ *  single letters/digits, order preserved.  Fewer than two distinct
+ *  characters is not an alphabet — "" tells the caller to keep the
+ *  default.  Pure. */
+export function normalizeHintCharset (input) {
+	const seen = new Set;
+	let out = "";
+	for (const ch of String(input || "").toLowerCase().split("")) {
+		if (!/^[a-z0-9]$/.test(ch) || seen.has(ch)) { continue; }
+		seen.add(ch);
+		out += ch;
+	}
+	return out.length > 1 ? out : "";
+}
+
+/** Pages `tabs.executeScript` can never inject into (MDN,
+ *  tabs.executeScript): the injectable schemes are those expressible as
+ *  a match pattern (http, https, file), but top-level about: frames and
+ *  extension pages (moz-extension:, the TST group tabs among them)
+ *  reject the injection outright, so a hint mode anchored on one is a
+ *  trap: no catcher, no keys.  Hint mode declines such active tabs
+ *  (spec tab-hints), and — while the exclusion option is on — assigns
+ *  them no code either, so one can never be navigated INTO and strand
+ *  the keyboard.  Pure. */
+export function isSpecialPageUrl (url) {
+	const text = String(url || "").toLowerCase();
+	if (!text) { return true; }
+	for (const scheme of ["about:", "moz-extension:", "chrome:", "resource:", "moz-icon:", "view-source:"]) {
+		if (text.startsWith(scheme)) { return true; }
+	}
+	return false;
+}
+
+/**
+ * Assign Vimium-style hint codes to the visible set (spec tab-hints).
+ *
+ * The codes are the visible ids rendered through `charset` in base N at
+ * a FIXED length `ceil(log_charset(count))`, in the caller's order — the
+ * tree-walk order the sidebar renders in.  A fixed length makes the
+ * prefix rule decidable by construction: no code can be a proper prefix
+ * of another (all codes share the length), so "the one-letter typed
+ * prefix that matches exactly one code" is exactly one tab and a
+ * two-letter code can never be ambiguous with it.  Length grows only
+ * when the count demands it (35 tabs stay 1-letter at the full charset;
+ * 36+ become 2 letters, 677+ three).
+ *
+ * Pure and deterministic: the same visible set always produces the same
+ * codes, so the E2E can pick letters out of the state export.
+ *
+ * @param {number[]} ids the visible tabs, rendered order
+ * @param {string=} charset the code alphabet
+ * @returns {Map<number, string>} id -> code
+ */
+export function assignHints (ids, charset = HINT_CHARSET) {
+	const base = String(charset || HINT_CHARSET).split("");
+	const alphabet = base.length > 1 ? base : HINT_CHARSET.split("");
+	const count = (ids || []).length;
+	const map = new Map;
+	if (count <= 0) { return map; }
+	const digits = alphabet.length;
+	const length = Math.max(1, Math.ceil(Math.log(count) / Math.log(digits)));
+	let value = 0;
+	for (const id of ids) {
+		let code = "";
+		let rest = value++;
+		for (let index = 0; index < length; index++) {
+			code = alphabet[rest % digits] + code;
+			rest = Math.floor(rest / digits);
+		}
+		map.set(id, code);
+	}
+	return map;
+}
+
+/**
+ * The codes a typed buffer still matches, in a stable order.
+ * `buffer` is already lower-cased by the caller; a non-empty buffer
+ * keeps only codes starting with it.  Pure: the callers only read it.
+ * @returns {Array<[number, string]>} id/code pairs, ids in input order
+ */
+export function hintMatches (codes, buffer) {
+	const text = String(buffer || "");
+	if (!text) { return []; }
+	const matches = [];
+	for (const [id, code] of codes) {
+		if (code.startsWith(text)) { matches.push([id, code]); }
+	}
+	return matches;
+}
+
+/**
+ * The code-eligible tabs of a window: EXACTLY the tabs whose surfaces
+ * are painted, so a typed code can only ever land on something the
+ * user can see (the 0.5.0 defect: codes for all 350+ visible tabs —
+ * rows inside folded subtrees included — meant 4-letter codes and
+ * mistype jumps into tabs that were not on screen).
+ *
+ * The surfaces:
+ * - a ROW tab's label paints on its rendered row: eligible iff the row
+ *   is in the rendered set (the tabs-rendered/-unrendered ledger).
+ *   TST's tree export carries NO render knowledge — kTAB_SAFE_STATES
+ *   (common/constants.js) lists collapsed/subtree-collapsed and friends
+ *   only; the virtual scroll's render range is a sidebar-side concept
+ *   no API exposes.  A warm ledger cut to the viewport is the whole
+ *   point: a few dozen codes, 1-2 letters.
+ * - a MEMBER's code paints on its icon: eligible iff the icon rule
+ *   holds (hidden by us keeps the icon; a reveal-suppressed or
+ *   foreign-hidden tab does not) AND the strap carrying the icon is
+ *   painted — the root strap rides #tabbar-top (always painted); any
+ *   other strap rides its owner's ROW, painted iff the owner's row is
+ *   rendered.  The strap paints on a FOLDED owner's row too (the icons
+ *   are the fold's presentation), and never on a member-owner without
+ *   a row (no reveal → no nested strap anywhere).
+ * - rows inside a folded subtree are never painted, warm or cold; the
+ *   walk carries the fold down and skips them.  MEMBERS inside the
+ *   fold are not skipped: their surface is the owner's strap, not a
+ *   row.
+ *
+ * Cold ledger (rendered null or empty — no tabs-rendered since our
+ * boot, e.g. an extension reload with the sidebar left open): the
+ * viewport cut is SKIPPED (the 0.3.3 stale-ledger trap must not
+ * return — TST routes set-extra-contents by tab id, so labels for
+ * rows that are rendered but never broadcast still paint); codes then
+ * cover every non-folded visible tab.  The fold cut survives the cold
+ * case: it comes from the tree (`subtree-collapsed`), not the ledger.
+ *
+ * Pure: everything derives from the tree, the tab records and the
+ * passed sets — unit-tested.
+ *
+ * @param {object} args tree, tabsById, shelfOf (member -> owner, from
+ * derive), shelved/hiddenByUs/suppressedHiddenByUs (Sets), rendered
+ * (Set of painted row ids; null/empty = cold), excludeSpecial
+ * (boolean: special pages carry no code)
+ * @returns {{orderedIds: number[], rowIds: number[], memberIds: number[]}}
+ * rowIds/memberIds in walk order; orderedIds the position-sorted union.
+ */
+export function planHintTargets ({ tree, tabsById, shelfOf, shelved, hiddenByUs, suppressedHiddenByUs, rendered, excludeSpecial, }) {
+	const ledger = rendered && rendered.size ? rendered : null;
+	const rowIds = [];
+	const memberIds = [];
+	(function walk (nodes, insideFold) {
+		for (const node of nodes || []) {
+			const id = node.id;
+			const tab = tabsById.get(id);
+			if (tab && !tab.pinned && !(excludeSpecial && isSpecialPageUrl(tab.url))) {
+				if (shelved.has(id)) {
+					const icon = (!tab.hidden || hiddenByUs.has(id))
+						&& !suppressedHiddenByUs.has(id);
+					// no shelfOf entry = the derivation renders no icon
+					// (its visible() rejected the tab); the strap check:
+					// ROOT_SHELF (null owner) rides #tabbar-top, any other
+					// owner's strap rides that owner's row — cold assumes
+					// painted (the stale-ledger fallback)
+					const painted = shelfOf.has(id) && (ledger == null
+						|| shelfOf.get(id) == null
+						|| ledger.has(shelfOf.get(id)));
+					if (icon && painted) { memberIds.push(id); }
+				}
+				else if (!(tab.hidden || suppressedHiddenByUs.has(id))
+						&& !insideFold
+						&& (ledger == null || ledger.has(id))) {
+					rowIds.push(id);
+				}
+			}
+			walk(node.children, insideFold || isFolded(node.states));
+		}
+	})(Array.isArray(tree) ? tree : [tree], false);
+	const positions = treePositions(tree);
+	const orderedIds = [ ...rowIds, ...memberIds, ]
+		.sort((a, b) => (positions.get(a) ?? Number.MAX_SAFE_INTEGER) - (positions.get(b) ?? Number.MAX_SAFE_INTEGER));
+	return { orderedIds, rowIds, memberIds, };
+}

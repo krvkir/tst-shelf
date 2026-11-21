@@ -1,42 +1,81 @@
 ## ADDED Requirements
 
 ### Requirement: A keyboard command starts hint mode for the focused window
-The extension SHALL register a browser keyboard command that starts hint mode for the focused window's tab strip. While hint mode is active, the extension SHALL assign and render a hint code for every visible tab of that window. Hint mode SHALL end when a tab is activated through a code, when the user presses Escape, or when the tab strip loses keyboard focus. Starting hint mode SHALL have no effect while the window's Tree Style Tab sidebar is closed.
+The extension SHALL register a browser keyboard command that starts hint mode for the focused window's tab strip. While hint mode is active, the extension SHALL assign and render a hint code for every visible tab of that window, and SHALL capture the code letters wherever the window's keyboard focus is — the focused web page as well as the Tree Style Tab sidebar — so typing a code works from the page the user is reading. Hint mode SHALL end when a tab is activated through a code, when the user presses Escape, or when the user has typed nothing for a few seconds. Starting hint mode SHALL have no effect while the window's Tree Style Tab sidebar is closed, and SHALL decline — a deliberate no-op — when the window's active tab is a page no key catcher can ever be injected into (a browser page, an extension page), because such a mode could not receive keys from anywhere the user's focus already is.
 
 #### Scenario: The command labels every visible tab
 - **WHEN** the user presses the hint command's key while the sidebar is open
 - **THEN** every visible tab of the window — rendered rows and shelf icons — carries a code label
 
+#### Scenario: Typing works from the focused page
+- **WHEN** hint mode is active and the window's keyboard focus is a normal web page
+- **THEN** typing a tab's code activates that tab, and the page receives no typed letter
+
 #### Scenario: Escape exits without activating anything
 - **WHEN** hint mode is active and the user presses Escape
 - **THEN** the labels disappear and no tab changes state
 
-#### Scenario: Losing keyboard focus exits the mode
-- **WHEN** hint mode is active and the tab strip loses keyboard focus
+#### Scenario: A pause in typing ends the mode
+- **WHEN** hint mode is active and the user types nothing for a few seconds
 - **THEN** the labels disappear and the extension stops consuming keys
 
 #### Scenario: A closed sidebar makes the command a no-op
 - **WHEN** the user presses the command's key while the window's Tree Style Tab sidebar is closed
 - **THEN** nothing happens and no labels appear anywhere
 
-### Requirement: Every visible tab carries a unique short code
-The extension SHALL assign, while hint mode is active, a unique code of the shortest practical length to every visible tab of the window: a shelved tab's code labels its shelf icon, a rendered row's tab has its code label its row. Codes SHALL follow the rendered order of the tree and SHALL be reassigned when the visible set changes. Tabs with no visible surface — rows outside the virtual-scroll viewport, tabs hidden by a reveal or filtered out by another extension — SHALL carry no code.
+#### Scenario: A special active page makes the command a no-op
+- **WHEN** the user presses the command's key while the window's active tab is a page the key catcher cannot be injected into — an about: page, an extension page such as a Tree Style Tab group tab
+- **THEN** nothing happens, no labels appear, and no hint mode is left running
+
+### Requirement: Every painted tab surface carries a unique short code
+The extension SHALL assign, while hint mode is active, a unique code of the shortest practical length to exactly the tabs whose surfaces are painted when the mode starts: a rendered row's tab has its code label its row, and a shelved tab whose shelf icon is painted has its code label that icon. No other tab SHALL carry a code — hidden tabs, tabs inside folded subtrees, and rows outside the sidebar's rendered range have none, so a typed code can never activate a tab the user cannot see. Codes SHALL follow the rendered order of the tree, SHALL stay unchanged for the mode's lifetime, and SHALL be built from the user-configured code alphabet. While the special-page exclusion option is on (the default), a tab whose page the key catcher can never be injected into SHALL carry no code either, so the keyboard can never navigate onto a page it would be stranded on.
 
 #### Scenario: Codes are unique and ordered
-- **WHEN** hint mode is active over a tree of ten visible tabs
+- **WHEN** hint mode is active over a tree of ten painted tabs
 - **THEN** every one of them carries a different code, in the order the tree renders them
 
 #### Scenario: A shelved tab's code sits on its icon
 - **WHEN** a shelf's members are hidden rows visible only as icons
 - **THEN** their codes label the icons on the strap, and no code labels the hidden rows themselves
 
-#### Scenario: Off-viewport rows have no code
-- **WHEN** a row sits outside the visible range of the virtual scroll
-- **THEN** it carries no code, and scrolling it into view assigns it one
+#### Scenario: A row scrolled out of view keeps its code
+- **WHEN** a labeled row leaves the visible range of the virtual scroll and comes back
+- **THEN** it shows the same code it had
+
+#### Scenario: A row outside the viewport at entry carries no code
+- **WHEN** a row is outside the sidebar's rendered range when the mode starts and scrolls into view later
+- **THEN** it carries no code, the codes of the other tabs do not change, and re-entering the mode after the scroll assigns codes for the new viewport
 
 #### Scenario: Codes follow a changing tree
-- **WHEN** a tab closes or the viewport scrolls while hint mode is active
-- **THEN** the codes are reassigned to the new visible set and stay unique
+- **WHEN** a tab closes while hint mode is active
+- **THEN** the codes of the remaining tabs stay valid and unique
+
+#### Scenario: A folded subtree carries no row codes
+- **WHEN** a parent's subtree is folded when the mode starts
+- **THEN** the rows inside the fold carry no code, the folded parent's own row carries its code, and the members of its shelf keep their icon codes
+
+#### Scenario: Special pages carry no code while the exclusion is on
+- **WHEN** hint mode is active with the exclusion option on (the default) and the window holds tabs on pages the catcher cannot be injected into — about: pages, extension pages
+- **THEN** those tabs carry no code, and every other painted tab does
+
+#### Scenario: Codes come from the configured alphabet
+- **WHEN** the user has configured a code alphabet in the options and starts hint mode
+- **THEN** every code consists only of characters from that alphabet
+
+#### Scenario: A window whose viewport cannot be queried still codes the tree
+- **WHEN** the mode starts for a window whose sidebar viewport state cannot be queried (no sidebar copy answers)
+- **THEN** the codes cover every tab whose row is not folded away — labels painting wherever rows exist — so a reload of the extension with an open sidebar never blanks the mode
+
+### Requirement: Hint options apply live
+The extension SHALL offer, on its options page, the code alphabet (two or more distinct letters or digits, defaulting to letters that no default Vimium mapping starts with) and the special-page exclusion (default on), and SHALL apply a change to either without a restart or a reload.
+
+#### Scenario: Changing the alphabet changes the next codes
+- **WHEN** the user changes the code alphabet while no hint mode is running and starts one afterwards
+- **THEN** the codes are built from the new alphabet
+
+#### Scenario: Turning the exclusion off codes special pages
+- **WHEN** the user turns the special-page exclusion off and starts hint mode over a window with an about: tab
+- **THEN** that tab carries a code as any other visible tab
 
 ### Requirement: Hint labels do not change the tree's geometry
 The extension SHALL render hint labels as overlays — on the shelf icon or on the tab's row — that change no row's size, position, or spacing, and SHALL leave the tab bar's own layout untouched while the mode is not active.
@@ -67,6 +106,10 @@ The extension SHALL activate the tab whose code the user types: a shelved tab ex
 #### Scenario: A prefix that matches several codes activates nothing
 - **WHEN** the user types one letter that begins several codes
 - **THEN** no tab activates, and only the labels of the still-matching tabs remain visible
+
+#### Scenario: The icon chips narrow together with the row labels
+- **WHEN** the user types one letter that begins several codes and the window holds shelved tabs with visible icons
+- **THEN** the chips on those icons hide exactly like the row labels of the non-matching tabs, so both surfaces agree
 
 #### Scenario: Backspace un-types a letter
 - **WHEN** the user typed one letter of a two-letter code and presses Backspace

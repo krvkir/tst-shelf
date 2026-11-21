@@ -25,4 +25,4 @@
 ## 5. Documentation
 
 - [x] 5.1 README: extend the favicon caveat with the failed-navigation rule and the undetectable broken-icon case
-- [ ] 5.2 version bump in `src/manifest.json` and `package.json` together (release checklist)
+- [x] 5.2 version bump in `src/manifest.json` and `package.json` together (release checklist)

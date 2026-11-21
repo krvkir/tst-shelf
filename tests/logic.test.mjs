@@ -10,6 +10,7 @@ import {
 	subtreeSizes, treePositions, nextPlacementMove, planExtremePlacementMove, resolveFavicons,
 	mustShowTabs, danglingMembers, ROOT_SHELF,
 	planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf,
+	assignHints, hintMatches, HINT_CHARSET, normalizeHintCharset, isSpecialPageUrl, planHintTargets,
 } from "../src/background/logic.esm.js";
 
 /** Light-tree node helper. */
@@ -852,4 +853,218 @@ test("the reference stays inside the member block (the re-parent trap)", () => {
 	});
 	assert.equal(plan.referenceTabId, 3, "the last member of the block, not the sibling after it");
 	assert.equal(plan.thenOutdent, false);
+});
+
+// ---------------------------------------------------------------------------
+// hint codes (tab-hints capability)
+
+test("short alphabet for a small visible set, unique codes", () => {
+	const map = assignHints([2, 3, 4], HINT_CHARSET);
+	assert.deepEqual([...map.values()], ["a", "c", "q"]);
+	assert.equal(new Set(map.values()).size, map.size, "codes are unique");
+	assert.equal(map.get(3).length, 1, "single letters while the set fits the alphabet");
+});
+
+test("codes follow the caller's (rendered) order", () => {
+	const map = assignHints([9, 4, 7], "abcd");
+	assert.deepEqual([...map.keys()], [9, 4, 7], "input order, not id order");
+});
+
+test("the length grows only when the count demands it", () => {
+	// the boundary math needs a 26-letter alphabet stated EXPLICITLY —
+	// the default charset is the six Vimium-safe letters now
+	const alphabet = "abcdefghijklmnopqrstuvwxyz";
+	assert.equal(assignHints(Array.from({ length: 26 }, (_, i) => i), alphabet).get(0).length, 1);
+	assert.equal(assignHints(Array.from({ length: 27 }, (_, i) => i), alphabet).get(0).length, 2);
+	assert.equal(assignHints(Array.from({ length: 676 }, (_, i) => i), alphabet).get(0).length, 2);
+	assert.equal(assignHints(Array.from({ length: 677 }, (_, i) => i), alphabet).get(0).length, 3);
+});
+
+test("the default charset is safe against Vimium's default keymap", () => {
+	// the lowercase letters that START a mapping in Vimium's
+	// background_scripts/commands.js defaultKeyMappings (measured in
+	// ~/repos/firefox/vimium): Vimium listens on window with
+	// capture:true and consumes mapped keys with
+	// stopImmediatePropagation, so a code letter from this set is
+	// eaten before our document-level catcher can ever see it
+	const vimiumFirstLetters = "jkhl gz dur y p iv f n o b t x m".split(/\s*/).join("");
+	for (const letter of HINT_CHARSET.split("")) {
+		assert.equal(vimiumFirstLetters.includes(letter), false,
+			`"${letter}" starts a default Vimium mapping and cannot be a code letter`);
+	}
+	assert.equal(HINT_CHARSET.length >= 2, true, "an alphabet, not a single letter");
+});
+
+test("normalizeHintCharset dedupes, lower-cases, and rejects too-short input", () => {
+	assert.equal(normalizeHintCharset("Qq Aa, c!"), "qac");
+	assert.equal(normalizeHintCharset("AcQSEW"), "acqsew", "upper-case input normalizes to the default set");
+	assert.equal(normalizeHintCharset("aa"), "", "one distinct character is not an alphabet — the caller keeps the default");
+	assert.equal(normalizeHintCharset(""), "");
+	assert.equal(normalizeHintCharset(null), "");
+	assert.equal(normalizeHintCharset("a1 2b"), "a12b", "digits are allowed in a custom charset");
+});
+
+test("isSpecialPageUrl marks exactly the uninjectable schemes", () => {
+	// MDN tabs.executeScript: top-level about: frames and extension
+	// pages reject the injection; http/https/file are the matchable
+	// schemes (anything else is ATTEMPTED and the arm failure logged)
+	assert.equal(isSpecialPageUrl("about:blank"), true);
+	assert.equal(isSpecialPageUrl("about:newtab"), true);
+	assert.equal(isSpecialPageUrl("about:reader?url=https%3A%2F%2Fexample.com%2F"), true);
+	assert.equal(isSpecialPageUrl("moz-extension://8f0261c6-33f8-4b47-b10a-e887e54570e4/resources/group-tab.html?title=Token+Engineering"), true);
+	assert.equal(isSpecialPageUrl("chrome://browser/content/browser.xhtml"), true);
+	assert.equal(isSpecialPageUrl("resource://pdf.js/web/viewer.html"), true);
+	assert.equal(isSpecialPageUrl("view-source:https://example.com/"), true);
+	assert.equal(isSpecialPageUrl("https://example.com/"), false);
+	assert.equal(isSpecialPageUrl("http://127.0.0.1:47631/a.html"), false);
+	assert.equal(isSpecialPageUrl("file:///home/dev/notes/index.html"), false);
+	assert.equal(isSpecialPageUrl("data:text/html,hello"), false, "attempted: not a match pattern, but not a known-forbidden scheme either");
+	assert.equal(isSpecialPageUrl(""), true, "no URL at all is not an injectable page");
+	assert.equal(isSpecialPageUrl(undefined), true);
+});
+
+test("a 700-tab window still gets unique, prefix-safe codes", () => {
+	const map = assignHints(Array.from({ length: 700 }, (_, i) => i + 1));
+	assert.equal(new Set(map.values()).size, 700, "unique");
+	// a fixed length makes the prefix rule decidable by construction
+	const lengths = new Set([...map.values()].map(code => code.length));
+	assert.equal(lengths.size, 1, "all codes share one length, so none is a bare prefix of another");
+});
+
+test("reassignment: a different visible set produces fresh codes, deterministically", () => {
+	const first = assignHints([5, 6, 7]);
+	const again = assignHints([5, 6, 7]);
+	assert.deepEqual([...first.entries()], [...again.entries()], "pure and deterministic");
+	const grown = assignHints([5, 6, 7, 8]);
+	assert.deepEqual(grown.get(5), first.get(5), "the stable prefix of the set keeps its codes");
+});
+
+test("hintMatches narrows by case-folded prefix", () => {
+	const codes = assignHints([1, 2, 3]);
+	assert.deepEqual(hintMatches(codes, "c"), [[2, "c"]]);
+	assert.deepEqual(hintMatches(codes, "C"), [], "the caller lower-cases; mixed case dies");
+	assert.deepEqual(hintMatches(codes, ""), [], "an empty buffer matches nothing (activation needs a letter)");
+});
+
+test("hintMatches keeps an empty match clean instead of a false activate", () => {
+	const codes = new Map([[1, "ad"], [2, "bc"]]);
+	assert.deepEqual(hintMatches(codes, "a"), [[1, "ad"]]);
+	assert.deepEqual(hintMatches(codes, "z"), []);
+});
+
+// ---------------------------------------------------------------------------
+// the coded set: painted surfaces only (planHintTargets)
+
+test("planHintTargets codes exactly the painted surfaces (warm ledger)", () => {
+	// tree: 1 = an owner, FOLDED, with member 2 (hidden by us) and plain
+	// child 3; 4 = a plain row; 5 = a root-shelf member (hidden by us);
+	// 6 = a plain row OUTSIDE the viewport
+	const tree = [
+		node(1, ["subtree-collapsed"], [node(2), node(3)]),
+		node(4, [], []),
+		node(5),
+		node(6),
+	];
+	const tabsById = new Map([
+		[1, { id: 1, }],
+		[2, { id: 2, hidden: true, }],
+		[3, { id: 3, }],
+		[4, { id: 4, }],
+		[5, { id: 5, hidden: true, }],
+		[6, { id: 6, }],
+	]);
+	const shelved = new Set([2, 5]);
+	const hiddenByUs = new Set([2, 5]);
+	const shelfOf = new Map([[2, 1], [5, null]]); // 2 on owner 1's shelf, 5 on the root shelf
+	const out = planHintTargets({
+		tree, tabsById, shelfOf, shelved, hiddenByUs,
+		suppressedHiddenByUs: new Set, rendered: new Set([1, 4]),
+		excludeSpecial: false,
+	});
+	// rows: 4 only (1 is coded as a row? NO — 1 is an owner with a PLAIN
+	// row too — owners are row tabs!  3 is folded away, 6 is off-screen)
+	assert.deepEqual(out.rowIds, [1, 4], "rendered rows only: the folded child and the off-viewport row carry no code");
+	// members: 2 (its strap paints on owner 1's rendered row, folded or
+	// not — the icons are the fold's presentation) and 5 (the root strap
+	// rides #tabbar-top, always painted)
+	assert.deepEqual(out.memberIds, [2, 5], "a member's code rides its painted strap, not its row");
+	// ordered: walk order 1, 2, 4, 5
+	assert.deepEqual(out.orderedIds, [1, 2, 4, 5]);
+});
+
+test("a cold ledger keeps codes for every non-folded visible tab (the 0.3.3 trap stays shut)", () => {
+	const tree = [
+		node(1, ["subtree-collapsed"], [node(3)]),
+		node(4),
+	];
+	const tabsById = new Map([[1, { id: 1, }], [3, { id: 3, }], [4, { id: 4, }]]);
+	const out = planHintTargets({
+		tree, tabsById, shelfOf: new Map, shelved: new Set, hiddenByUs: new Set,
+		suppressedHiddenByUs: new Set, rendered: null, excludeSpecial: false,
+	});
+	assert.deepEqual(out.rowIds, [1, 4], "cold: the viewport cut is skipped (labels paint wherever rows are)");
+	assert.equal(out.rowIds.includes(3), false, "the fold cut comes from the tree and survives the cold case");
+	// an EMPTY ledger is cold too (a window whose rows all unrendered)
+	assert.deepEqual(planHintTargets({
+		tree, tabsById, shelfOf: new Map, shelved: new Set, hiddenByUs: new Set,
+		suppressedHiddenByUs: new Set, rendered: new Set, excludeSpecial: false,
+	}).rowIds, [1, 4]);
+});
+
+test("a nested member is coded only while its owner's row is painted (a reveal)", () => {
+	// C (2) is a member of A's shelf and the owner of c1 (7); c1's strap
+	// rides C's row, which exists only during a reveal
+	const tree = [node(1, [], [node(2, [], [node(7)])])];
+	const tabsById = new Map([
+		[1, { id: 1, }], [2, { id: 2, hidden: true, }], [7, { id: 7, hidden: true, }],
+	]);
+	const shelved = new Set([2, 7]);
+	const hiddenByUs = new Set([2, 7]);
+	const shelfOf = new Map([[2, 1], [7, 2]]);
+	const base = { tree, tabsById, shelfOf, shelved, hiddenByUs, suppressedHiddenByUs: new Set, excludeSpecial: false, };
+	// no reveal: owner 2 has no row, so the nested strap paints nowhere
+	assert.deepEqual(planHintTargets({ ...base, rendered: new Set([1]), }).memberIds, [2],
+		"the nested member carries no code without a reveal (its strap has no row)");
+	// the reveal paints owner 2's row: c1's strap paints with it
+	assert.deepEqual(planHintTargets({ ...base, rendered: new Set([1, 2]), }).memberIds, [2, 7]);
+});
+
+test("member icon rules and the special-page exclusion gate the codes", () => {
+	const tree = [node(1, [], [node(2), node(3), node(4), node(5)])];
+	const tabsById = new Map([
+		[1, { id: 1, url: "https://a.example/", }],
+		[2, { id: 2, hidden: true, url: "https://a.example/", }],          // hidden by someone else: no icon
+		[3, { id: 3, hidden: true, url: "https://a.example/", }],          // reveal-suppressed: no icon
+		[4, { id: 4, hidden: true, url: "about:blank", }], // special page: excluded
+		[5, { id: 5, hidden: true, url: "https://a.example/", }],
+	]);
+	const shelved = new Set([2, 3, 4, 5]);
+	const hiddenByUs = new Set([4, 5]);
+	const suppressedHiddenByUs = new Set([3]);
+	const shelfOf = new Map([[2, 1], [3, 1], [4, 1], [5, 1]]);
+	const out = planHintTargets({
+		tree, tabsById, shelfOf, shelved, hiddenByUs, suppressedHiddenByUs,
+		rendered: new Set([1]), excludeSpecial: true,
+	});
+	assert.deepEqual(out.memberIds, [5], "only the eligible icon survives: foreign-hidden, suppressed and special members carry no code");
+	// with the exclusion OFF the special-page member is coded like any other
+	assert.deepEqual(planHintTargets({
+		tree, tabsById, shelfOf, shelved, hiddenByUs, suppressedHiddenByUs,
+		rendered: new Set([1]), excludeSpecial: false,
+	}).memberIds, [4, 5]);
+	// a member the derivation gives no shelf (no icon anywhere) carries no code
+	assert.deepEqual(planHintTargets({
+		tree, tabsById, shelfOf: new Map, shelved, hiddenByUs, suppressedHiddenByUs,
+		rendered: new Set([1]), excludeSpecial: false,
+	}).memberIds, []);
+});
+
+test("pinned tabs and tabs missing from the query carry no code", () => {
+	const tree = [node(1, [], [node(2)]), node(3)];
+	const tabsById = new Map([[1, { id: 1, pinned: true, }], [3, { id: 3, }]]);
+	const out = planHintTargets({
+		tree, tabsById, shelfOf: new Map, shelved: new Set, hiddenByUs: new Set,
+		suppressedHiddenByUs: new Set, rendered: new Set([1, 2, 3]), excludeSpecial: false,
+	});
+	assert.deepEqual(out.rowIds, [3], "pinned rows and absent tab records are never coded");
 });

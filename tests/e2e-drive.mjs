@@ -31,6 +31,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { spawn, } from "node:child_process";
 import net from "node:net";
 import { fileURLToPath, } from "node:url";
@@ -59,6 +60,14 @@ const FIREFOX_BIN = flag("--bin", "/usr/bin/firefox");
  *  production dist/ is never installed by the harness (and can never be
  *  left holding a test build). */
 const DIST = path.resolve(REPO, flag("--dist", "dist"));
+/** The hint-mode fixture pages: a real http server (the favicon probe's
+ *  pattern).  executeScript can inject into http (MDN) but never into
+ *  about:/extension pages, so the real page catcher and the
+ *  special-page exclusion both need real http pages — mirrored as a
+ *  constant in src/tests-smoke.js (phase 1 runs there, before any
+ *  driver script exists). */
+const HINT_PORT = 47631;
+const HINT_ORIGIN = `http://127.0.0.1:${HINT_PORT}`;
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), "tst-shelf-e2e-"));
 const PREFS = path.join(SCRATCH, "prefs.js");
 const die = error => { console.error(error && error.stack || String(error)); process.exitCode = 2; };
@@ -467,6 +476,219 @@ const rowPresenceScript = String.raw`
 	return JSON.stringify(out);
 `;
 
+/** Real http pages in the fixture window, the first made ACTIVE (the
+ *  window's active tab decides both the decline rule and the catcher's
+ *  injection target).  Returns the new ids plus EVERY http tab of the
+ *  window (phase 1's smoke page creates one too).  The QUERY PATTERN
+ *  carries no port — match patterns reject ports (MDN) — while the
+ *  CREATED URLs do.  Run on the tab-hosted TST sidebar page
+ *  (browser.tabs works there). */
+const mkHintTabsScript = String.raw`
+	return (async () => {
+		const windowId = arguments[0];
+		const origin = arguments[1];
+		const a = await browser.tabs.create({ windowId, url: origin + "/a.html", active: false, });
+		await browser.tabs.create({ windowId, url: origin + "/b.html", active: false, });
+		await browser.tabs.update(a.id, { active: true, });
+		const settled = [];
+		for (let attempt = 0; attempt < 20; attempt++) {
+			const tabs = await browser.tabs.query({ windowId, url: "http://127.0.0.1/*", });
+			const ready = tabs.length >= 2 && tabs.every(tab => tab.status === "complete");
+			if (ready) { settled.push(...tabs.map(tab => tab.id)); break; }
+			await new Promise(resolve => setTimeout(resolve, 500));
+		}
+		return JSON.stringify({ a: a.id, all: settled, });
+	})();
+`;
+
+/** Make a given tab the window's active tab — the hint mode's anchor
+ *  rule keys on the ACTIVE tab, and a block that just activated a
+ *  special page (about:blank fixture tabs, a shelved member) must hand
+ *  the anchor back to an injectable page before the next entry. */
+const activateTabScript = String.raw`
+	return (async () => {
+		await browser.tabs.update(Number(arguments[0]), { active: true, });
+		return "ok";
+	})();
+`;
+
+/** Dispatches one synthetic keydown on the key catcher (composed, so the
+ *  document-level capture listener in tst-api-frontend.js sees it and
+ *  forwards it to the addon).  Returns whether a catcher was present. */
+const keydownScript = String.raw`
+	const key = arguments[0];
+	const host = document.querySelector("#tabbar-top .extra-items-container");
+	const root = host && host.shadowRoot;
+	const catcher = root && root.querySelector('[part~="shelf-keycatcher"]');
+	if (!catcher) { return "no-catcher"; }
+	window.__dispatchedKeys = window.__dispatchedKeys || [];
+	if (window.__dispatchedKeys.length > 30) { window.__dispatchedKeys = []; }
+	window.__dispatchedKeys.push(key);
+	catcher.dispatchEvent(new KeyboardEvent("keydown", {
+		key, bubbles: true, composed: true, cancelable: true, repeat: false,
+	}));
+	return "sent " + key + " queue:" + JSON.stringify(window.__dispatchedKeys);
+`;
+
+/** Where does a REAL focus event land for the catcher?  Trace listeners
+ *  at document, #tabbar-top, the shadow root and the catcher; then a
+ *  catcher.focus().  The composed/bubble behavior for focus targeting a
+ *  node inside a shadow root decides whether TST's document-level capture
+ *  listener can ever forward extra-contents-focus. */
+const focusProbeScript = String.raw`
+	return (async () => {
+		const host = document.querySelector("#tabbar-top .extra-items-container");
+		const root = host && host.shadowRoot;
+		const catcher = root && root.querySelector('[part~="shelf-keycatcher"]');
+		if (!catcher) { return "no-catcher"; }
+		const trace = [];
+		document.addEventListener("focus", e => trace.push("doc:" + (e.composed ? "c" : "u") + ":" + (e.target.id || e.target.tagName)), true);
+		document.querySelector("#tabbar-top").addEventListener("focus", () => trace.push("tabbar-top"), true);
+		root.addEventListener("focus", () => trace.push("shadow"), true);
+		catcher.addEventListener("focus", () => trace.push("catcher"), true);
+		const result = { tabindexBefore: catcher.getAttribute("tabindex"), trace, };
+		catcher.focus();
+		result.focus1 = root.activeElement === catcher;
+		if (!result.focus1) {
+			catcher.setAttribute("tabindex", "0");
+			catcher.focus();
+			result.focus2 = root.activeElement === catcher;
+			result.tabindexAfter = catcher.getAttribute("tabindex");
+		}
+		await new Promise(r => setTimeout(r, 400));
+		result.focusedAfter = root.activeElement === catcher;
+		return JSON.stringify(result);
+	})();
+`;
+
+/** TST's addon registry, from the tab-hosted sidebar page's own channel:
+ *  kCOMMAND_REQUEST_INITIALIZE answers {addons: {id: full entry}} with
+ *  this addon's registered listeningTypes — the exact set TST's
+ *  hasListenerForMessageType gates event forwarding on. */
+const tstRegistryScript = String.raw`
+	return (async () => {
+		const response = await browser.runtime.sendMessage({ type: "treestyletab:request-initialize", });
+		const self = response && response.addons && response.addons["tst-shelf@example.com"];
+		return JSON.stringify(self ? {
+			listeningTypes: self.listeningTypes,
+			name: self.name,
+			version: self.version,
+		} : null);
+	})();
+`;
+
+/** The sound-block state probe: catches the reply rejection INSIDE the
+ *  page and reports the calling context (href, runtime availability),
+ *  because a rejected ExecuteScript promise surfaces as {value: null}
+ *  (Firefox 158 Marionette), indistinguishable from an empty reply. */
+const soundStateProbeScript = String.raw`
+	return (async () => {
+		try {
+			const response = await browser.runtime.sendMessage("tst-shelf@example.com", { type: "test:state", });
+			return "OK:" + JSON.stringify({
+				keys: Object.keys(response || {}),
+				active: response && response.shelves && response.shelves[arguments[0]]
+					? response.shelves[arguments[0]].active : null,
+				shelves: response && response.shelves ? Object.keys(response.shelves) : null,
+				rendered: response && response.renderedTabs ? Object.keys(response.renderedTabs) : null,
+				hints: response ? response.hints : null,
+				bootlog: response ? response.bootlog : null,
+			});
+		} catch (error) {
+			return "ERR:" + (error && error.message || String(error))
+				+ "|href=" + String(location.href).slice(0, 80)
+				+ "|runtime=" + String(typeof (window.browser && browser.runtime));
+		}
+	})();
+`;
+
+/** A tab's TST tree export (states included), read from the tab-hosted
+ *  sidebar page's external channel — the same call the smoke page makes. */
+const treeStateScript = String.raw`
+	return (async () => {
+		const response = await browser.runtime.sendMessage(
+			"tst-shelf@example.com",
+			{ type: "test:tree-of", tab: arguments[0], }
+		);
+		return JSON.stringify(response && response.tree || null);
+	})();
+`;
+
+/** The hint-mode DOM dump: catcher presence, the code chip on every
+ *  strap icon, the code label in every rendered row's tab-above
+ *  container, and the idle wrapper's presence in the root container. */
+const hintDumpScript = String.raw`
+	const chips = [];
+	for (const strapHost of document.querySelectorAll("#tabbar-top .extra-items-container, tab-item[data-tab-id] .extra-items-container.below")) {
+		const root = strapHost.shadowRoot;
+		if (!root) { continue; }
+		for (const icon of root.querySelectorAll('[part~="shelf-icon"]')) {
+			const chip = icon.querySelector('[part~="shelf-hint"]');
+			chips.push({ id: icon.dataset.tabId, code: chip ? chip.textContent : null });
+		}
+	}
+	const labels = [];
+	for (const row of document.querySelectorAll("tab-item[data-tab-id]")) {
+		// the dummy tab mirrors the LAST rendered tab's id; it is not a
+		// row and its mirrored label belongs to the mirrored icon, not to
+		// any row
+		if (row.id == "dummy-tab" || row.classList.contains("dummy-tab")) { continue; }
+		const host = row.querySelector(".extra-items-container.above");
+		const root = host && host.shadowRoot;
+		const chip = root ? root.querySelector('[part~="shelf-rowhint"]') : null;
+		// the chip's geometry against its row: the 0.5.0 corner placement
+		// (top inline-end — the favicon paints at z-index 200 over the
+		// .above container's 150, so the favicon's corner always loses)
+		let geometry = null;
+		if (chip) {
+			const chipRect = chip.getBoundingClientRect();
+			const rowRect = row.getBoundingClientRect();
+			geometry = {
+				insetEnd: Math.round(rowRect.right - chipRect.right),
+				insetTop: Math.round(chipRect.top - rowRect.top),
+				inside: chipRect.top >= rowRect.top - 2 && chipRect.bottom <= rowRect.bottom + 2,
+			};
+		}
+		labels.push({
+			id: row.dataset.tabId,
+			code: chip ? chip.getAttribute("data-hint") : null,
+			text: chip ? chip.textContent : null,
+			geometry,
+			rid: row.id,
+			rcls: String(row.className).split(" ").filter(Boolean).slice(-3).join(" "),
+			// a stray/invisible element (the hidden members' leftovers, the
+			// dummy tab) must not demand a label: the check keys on rows a
+			// user could look at
+			invisible: row.offsetHeight === 0 || row.classList.contains("hidden"),
+		});
+	}
+	const topHost = document.querySelector("#tabbar-top .extra-items-container");
+	const topRoot = topHost && topHost.shadowRoot;
+	const catcherNode = topRoot && topRoot.querySelector('[part~="shelf-keycatcher"]');
+	const catcherCss = catcherNode ? (() => {
+		const cs = getComputedStyle(catcherNode);
+		return cs.display + "/" + cs.visibility + "/" + cs.opacity;
+	})() : null;
+	const topItem = topRoot && topRoot.querySelector(".extra-item");
+	const hostOf = topHost && topHost.closest("#tabbar-top");
+	const hostCss = hostOf ? getComputedStyle(hostOf).display + "/" + getComputedStyle(hostOf).visibility : null;
+	return JSON.stringify({
+		catcher: !!catcherNode,
+		catcherPart: catcherNode ? catcherNode.getAttribute("part") : null,
+		catcherCss,
+		catcherFocused: !!(topRoot && topRoot.activeElement &&
+			(topRoot.activeElement.getAttribute("part") || "").includes("shelf-keycatcher")),
+		idle: !!(topRoot && topRoot.querySelector(".shelf-strap-idle")),
+		item: !!topItem,
+		itemOwner: topItem ? topItem.dataset.owner : null,
+		itemPart: topItem ? topItem.getAttribute("part") : null,
+		topHostCss: hostCss,
+		catcherFocused: !!(topRoot && topRoot.activeElement &&
+			(topRoot.activeElement.getAttribute("part") || "").includes("shelf-keycatcher")),
+		chips, labels,
+	});
+`;
+
 /** Rows AND browser visibility for a set of tabs.  `hidden` is the other
  *  half of a reveal's claim: a suppressed row goes through
  *  browser.tabs.hide(), so a tab without a row must report `hidden`.
@@ -800,9 +1022,15 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 					for (let attempt = 0; attempt < 10; attempt++) {
 						await new Promise(resolve => setTimeout(resolve, 800));
 						iconAfter = await strapIcon(e.nestedOwner);
-						const state = await call({ type: "test:state", });
+						const stateResp = await marionette.command("WebDriver:ExecuteScript", {
+							script: soundStateProbeScript, args: [windowId,], newSandbox: false,
+						}).catch(e => ({ value: "MARIONETTE-ERR:" + e.message }));
+						console.log(`[drive] sound state probe: ${stateResp && stateResp.value ? String(stateResp.value).slice(0, 600) : JSON.stringify(stateResp)}`);
+						const state = stateResp && stateResp.value && String(stateResp.value).startsWith("OK:")
+							? JSON.parse(String(stateResp.value).slice(3)) : null;
 						if (iconAfter && iconAfter.sound === null) {
-							activeAfter.push(state && state.shelves[windowId].active);
+							console.log(`[drive] sound state keys: ${state ? Object.keys(state).join(",") : "null"} typeof shelves=${state && typeof state.shelves}`);
+							activeAfter.push(state && state.active);
 							break;
 						}
 					}
@@ -1141,6 +1369,522 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 					const siblingBack = !(backState && backState.hidden[e.plain]);
 					check(`ending the reveal restores the suppressed sibling's visibility`, siblingBack);
 				}
+
+				// -- hint mode (tab-hints): the real chain, catcher to
+				// activation.  Entry through the internal hook (the native
+				// command is a trusted event), focus through TST's own
+				// focus-to-extra-contents, keydowns dispatched on the
+				// catcher like a focused user's, every verdict read back
+				// through the state.  Phase 1 already covered the closed-
+				// sidebar no-op.
+				{
+					const call = async message => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfCallScript, args: [message,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+						return response && response.value ? JSON.parse(response.value) : null;
+					};
+					const dumpHints = async () => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: hintDumpScript, args: [], newSandbox: false,
+						}).catch(error => { console.log(`[drive] hint dump failed: ${error.message}`); return null; });
+						return response && response.value ? JSON.parse(response.value) : null;
+					};
+					const readState = async () => (await call({ type: "test:state", })) || null;
+					const sendKeys = async text => {
+						for (const character of String(text)) {
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: keydownScript, args: [character,], newSandbox: false,
+							}).catch(error => console.log(`[drive] keydown failed: ${error.message}`));
+							await new Promise(resolve => setTimeout(resolve, 800));
+						}
+					};
+					// Enter + confirm: the mode confirms on the first catcher
+					// keydown (Firefox does not dispatch focus events for
+					// shadow targets), so a neutral F5 follows the command.
+					const enterConfirmed = async () => {
+						const entered = await call({ type: "test:enter-hints", windowId, });
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: keydownScript, args: ["F5",], newSandbox: false,
+						}).catch(error => console.log(`[drive] confirm key failed: ${error.message}`));
+						let state = null;
+						for (let attempt = 0; attempt < 12; attempt++) {
+							state = await readState();
+							if (state && state.hints && state.hints.confirmed) { break; }
+							await new Promise(resolve => setTimeout(resolve, 700));
+						}
+						return { entered, state, };
+					};
+					const focusProbeResp = await marionette.command("WebDriver:ExecuteScript", {
+						script: focusProbeScript, args: [], newSandbox: false,
+					}).catch(e => ({ value: "ERR:" + e.message }));
+					console.log(`[drive] focus probe: ${focusProbeResp && focusProbeResp.value}`);
+					{
+						// the keydown probe: does TST's forwarder deliver a
+						// synthetic keydown dispatched on the catcher?
+						const keyProbeResp = await marionette.command("WebDriver:ExecuteScript", {
+							script: keydownScript, args: ["z",], newSandbox: false,
+						}).catch(e => ({ value: "ERR:" + e.message }));
+						console.log(`[drive] keydown probe: ${keyProbeResp && keyProbeResp.value}`);
+					}
+					const registryResp = await marionette.command("WebDriver:ExecuteScript", {
+						script: tstRegistryScript, args: [], newSandbox: false,
+					}).catch(e => ({ value: "ERR:" + e.message }));
+					console.log(`[drive] tst registry for tst-shelf: ${registryResp && registryResp.value}`);
+					// real http pages in the fixture window: executeScript
+					// can inject into http (MDN), never into the about:blank
+					// fixture tabs — the pages the real catcher lands in, and
+					// the exclusion's counterweight
+					let hintTabs = null;
+					{
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: mkHintTabsScript, args: [windowId, HINT_ORIGIN,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] hint tabs failed: ${error.message}`); return null; });
+						hintTabs = response && response.value ? JSON.parse(response.value) : null;
+						await new Promise(resolve => setTimeout(resolve, 2500));
+					}
+					// the DEFAULT options round: only the real http pages carry
+					// codes (the fixture's about:blank tabs are excluded), the
+					// active http page hosts the page catcher, and the
+					// configured charset is the Vimium-safe default
+					{
+						const enteredDefault = await call({ type: "test:enter-hints", windowId, });
+						const defaultState = await readState();
+						const codedIds = new Set((defaultState && defaultState.hints && defaultState.hints.codes || [])
+							.map(([id]) => Number(id)));
+						const httpIds = new Set((hintTabs && hintTabs.all || []).map(Number));
+						const onlyHttp = hintTabs && codedIds.size > 0
+							&& [...codedIds].every(id => httpIds.has(id));
+						check("the default options exclude special pages from hint codes (only the http tabs are coded)",
+							!!(enteredDefault && enteredDefault.ok && onlyHttp
+								&& defaultState.hintOptions
+								&& defaultState.hintOptions.charset === "acqsew"
+								&& defaultState.hintOptions.excludeSpecialPages === true),
+							() => `entered=${JSON.stringify(enteredDefault)} coded=${JSON.stringify([...codedIds])} http=${JSON.stringify([...httpIds])} options=${JSON.stringify(defaultState && defaultState.hintOptions)}`);
+						// the page catcher is armed inside the real http page
+						let armedState = null;
+						for (let attempt = 0; attempt < 12; attempt++) {
+							const s = await readState();
+							if (s && (s.bootlog || []).some(line => line.includes(`hints-arm tab ${hintTabs.a}`))) { armedState = s; break; }
+							await new Promise(resolve => setTimeout(resolve, 700));
+						}
+						check("the page catcher is armed inside the real http page", !!armedState,
+							() => "no hints-arm line in the bootlog");
+						// a keydown dispatched INSIDE that page reaches the
+						// mode through the production catcher — the http tabs'
+						// single-letter codes make it an activation
+						const httpCode = (defaultState && defaultState.hints && defaultState.hints.codes || [])
+							.find(([id]) => Number(id) == hintTabs.a);
+						const pageKey = await call({ type: "test:page-key", tabId: hintTabs.a, key: (httpCode || [0, "a"])[1], });
+						let afterPageKey = null;
+						for (let attempt = 0; attempt < 10; attempt++) {
+							afterPageKey = await readState();
+							if (afterPageKey && (!afterPageKey.hints || afterPageKey.hints.confirmed)) { break; }
+							await new Promise(resolve => setTimeout(resolve, 700));
+						}
+						check("a keydown inside the armed page reaches the mode through the real catcher",
+							!!(pageKey && pageKey.ok && afterPageKey && afterPageKey.hints == null),
+							() => `pageKey=${JSON.stringify(pageKey)} code=${JSON.stringify(httpCode)} hints=${JSON.stringify(afterPageKey && afterPageKey.hints)}`);
+					}
+					// the exclusion flip: the full fixture participates from
+					// here on (the chips/labels/narrowing/activation blocks
+					// need the fixture's codes)
+					{
+						await call({ type: "test:set-hint-options", excludeSpecialPages: false, });
+						let flipped = null;
+						for (let attempt = 0; attempt < 10; attempt++) {
+							flipped = await readState();
+							if (flipped && flipped.hintOptions && flipped.hintOptions.excludeSpecialPages === false) { break; }
+							await new Promise(resolve => setTimeout(resolve, 600));
+						}
+						check("the exclusion option flips live (special pages join the code set)",
+							!!(flipped && flipped.hintOptions && flipped.hintOptions.excludeSpecialPages === false),
+							() => `options=${JSON.stringify(flipped && flipped.hintOptions)}`);
+					}
+					const { entered, state: confirmedState, } = await enterConfirmed();
+					console.log("[drive] main entry diagnostics:", JSON.stringify({
+						entered: entered && { ok: entered.ok, reason: entered.reason, codes: (entered.codes || []).slice(0, 12), },
+						renderedOfMode: confirmedState && confirmedState.hints && confirmedState.hints.rendered,
+						hintOptions: confirmedState && confirmedState.hintOptions,
+					}));
+					if (!confirmedState || !confirmedState.hints || !confirmedState.hints.confirmed) {
+						const diagDump = await dumpHints();
+						const diagBoot = await readState();
+						check("hint mode confirms through the catcher's focus (tab-hosted sidebar)", false,
+							() => `entered=${JSON.stringify(entered)} state=${JSON.stringify(confirmedState && confirmedState.hints)} dom=${JSON.stringify(diagDump)} boot=${JSON.stringify(diagBoot && diagBoot.bootlog)} diag=${JSON.stringify(diagBoot && diagBoot.diagLog && diagBoot.diagLog.slice(-30))}`);
+					}
+					else {
+						check("hint mode confirms through the catcher's focus (tab-hosted sidebar)", true);
+						const modeDump = await dumpHints();
+						check("the key catcher exists and is the focused element", !!(modeDump && modeDump.catcher && modeDump.catcherFocused),
+							() => `catcher=${JSON.stringify(modeDump && { catcher: modeDump.catcher, focused: modeDump.catcherFocused })}`);
+						{
+							const state = confirmedState;
+							const codes = new Map(state.hints.codes);
+							const chipsOk = (modeDump.chips || []).every(chip => codes.get(Number(chip.id)) == chip.code);
+							check("every shelf icon carries its own code chip", chipsOk,
+								() => `chips=${JSON.stringify((modeDump.chips || []).slice(0, 8))} codes=${JSON.stringify([...codes.entries()].slice(0, 8))}`);
+							// the paints, against the wanted set: TST never
+							// answers extra-contents writes (each case in
+							// tst-api-frontend.js ends with a bare `return`),
+							// so the renderer's settled-ledger count lags the
+							// DOM arbitrarily; the DOM is the oracle.  Poll to
+							// stability: the confirm-time relabel and the
+							// tabs-rendered relabel both ride later beats.
+							// A SHELVED tab's code labels its ICON, never its
+							// row — a revealed member's row must stay bare.
+							const shelvedIds = new Set((confirmedState.shelved || []).map(Number));
+							let labelDump = modeDump;
+							let labelDiag = null;
+							let badRows = [];
+							for (let attempt = 0; attempt < 10; attempt++) {
+								badRows = (labelDump && labelDump.labels || [])
+									.filter(entry => !entry.invisible && !shelvedIds.has(Number(entry.id)))
+									.map(entry => {
+										const code = codes.get(Number(entry.id)) || "";
+										return (entry.text || "") !== code ? [entry.id, entry.text, code] : null;
+									})
+									.filter(Boolean);
+								if (!badRows.length) { break; }
+								await new Promise(resolve => setTimeout(resolve, 1300));
+								labelDump = await dumpHints();
+								labelDiag = await readState();
+							}
+							check("every rendered row carries its code label (DOM agrees with the wanted codes)", badRows.length === 0,
+								() => `mismatched=${JSON.stringify(badRows.slice(0, 6))} first4=${JSON.stringify((labelDump && labelDump.labels || []).slice(0, 4))} diag=${JSON.stringify(labelDiag && labelDiag.diagLog && labelDiag.diagLog.slice(-10))}`);
+						}
+						// the 0.6.0 coverage contract: codes exist ONLY for
+						// painted surfaces — every coded ROW id must be one
+						// TST rendered (the tabs-rendered ledger); a coded
+						// id the ledger does not know is a code for a tab
+						// the user cannot see (the mistype-into-the-unseen
+						// defect this round removes)
+						{
+							const codesHere = new Map(confirmedState.hints.codes);
+							const shelvedHere = new Set((confirmedState.shelved || []).map(Number));
+							const codedRowIds = [...codesHere.keys()].filter(id => !shelvedHere.has(id));
+							const renderedNow = confirmedState.hints.rendered;
+							// rendered truth from the mode's own query: with
+							// a live viewport the coded rows must be a subset
+							// of it; the null case (no copy answered — the
+							// fold-cut fallback) is unit-tested, not E2E'd
+							const unseen = renderedNow
+								? codedRowIds.filter(id => !renderedNow.includes(id)) : [];
+							check("codes are assigned only to painted surfaces (no code for an unrendered row)",
+								unseen.length === 0,
+								() => `unseen=${JSON.stringify(unseen)} rendered=${JSON.stringify(renderedNow)} codedRows=${JSON.stringify(codedRowIds)}`);
+						}
+						// narrowing: a letter that begins several codes keeps
+						// only those labels — deterministic, because the
+						// visible set outnumbers the alphabet
+						{
+							const stateBefore = await readState();
+							const freshDump = (await dumpHints()) || {};
+							const labelBefore = new Map((freshDump.labels || [])
+								.map(entry => [Number(entry.id), entry.text]));
+							// the most loaded letter: the visible set outnumbers
+							// the alphabet, so some letter begins several codes
+							const counts = {};
+							for (const [, code] of stateBefore.hints.codes) {
+								counts[code[0]] = (counts[code[0]] || 0) + 1;
+							}
+							const [letter, expected] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+							await sendKeys(letter);
+							let narrowed = null;
+							for (let attempt = 0; attempt < 10; attempt++) {
+								const candidate = await dumpHints();
+								const buffered = await readState();
+								if (buffered && buffered.hints && buffered.hints.buffer === letter) { narrowed = candidate; break; }
+								await new Promise(resolve => setTimeout(resolve, 700));
+							}
+							const kept = narrowed
+								? (narrowed.labels || []).filter(entry => entry.text).length : -1;
+							const matchingRow = [...labelBefore.entries()].find(([id]) =>
+								(narrowed && narrowed.labels || []).some(entry => Number(entry.id) === id && entry.text));
+							const afterState = await readState();
+							check(`a typed prefix keeps only the still-matching labels (letter ${letter}: ${expected} codes, ${kept} kept)`,
+								!!narrowed && kept > 0 && kept < labelBefore.size && stateBefore.hints.buffer === "",
+								() => `kept=${kept} labelsBefore=${labelBefore.size} hints=${JSON.stringify(afterState && afterState.hints)} letter=${letter}`);
+							// one concrete label pair: a matching row keeps its
+							// code, a non-matching row's label is gone
+							{
+								const stillKept = (narrowed && narrowed.labels || []).find(entry => entry.text && (narrowed.labels || []).length && entry.text.startsWith(letter));
+								const goneOnes = (narrowed && narrowed.labels || []).filter(entry => !entry.text && labelBefore.get(Number(entry.id))).length;
+								check("the narrowed labels vanish and the matching ones stay",
+									!!stillKept && goneOnes > 0,
+									() => `kept row=${JSON.stringify(stillKept)} vanished=${goneOnes}`);
+							}
+							// the STRAP CHIPS narrow with the rows (the 0.4.0
+							// defect: the icon chips kept every code while the
+							// row labels narrowed, and the two surfaces
+							// disagreed mid-mode — "hints disappear at random")
+							{
+								const paintedChips = (narrowed && narrowed.chips || []).filter(chip => chip.code);
+								const offPrefix = paintedChips.filter(chip => !(chip.code || "").startsWith(letter));
+								check("the icon chips narrow with the typed prefix too",
+									paintedChips.length > 0 && offPrefix.length === 0,
+									() => `chips=${JSON.stringify(paintedChips.slice(0, 8))} letter=${letter} off=${JSON.stringify(offPrefix.slice(0, 4))}`);
+							}
+							// the row chip's corner placement (0.5.0): top
+							// inline-end, inside the row — the favicon's
+							// z-index 200 paints over the .above container's
+							// 150, so the old favicon-corner chip was
+							// invisible ("below favicons")
+							{
+								const withGeometry = (narrowed && narrowed.labels || [])
+									.filter(entry => entry.geometry);
+								const misplaced = withGeometry.filter(entry =>
+									entry.geometry.insetEnd < 0 || entry.geometry.insetEnd > 12
+									|| !entry.geometry.inside);
+								check("row chips sit at the row's inline-end top corner, inside the row",
+									withGeometry.length > 0 && misplaced.length === 0,
+									() => `misplaced=${JSON.stringify(misplaced.slice(0, 5).map(entry => [entry.id, entry.geometry]))}`);
+							}
+							// the uniform-row law holds while labels paint
+							{
+								const geometry = await marionette.command("WebDriver:ExecuteScript", {
+									script: conformanceScript, args: [], newSandbox: false,
+								}).catch(error => { console.log(`[drive] labeled conformance failed: ${error.message}`); return null; });
+								const g = geometry && geometry.value ? JSON.parse(geometry.value) : null;
+								check("the uniform-row conformance gate stays green while labels paint (rows stay at TST's computed positions)",
+									g && g.rows >= 2 && g.drift.length == 0 && g.rowH > 20 && g.anchor <= 1.5,
+									() => JSON.stringify(g));
+							}
+							// Backspace pops the letter: every label is back
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: keydownScript, args: ["Backspace",], newSandbox: false,
+							}).catch(error => console.log(`[drive] backspace failed: ${error.message}`));
+							// poll to stability: TST's virtual scroll legitimately
+							// unrenders/re-renders rows between reads, so the
+							// pre-typing count can differ from the CURRENT
+							// viewport; the exact contract is "every row present
+							// in the dump that carries a code shows its code"
+							let restored = null;
+							const shelvedState2 = await readState();
+							const shelvedSet = new Set((shelvedState2 && shelvedState2.shelved || []).map(Number));
+							for (let attempt = 0; attempt < 12; attempt++) {
+								await new Promise(resolve => setTimeout(resolve, 800));
+								restored = await dumpHints();
+								const stable = await readState();
+								const mismatches = [];
+								for (const entry of (restored && restored.labels) || []) {
+									if (entry.invisible || shelvedSet.has(Number(entry.id))) { continue; }
+									const code = stable && stable.hints
+										? (stable.hints.codes || []).find(([tabId]) => tabId == Number(entry.id))
+										: null;
+									if ((entry.text || "") !== ((code || [])[1] || "")) { mismatches.push(Number(entry.id)); }
+								}
+								if (!mismatches.length) { break; }
+								if (attempt == 11) {
+									restored = restored || { labels: [], };
+									restored.__mismatches = mismatches;
+									break;
+								}
+							}
+							const stateAtRest = await readState();
+							check("Backspace restores every label of the visible set",
+								restored && restored.__mismatches === undefined,
+								() => `mismatch=${JSON.stringify((restored && restored.__mismatches) || []).slice(0, 8)} ledger=${stateAtRest && stateAtRest.rowLedger}`);
+						}
+						// Escape exits and blanks every label
+						{
+							const escapeResp = await marionette.command("WebDriver:ExecuteScript", {
+								script: keydownScript, args: ["Escape",], newSandbox: false,
+							}).catch(error => ({ value: "ERR:" + error.message }));
+							console.log(`[drive] escape dispatched: ${escapeResp && escapeResp.value}`);
+							const escapeArrival = await readState();
+							console.log(`[drive] escape arrival diag: ${JSON.stringify(escapeArrival && escapeArrival.diagLog.slice(-5))} hints=${JSON.stringify(escapeArrival && escapeArrival.hints)} ledger=${escapeArrival && escapeArrival.rowLedger}`);
+							// poll the acknowledge ledger first (the hint state
+							// export dies with the mode): the exit is complete
+							// when no acknowledged label remains anywhere
+							let ledgerState = null;
+							for (let attempt = 0; attempt < 12; attempt++) {
+								await new Promise(resolve => setTimeout(resolve, 700));
+								ledgerState = await readState();
+								if (ledgerState && !ledgerState.hints && ledgerState.rowLedger === 0) { break; }
+							}
+							// then the paints: poll the DOM to stability — the
+							// chip diffs and label clears ride the settled
+							// sends, and TST re-renders can replay caches in
+							// between
+							let afterEscape = null;
+							let escDiag = null;
+							for (let attempt = 0; attempt < 10; attempt++) {
+								afterEscape = await dumpHints();
+								const dirty = (afterEscape && afterEscape.chips || []).some(chip => chip.code)
+									|| (afterEscape && afterEscape.labels || []).some(entry => entry.text);
+								if (!dirty) { break; }
+								await new Promise(resolve => setTimeout(resolve, 1100));
+							}
+							const afterState = await readState();
+							escDiag = afterState;
+							check("Escape exits the mode and leaves no label behind",
+								afterEscape && !(afterEscape.chips || []).some(chip => chip.code)
+									&& !(afterEscape.labels || []).some(entry => entry.text)
+									&& afterState && !afterState.hints && afterState.rowLedger === 0,
+								() => `afterEscape=${JSON.stringify(afterEscape && {
+									chips: (afterEscape.chips || []).filter(chip => chip.code).length,
+									labels: (afterEscape.labels || []).filter(entry => entry.text).length,
+								})} ledger=${afterState && afterState.rowLedger} inFlight=${afterState && afterState.rowInFlight} rowTrace=${JSON.stringify(escDiag && escDiag.rowTrace && escDiag.rowTrace.slice(-40))} keys=${JSON.stringify(escDiag && escDiag.rowKeys)} hintLog=${JSON.stringify(escDiag && escDiag.hintLog && escDiag.hintLog.slice(-14))} diag=${JSON.stringify(escDiag && escDiag.diagLog && escDiag.diagLog.slice(-25))}`);
+						}
+						// typing a ROW tab's full code activates it
+						{
+							await enterConfirmed();
+							let ready = null;
+							for (let attempt = 0; attempt < 12; attempt++) {
+								ready = await readState();
+								if (ready && ready.hints && ready.hints.confirmed) { break; }
+								await new Promise(resolve => setTimeout(resolve, 800));
+							}
+							const codeOf = id => (String(ready.hints.codes).length && (ready.hints.codes || []).find(([tabId]) => tabId == id) || [])[1];
+							// the fixture's D row may sit outside the hint window's
+							// rendered viewport (the 30 blank tabs pushed it up);
+							// any coded NON-shelved row tab proves the same thing
+							const codedPlain = codeOf(e.plain)
+								|| ((ready.hints.codes || []).find(([tabId]) =>
+										!(ready.shelved || []).includes(String(tabId)) && !(ready.shelved || []).includes(tabId)) || [])[1];
+							const plainCode = codedPlain;
+							const plainTab = plainCode
+								&& ((ready.hints.codes || []).find(([, code]) => code === plainCode) || [])[0];
+							check("the row tab's code is assignable (fixture sanity)", !!plainCode, `plain code=${plainCode} tab=${plainTab} codes=${JSON.stringify(ready && ready.hints && ready.hints.codes)}`);
+							await sendKeys(plainCode || "");
+							let activated = null;
+							for (let attempt = 0; attempt < 12; attempt++) {
+								const status = await readState();
+								if (status && status.shelves[windowId].active.includes(plainTab)) { activated = status; break; }
+								await new Promise(resolve => setTimeout(resolve, 800));
+							}
+							check(`typing a row tab's code (${plainCode}) activates that tab`,
+								!!activated, () => `active=${JSON.stringify(activated && activated.shelves[windowId].active)} hints=${JSON.stringify(activated && activated.hints)}`);
+							if (activated) {
+								check("the finished code ends the mode", !activated.hints,
+									() => `hints=${JSON.stringify(activated.hints)}`);
+							}
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: activateScript, args: [e.rootMember,], newSandbox: false,
+							}).catch(error => console.log(`[drive] reset activation failed: ${error.message}`));
+							await new Promise(resolve => setTimeout(resolve, 1500));
+						}
+						// typing a SHELVED member's code runs the icon-click
+						// choreography: selection, fold swap, reveal rules
+						{
+							// the previous block's activation left a special
+							// page (an about:blank fixture tab) active — the
+							// decline rule's exact case again
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: activateTabScript, args: [hintTabs.a,], newSandbox: false,
+							}).catch(error => console.log(`[drive] member anchor failed: ${error.message}`));
+							await new Promise(resolve => setTimeout(resolve, 1200));
+							const { state: shelvedState, } = await enterConfirmed();
+							let ready = shelvedState;
+							const codeOfHere = (state, id) =>
+								(((state && state.hints && state.hints.codes) || []).find(([tabId]) => tabId == id) || [])[1];
+							const shelvedSet = ((ready && ready.shelved) || []).map(Number);
+							const codedMember = ((ready && ready.hints && ready.hints.codes) || []).find(([tabId]) =>
+								codeOfHere(ready, tabId) && (tabId == e.clickFirst || shelvedSet.includes(Number(tabId))));
+							const memberCode = codedMember ? codedMember[1] : null;
+							const memberTab = codedMember ? Number(codedMember[0]) : null;
+							check("the shelved member's code is assignable (fixture sanity)", !!memberCode, `member code=${memberCode} tab=${memberTab} codes=${JSON.stringify(ready && ready.hints && ready.hints.codes)} ledger=${JSON.stringify(ready && ready.renderedTabs)}`);
+							await sendKeys(memberCode || "");
+							let memberState = null;
+							for (let attempt = 0; attempt < 12; attempt++) {
+								memberState = await readState();
+								if (memberState && memberState.shelves[windowId].active.includes(memberTab)) { break; }
+								await new Promise(resolve => setTimeout(resolve, 800));
+							}
+							const liveMember = memberState && memberState.shelves[windowId].active.includes(memberTab);
+							check(`typing a shelved member's code (${memberCode}) activates it through the selection choreography`, !!liveMember,
+								() => `active=${JSON.stringify(memberState && memberState.shelves[windowId].active)} hints=${JSON.stringify(memberState && memberState.hints)}`);
+							// the subtree unfolds with the selection (the fold
+							// swap ran; c1 stays row-less as a nested member,
+							// c2 is a plain child and comes back)
+							const treeResponse = await marionette.command("WebDriver:ExecuteScript", {
+								script: treeStateScript, args: [memberTab,], newSandbox: false,
+							}).catch(() => null);
+							const unfoldedAfter = treeResponse && treeResponse.value ? JSON.parse(treeResponse.value) : null;
+							const rowsAfter = await marionette.command("WebDriver:ExecuteScript", {
+								script: rowPresenceScript, args: [memberTab == e.clickFirst
+									? [e.clickFirst, e.children[1], e.children[0],]
+									: [memberTab,],], newSandbox: false,
+							}).catch(() => null);
+							const rows = rowsAfter && rowsAfter.value ? JSON.parse(rowsAfter.value) : null;
+							if (memberTab == e.clickFirst) {
+								check("the typed member's subtree unfolds like a clicked icon",
+									unfoldedAfter && !(unfoldedAfter.states || []).includes("subtree-collapsed"),
+									() => JSON.stringify(unfoldedAfter));
+								check("the activated member has its row back and its plain child below the shelf",
+									rows && rows[e.clickFirst] && rows[e.children[1]] && !rows[e.children[0]],
+									() => `rows=${JSON.stringify(rows)}`);
+							}
+							else {
+								// the fallback member is often the childless root-shelf
+								// tab: the with-children scenario rides on C above, so
+								// for a childless member assert only what it owes —
+								// its own row is back after the activation's fold swap
+								check("the typed childless member's row is back after the fold swap", !!rows && !!rows[memberTab],
+									() => `rows=${JSON.stringify(rows)} tab=${memberTab} tree=${JSON.stringify(unfoldedAfter)}`);
+							}
+							// restore the resting state for phase 3: C folded, E active
+							await call({ type: "test:collapse", tabId: e.clickFirst, windowId, collapsed: true, });
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: activateScript, args: [e.rootMember,], newSandbox: false,
+							}).catch(error => console.log(`[drive] final reset failed: ${error.message}`));
+							await new Promise(resolve => setTimeout(resolve, 2000));
+							let settled = null;
+							let refolded = null;
+							let refoldedRaw = null;
+							for (let attempt = 0; attempt < 8; attempt++) {
+								await new Promise(resolve => setTimeout(resolve, 900));
+								settled = await readState();
+								const refoldedResponse = await marionette.command("WebDriver:ExecuteScript", {
+									script: treeStateScript, args: [e.clickFirst,], newSandbox: false,
+								}).catch(() => null);
+								refoldedRaw = refoldedResponse && refoldedResponse.value;
+								refolded = refoldedRaw ? JSON.parse(refoldedRaw) : null;
+								if (settled && settled.hints == null && refolded && (refolded.states || []).includes("subtree-collapsed")) { break; }
+							}
+							check("after the hint block the shelf state is restored for phase 3",
+								settled && settled.hints == null && refolded && (refolded.states || []).includes("subtree-collapsed"),
+								() => `hints=${JSON.stringify(settled && settled.hints)} states=${JSON.stringify(refolded && refolded.states)}`);
+						}
+						// the CONFIGURED charset: codes built from its letters
+						// alone (the options field, live through onChanged)
+						{
+							// the previous block activated a SHELVED member —
+							// a special page (about:blank) and the mode's
+							// decline rule's exact case: hand the anchor back
+							// to an injectable page before entering again
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: activateTabScript, args: [hintTabs.a,], newSandbox: false,
+							}).catch(error => console.log(`[drive] anchor activation failed: ${error.message}`));
+							await new Promise(resolve => setTimeout(resolve, 1200));
+							await call({ type: "test:set-hint-options", charset: "ac", });
+							let applied = null;
+							for (let attempt = 0; attempt < 10; attempt++) {
+								applied = await readState();
+								if (applied && applied.hintOptions && applied.hintOptions.charset === "ac") { break; }
+								await new Promise(resolve => setTimeout(resolve, 600));
+							}
+							const { state: charsetState, } = await enterConfirmed();
+							const charsetCodes = (charsetState && charsetState.hints && charsetState.hints.codes) || [];
+							const offCharset = charsetCodes.filter(([, code]) => ![...code].every(ch => "ac".includes(ch)));
+							check("a configured charset (ac) builds every code from its own letters",
+								charsetCodes.length > 5 && offCharset.length === 0
+									&& !!(applied && applied.hintOptions && applied.hintOptions.charset === "ac"),
+								() => `applied=${JSON.stringify(applied && applied.hintOptions)} codes=${JSON.stringify(charsetCodes.slice(0, 6))} off=${JSON.stringify(offCharset.slice(0, 4))}`);
+							await call({ type: "test:exit-hints", reason: "charset-done", });
+							// restore the defaults: phase 3 enters with the
+							// production options in force
+							await call({ type: "test:set-hint-options", charset: "", excludeSpecialPages: true, });
+							for (let attempt = 0; attempt < 10; attempt++) {
+								const restored = await readState();
+								if (restored && restored.hintOptions && restored.hintOptions.charset === "acqsew"
+									&& restored.hintOptions.excludeSpecialPages === true) { break; }
+								await new Promise(resolve => setTimeout(resolve, 600));
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -1152,6 +1896,18 @@ async function main () {
 	fs.rmSync(CONSOLE_LOG.replace(/\.log$/, ".lock"), { force: true, });
 	fs.rmSync(SETUP_REPORT, { force: true, });
 	fs.rmSync(FINAL_REPORT, { force: true, });
+
+	// the hint-fixture http pages: up before the browser (the smoke page
+	// navigates to one in phase 1), down with the process
+	const hintServer = http.createServer((req, res) => {
+		res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", });
+		res.end(`<!doctype html><meta charset="utf-8"><title>hint ${req.url}</title><p>hint target ${req.url}</p>`);
+	});
+	await new Promise((resolve, reject) => {
+		hintServer.once("error", reject);
+		hintServer.listen(HINT_PORT, "127.0.0.1", resolve);
+	});
+	console.log(`[drive] hint pages at ${HINT_ORIGIN}`);
 
 	const args = HEADED
 		? ["-no-remote", "-marionette", "-remote-allow-system-access", "-profile", SCRATCH,]
@@ -1196,6 +1952,14 @@ async function main () {
 			for (const entry of expect.results || []) {
 				check(entry.name, entry.ok, entry.detail, "setup");
 			}
+			// commands registration on a TEMPORARY (about:debugging-style)
+			// install: the smoke page's own browser.commands.getAll() is
+			// the readout (0.3.2's background-side boot assert is retired
+			// — the user's finding was key shadowing, not registration).
+			const cmd = (expect.commands || []).find(entry => entry.name === "tst-shelf:hints");
+			check("hints command registered at boot (temporary install)",
+				!!cmd && !!cmd.shortcut,
+				() => `commands: ${JSON.stringify(expect.commands)}`);
 		}
 
 		// -- phase 2: sidebar DOM assertions + synthetic clicks ------------
@@ -1221,10 +1985,18 @@ async function main () {
 			check("reinstalled smoke page reports again (persistence path)", false, "no report after the reinstall");
 		} else {
 			printReport(FINAL_REPORT, "phase 3 (reinstall)");
+			// same assertion after the in-session reinstall: an upgrade
+			// cycle must land the NEW manifest's commands, read from the
+			// reinstalled smoke page's own commands.getAll().
+			const cmd = (phase3Report.commands || []).find(entry => entry.name === "tst-shelf:hints");
+			check("hints command registered after reinstall (upgrade proxy)",
+				!!cmd && !!cmd.shortcut,
+				() => `commands: ${JSON.stringify(phase3Report.commands)}`);
 		}
 
 		marionette.destroy();
 	} finally {
+		hintServer.close();
 		if (firefox.exitCode === null) { firefox.kill("SIGTERM"); }
 		await new Promise(resolve => setTimeout(resolve, 800));
 		if (firefox.exitCode === null) { firefox.kill("SIGKILL"); }

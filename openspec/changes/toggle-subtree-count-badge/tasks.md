@@ -26,4 +26,4 @@
 
 - [x] 4.1 README: the option; the `storage` permission rationale widens to diagnostics and options
 - [x] 4.2 `openspec/project.md`: the permission-surface line for `storage`
-- [ ] 4.3 version bump in `src/manifest.json` and `package.json` together (release checklist)
+- [x] 4.3 version bump in `src/manifest.json` and `package.json` together (release checklist)

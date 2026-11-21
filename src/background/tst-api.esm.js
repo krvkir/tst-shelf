@@ -77,7 +77,14 @@ export default function tstAPI({ getManifest, methods = [ ], events = { __proto_
 		},
 	]));
 
-	async function onMessageExternal(message, sender) {
+	// Not `async`: Firefox resolves the caller with the FIRST fulfilled
+	// listener reply, and an async function always fulfills on its own
+	// microtask — even `return undefined` from it CLOSES the message
+	// channel.  Unregistered types below must decline synchronously so
+	// other listeners of this extension can still answer (the E2E drives
+	// its `test:*` API through this very channel, from the tab-hosted
+	// TST sidebar, which is another extension to Firefox).
+	function onMessageExternal(message, sender) {
 		if (sender.id !== TST_ID) { return false; }
 
 		// Deviation 3: TST 4.0+ coalesces registered bulk notification types
@@ -86,12 +93,22 @@ export default function tstAPI({ getManifest, methods = [ ], events = { __proto_
 		// try-scroll-..., extra-contents-*) are ever bulk, so fan the batch
 		// out and answer "handled" at the end.
 		if (Array.isArray(message.messages)) {
-			try {
-				for (const one of message.messages) {
-					await handleTstMessage(one, sender);
-				}
-			} catch (error) { onError(error); }
-			return true;
+			return (async () => {
+				try {
+					for (const one of message.messages) {
+						await handleTstMessage(one, sender);
+					}
+				} catch (error) { onError(error); }
+				return true;
+			})();
+		}
+
+		// Deviation 4: a type this client did not register is NOT ours.
+		// (An earlier version answered `true` to everything it did not
+		// know — that reply raced and beat the test API's own replies.)
+		const type = message.type;
+		if (!events[type] && type !== 'ready' && type !== 'wait-for-shutdown') {
+			return undefined;
 		}
 
 		return handleTstMessage(message, sender);
@@ -107,6 +124,8 @@ export default function tstAPI({ getManifest, methods = [ ], events = { __proto_
 			}); break;
 			default: {
 				const handler = events[message.type];
+					// an unknown BULK member type: the frame reply is already
+				// committed, so a plain decline keeps the fan-out honest
 				if (!handler) { break; }
 				const response = await handler(message);
 				// Deviation 2: a boolean verdict goes back to TST verbatim;

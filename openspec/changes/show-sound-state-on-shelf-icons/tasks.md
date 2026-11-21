@@ -22,4 +22,4 @@
 ## 4. Documentation
 
 - [x] 4.1 README: the indicator, the headless-audio measurement, the click-to-mute behavior
-- [ ] 4.2 version bump in `src/manifest.json` and `package.json` together (release checklist)
+- [x] 4.2 version bump in `src/manifest.json` and `package.json` together (release checklist)

@@ -19,7 +19,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.dirname(HERE);
 const DIR = path.resolve(REPO, process.argv[2] || "dist");
 
-const REQUIRED = ["manifest.json", "background.js", "icons/48.png", "icons/96.png", "options.html", "options.js"];
+const REQUIRED = ["manifest.json", "background.js", "icons/48.png", "icons/96.png", "options.html", "options.js", "hint-catcher.js"];
 const FORBIDDEN = ["tests.html", "tests-smoke.js", "tree-tab.html", "tree-tab.js", "favicon.svg"];
 
 const problems = [];
@@ -63,6 +63,15 @@ if (manifest) {
 	}
 	if ((manifest.permissions || []).includes("downloads")) {
 		say("manifest declares the downloads permission (E2E only)");
+	}
+	// Production is host-permission-free by design (README permissions
+	// rationale): a match pattern in permissions is the E2E flavor's
+	// localhost hint server leaking into the releasable tree.
+	const API_PERMISSIONS = new Set(["tabs", "tabHide", "storage", "sessions", "menus", "activeTab"]);
+	for (const permission of manifest.permissions || []) {
+		if (!API_PERMISSIONS.has(permission)) {
+			say(`manifest declares a non-API permission (host permission?): ${permission}`);
+		}
 	}
 	const expected = new Set(REQUIRED);
 	for (const rel of files) {

@@ -187,4 +187,111 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
 ::part(%EXTRA_CONTENTS_PART% shelf-sound tst-shelf-sound-muted) {
   mask: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3Cpath%20d%3D%22M1%206h3l4-3.5v11L4%2010H1z%22%20fill%3D%22black%22%2F%3E%3Cpath%20d%3D%22M3%202l11%2012M14%202L3%2014%22%20fill%3D%22none%22%20stroke%3D%22black%22%20stroke-width%3D%222%22%2F%3E%3C%2Fsvg%3E") no-repeat center / contain;
 }
+
+/* 8. The hint mode (tab-hints).  The code chips paint OUT OF FLOW —
+     the per-row tab-above extra-contents container is a column flex
+     in .ui's flow (base.css), so an in-flow label would add exactly the
+     height the uniform-row law forbids; an absolutely positioned chip
+     contributes zero height and the container stays empty.
+
+     TWO chips, two rules: "shelf-hint" is the ICON chip (inside our own
+     .shelf-icon), "shelf-rowhint" the ROW chip (inside TST's .above
+     container).  The row chip sits at the row's TOP INLINE-END corner:
+     TST's z-order table (base.css) gives .above the
+     --tab-extra-contents-beside-z-index (150) — ABOVE the caption's
+     --tab-base-z-index (100), BELOW the favicon's
+     --tab-favicon-z-index (200) — so wherever the chip overlaps the
+     favicon it loses (the 0.4.0 rule anchored it at the favicon's
+     corner: "below favicons, not always visible").  At the inline-end
+     corner nothing above 150 ever paints, and the chip wins over
+     label, counter and close box. */
+::part(%EXTRA_CONTENTS_PART% shelf-hint) {
+  position: absolute;
+  inset-inline-start: 8px;
+  inset-block-start: 0;
+  z-index: var(--tab-extra-contents-beside-z-index, 1);
+  font: message-box;
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 600;
+  padding: 0 3px;
+  color: #0b2a30;
+  background-color: #00c8d9;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(2, 42, 48, 0.55);
+  pointer-events: none;
+}
+::part(%EXTRA_CONTENTS_PART% shelf-rowhint) {
+  position: absolute;
+  inset-inline-end: 2px;
+  inset-block-start: 0;
+  font: message-box;
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 600;
+  padding: 0 3px;
+  color: #0b2a30;
+  background-color: #00c8d9;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(2, 42, 48, 0.55);
+  pointer-events: none;
+}
+@media (prefers-color-scheme: dark) {
+  ::part(%EXTRA_CONTENTS_PART% shelf-hint),
+  ::part(%EXTRA_CONTENTS_PART% shelf-rowhint) {
+    color: #ffffff;
+    background-color: #005f6e;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
+  }
+}
+
+/* 8b. The twin of the load-bearing rule 1: the dummy tab mirrors the
+     latest tab-above extra contents, and its (hidden, but
+     layout-visible) mirror must not inflate every row either. */
+#dummy-tab .extra-items-container.above {
+  display: none !important;
+}
+
+/* 8a. The row chip's ANCHOR: TST's .above container sits in .ui's
+     column flow, and its box varies by row kind — on the OWNER row
+     (whose .below carries the strap) the measured container lands
+     ~20px below the row's top and falls short of the row's inline-end
+     edge (the E2E caught the owner's chip misplaced by 156px).  The
+     container is therefore overlaid on the whole row: the chip's
+     corner coordinates become the ROW's, for every row kind alike.
+     The overlay keeps TST's own z-index (150, below the favicon's
+     200 — nothing above 150 paints at the inline-end corner) and
+     TST's pointer-events: none, and leaves the flow untouched (it was
+     zero-height): the uniform-row law holds.  No other addon in this
+     setup writes tab-above contents (checked: tst-workspace has
+     none). */
+tab-item .extra-items-container.above {
+  position: absolute;
+  inset: 0;
+}
+
+/* 8c. The key catcher: zero-size, invisible, still focusable —
+     display: none would make node.focus() a no-op, which is why
+     visibility is hidden instead of the node being removed.  #tabbar-top
+     itself is an absolute, height-0 overlay (base.css), so the catcher
+     reserves no space anywhere while the mode is off. */
+::part(%EXTRA_CONTENTS_PART% shelf-keycatcher) {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  padding: 0;
+  border: none;
+  pointer-events: none;
+}
+
+/* 8d. A member-less root strap is the part-less idle wrapper: give it
+     no size, so an empty root shelf still reserves no space while the
+     catcher waits inside it. */
+#tabbar-top .extra-items-container .shelf-strap-idle {
+  display: block;
+  width: 0;
+  height: 0;
+  overflow: visible;
+}
 `;

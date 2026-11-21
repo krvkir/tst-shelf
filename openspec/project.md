@@ -61,6 +61,9 @@ Capabilities:
   subtree, and recursive nested shelves.
 - `shelf-interaction` — selecting a shelved tab by clicking its icon
   and the shelf icon's context menu.
+- `tab-hints` — the keyboard command that labels every visible tab of
+  the focused window with a short code (a member's code on its icon, a
+  row's code on the row), prefix narrowing, and code activation.
 
 Constraints:
 
@@ -87,8 +90,9 @@ Constraints:
   option, `badgeMode`), `sessions` (the sticky per-tab flag), `menus`
   (the tab-context-menu items — Put on shelf, Take off the shelf, and
   the "Shelf" submenu with the two place commands — which TST's own
-  item API cannot make visible for plain tab rows), no host
-  permissions, no content scripts.
+  item API cannot make visible for plain tab rows), `commands` (the
+  user-rebindable hint-mode hotkey), no host permissions, no content
+  scripts.
 - Interop with tst-workspace goes through the native hidden state of
   tabs only; the two extensions do not message each other.
 

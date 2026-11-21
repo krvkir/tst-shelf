@@ -24,4 +24,4 @@
 ## 4. Documentation
 
 - [x] 4.1 README: the submenu, the two commands, and the deferred drag-reorder note with the measured TST surface facts
-- [ ] 4.2 version bump in `src/manifest.json` and `package.json` together (release checklist)
+- [x] 4.2 version bump in `src/manifest.json` and `package.json` together (release checklist)

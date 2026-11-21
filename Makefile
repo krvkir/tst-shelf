@@ -82,4 +82,8 @@ release: test perf e2e
 	@ls -l web-ext-artifacts/
 
 clean:
-	rm -rf $(DIST) $(E2E_DIST) web-ext-artifacts tests/e2e-downloads
+	rm -rf $(DIST) $(E2E_DIST) tests/e2e-downloads
+	# NEVER delete web-ext-artifacts/: every built version stays there as
+	# a fall-back tool when a newer version glitches (AGENTS.org,
+	# Release Checklist).  web-ext --overwrite-dest replaces only the
+	# same-version zip; older zips survive every release.

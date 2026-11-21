@@ -8,7 +8,20 @@
 	<meta charset="utf-8">
 	<title>TST Shelf options</title>
 	<style>
-		body { color-scheme: light dark; font: message-box; padding: 1em 1.5em; }
+		/* Explicit scheme-paired colors: the options page renders inside
+		   about:addons (and as its own tab), where the UA's default
+		   background/text selection is NOT guaranteed to pair (a dark
+		   browser theme left this page white-on-white).  "Canvas" and
+		   "CanvasText" are the browser's own scheme-matched surface and
+		   text colors — they flip together, so contrast is guaranteed in
+		   both schemes; declaring color-scheme on :root (NOT on body) is
+		   what makes the canvas, form controls and scrollbars follow. */
+		:root {
+			color-scheme: light dark;
+			background: Canvas;
+			color: CanvasText;
+		}
+		body { font: message-box; padding: 1em 1.5em; }
 		h1 { font-size: 1.1em; }
 		fieldset { border: 1px solid currentcolor; border-radius: 4px; }
 		label { display: block; padding: 2px 0; }
@@ -26,6 +39,23 @@
 			<input type="radio" name="badgeMode" value="count">
 			count — the fold badge shows the number of the tab's descendants,
 			the same number Tree Style Tab writes in parentheses on its rows
+		</label>
+	</fieldset>
+	<fieldset>
+		<legend>Keyboard hints</legend>
+		<label>
+			<input type="checkbox" name="hintExcludeSpecialPages" checked>
+			exclude special pages — pages a hint catcher can never run on
+			(about:…, extension pages — the TST group tabs among them) get no
+			hint code, and entering hint mode from one does nothing, so the
+			keyboard can never get stranded there
+		</label>
+		<label>
+			letters for hint codes
+			<input type="text" name="hintCharset" size="12" maxlength="36"
+				placeholder="acqsew" pattern="[a-zA-Z0-9 ]*" spellcheck="false">
+			<span class="hint-note">two or more distinct letters/digits; the
+			default (acqsew) avoids every key Vimium maps by default</span>
 		</label>
 	</fieldset>
 	<script src="options.js"></script>

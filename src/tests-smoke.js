@@ -19,6 +19,12 @@
 "use strict";
 
 const TST_ID = "treestyletab@piro.sakura.ne.jp";
+/** The driver's hint-fixture server (tests/e2e-drive.mjs HINT_ORIGIN):
+ *  a REAL http page — the only kind executeScript can inject the page
+ *  catcher into (MDN), needed in phase 1 before any driver script
+ *  exists. */
+const HINT_PAGE = "http://127.0.0.1:47631/a.html";
+const HINT_ORIGIN = "http://127.0.0.1:47631";
 
 const outEl = document.getElementById("out");
 /** @type {{name: string, ok: boolean, detail: string}[]} */
@@ -70,7 +76,12 @@ async function report (isTimeout) {
 	let bootlog = [];
 	try { const stored = await browser.storage.local.get({ bootlog: [], }); bootlog = stored.bootlog || []; }
 	catch (_error) { }
-	await download({ userAgent: navigator.userAgent, isTimeout: !!isTimeout, bootlog, results, }, "tst-shelf-e2e.json");
+	await download({
+		userAgent: navigator.userAgent, isTimeout: !!isTimeout, bootlog, results,
+		commands: await browser.commands.getAll()
+			.then(list => list.map(c => ({ name: c.name, shortcut: c.shortcut || null, })))
+			.catch(() => null),
+	}, "tst-shelf-e2e.json");
 	render();
 }
 
@@ -88,7 +99,16 @@ async function main () {
 		const state = await eventually("registration lands with TST >= 4",
 			async () => {
 				const s = await send({ type: "test:state" });
-				return s && s.registered && s.usable ? s : null;
+				if (!(s && s.registered && s.usable)) { return null; }
+				// the commands registration read from OUR OWN page: the
+				// commands API answers any extension page, and the smoke
+				// page IS one.  (0.3.2's background-side boot assert was
+				// retired: the user's finding was key shadowing, not
+				// registration.)
+				const hasCmd = await browser.commands.getAll()
+					.then(list => list.some(c => c.name === "tst-shelf:hints" && !!c.shortcut))
+					.catch(() => false);
+				return hasCmd ? s : null;
 			}, 30000);
 		if (!state) { return report(isTimeout); }
 
@@ -285,9 +305,70 @@ async function phaseOneAndTwo () {
 			JSON.stringify(probe));
 	}
 
+	// -- hint mode: the decline rule, then the closed-sidebar no-op -----
+	{
+		// the fixture window's ACTIVE tab is an about:blank fixture tab —
+		// a page the catcher can never be injected into (MDN: executeScript
+		// rejects top-level about: frames), so the hotkey is a deliberate
+		// no-op there: entering declines with the injectability reason,
+		// never a mode that traps the keyboard.  (An extension page as
+		// the active tab declines identically — same scheme set.)
+		const declined = await send({ type: "test:enter-hints", windowId: ids.windowId, });
+		record("entering hint mode from an extension page declines (the active tab cannot host the catcher)",
+			declined && declined.ok === false && declined.reason === "active-tab-not-injectable",
+			JSON.stringify(declined));
+		// a REAL http page: injectable — the mode enters, the catcher is
+		// armed there for real, and with no sidebar page yet (phase 2
+		// opens one) no key source ever confirms the mode: the timeout
+		// tears it down with nothing painted.  With the default options
+		// only the http page itself carries a code (the fixture's
+		// about:blank tabs are special pages).
+		const hintTab = await browser.tabs.create({ windowId: ids.windowId, url: HINT_PAGE, active: true, });
+		await eventually("the real http page settles", async () => {
+			const live = await browser.tabs.get(hintTab.id);
+			// the tab BRIEFLY sits at about:blank with status "complete"
+			// before the navigation commits — the URL is the real signal
+			return live.url === HINT_PAGE && live.status === "complete" ? live : null;
+		}, 10000);
+		const entered = await send({ type: "test:enter-hints", windowId: ids.windowId, });
+		record("entering hint mode from a real http page reports itself (no sidebar yet)",
+			entered && entered.ok === true, JSON.stringify(entered));
+		await eventually("the page catcher is armed inside the real http page", async () => {
+			const s = await send({ type: "test:state" });
+			return (s.bootlog || []).some(line => line.includes(`hints-arm tab ${hintTab.id}`)) ? s : null;
+		}, 10000);
+		const immediateState = await send({ type: "test:state" });
+		record("the mode without a sidebar stays unconfirmed (no key source)",
+			immediateState && immediateState.hints && immediateState.hints.confirmed === false
+				&& (immediateState.hints.codes || []).length > 0,
+			JSON.stringify(immediateState && immediateState.hints));
+		const refused = await send({ type: "test:hint-key", key: "a", });
+		record("a keydown with no confirmed mode is refused", refused && refused.verdict === "false",
+			JSON.stringify(refused));
+		await eventually("the unconfirmed mode times out and exits", async () => {
+			const s = await send({ type: "test:state" });
+			return s && s.hints == null ? s : null;
+		}, 15000);
+		// the fixture must return to its exact shape: the driver's tree
+		// geometry checks (the pure-swap sampler) measure row positions,
+		// and one extra bottom row lets TST's virtual scroll transiently
+		// render the tree WITHOUT the just-activated member's row (the
+		// render range is only ~4 rows in the tab-hosted sidebar) — the
+		// check's premise is a tree that fits the range entirely
+		await browser.tabs.remove(hintTab.id).catch(() => {});
+	}
+
 	// -- setup report for the driver (window id + expectations) --------
+	// the readout the driver needs, plus the background's bootlog: the
+	// commands-registration line rides it (the readiness gate above
+	// waited for it, so it is on disk by now)
+	const bootlog = (await browser.storage.local.get({ bootlog: [], }).catch(() => ({}))).bootlog || [];
 	await download({
 		windowId: ids.windowId,
+		bootlog,
+		commands: await browser.commands.getAll()
+			.then(list => list.map(c => ({ name: c.name, shortcut: c.shortcut || null, })))
+			.catch(() => null),
 		expect: {
 			owner: ids.A, members: [ids.B, ids.C], rootMember: ids.E,
 			children: [ids.c1, ids.c2],
@@ -501,6 +582,46 @@ async function phaseThree (ids) {
 	record("TST's native fold state persisted through the reinstall",
 		(refoldedC.states || []).includes("subtree-collapsed"),
 		JSON.stringify(refoldedC.states));
+	record("hint mode stays down after the restart (runtime-only state)",
+		state.hints == null, JSON.stringify(state.hints));
+
+	// -- the page catcher's channel, for real, after the reinstall -----
+	// The 0.4.4 path: the catcher is armed in a REAL http page (the
+	// driver's hint server) — this extension page cannot host it (MDN),
+	// and the smoke page's old runtime-message relay is now an ORPHAN
+	// by design (the armed catcher lives in the http tab, so the
+	// alive-ack must reject any other sender).  The production path
+	// runs instead: executeScript injects hint-catcher.js there, and a
+	// keydown inside the page rides the injected listener.
+	{
+		const hintTabs = await browser.tabs.query({ windowId: ids.windowId, url: "http://127.0.0.1/*", });
+		const hintTab = hintTabs[0] || null;
+		record("the hint fixture page survived the reinstall", !!hintTab,
+			`count=${hintTabs.length}`);
+		if (hintTab) {
+			await browser.tabs.update(hintTab.id, { active: true, });
+			const entered = await send({ type: "test:enter-hints", windowId: ids.windowId, });
+			record("hint mode enters after the reinstall (a real page is the anchor)",
+				entered && !!entered.ok, JSON.stringify(entered));
+			const code = entered && entered.ok && (entered.codes || [])[0];
+			if (entered && entered.ok && code) {
+				await eventually("the catcher is armed in the real page again", async () => {
+					const s = await send({ type: "test:state" });
+					return (s.bootlog || []).some(line => line.includes(`hints-arm tab ${hintTab.id}`)) ? s : null;
+				}, 10000);
+				// the production path: a keydown dispatched inside the armed
+				// page.  The default options code only the http tabs
+				// (single letters), so the key ACTIVATES and ends the mode.
+				const ack = await send({ type: "test:page-key", tabId: hintTab.id, key: String(code[1]).charAt(0), });
+				record("a keydown inside the armed page is dispatched", ack && ack.ok === true,
+					JSON.stringify(ack));
+				const after = await send({ type: "test:state" });
+				record("the key reached the mode through the real catcher (activation ended it)",
+					after && after.hints == null,
+					JSON.stringify(after && after.hints));
+			}
+		}
+	}
 }
 
 main().catch(error => { record("smoke crashed", false, String(error && error.stack || error)); report(false); });

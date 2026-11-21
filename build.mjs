@@ -38,6 +38,7 @@ const STATIC_FILES = [
 	"manifest.json",
 	"icons/48.png", "icons/96.png",
 	"options.html", "options.js",
+	"hint-catcher.js",
 ];
 /** Files that only the E2E flavor carries (copied by applyE2EPatch). */
 const E2E_FILES = ["tests.html", "tests-smoke.js", "tree-tab.html", "tree-tab.js", "favicon.svg"];
@@ -64,6 +65,14 @@ function applyE2EPatch () {
 	const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 	manifest.version += "-e2e";
 	manifest.permissions.push("downloads");
+	// the hint-fixture pages (tests/e2e-drive.mjs): the E2E enters hint
+	// mode through the test hook, so no commands-API activeTab grant
+	// exists, and arming the page catcher in a real http page REQUIRES
+	// a host permission for it.  Match patterns carry NO port (MDN:
+	// a pattern with a port is invalid) — http://127.0.0.1/* matches
+	// any port, 47631 included.  Production never carries this —
+	// verify-dist rejects any match-pattern permission outright.
+	manifest.permissions.push("http://127.0.0.1/*");
 	fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, "\t"));
 }
 

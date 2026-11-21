@@ -1,7 +1,7 @@
 {
 	"manifest_version": 2,
 	"name": "TST Shelf",
-	"version": "0.2.3",
+	"version": "0.6.0",
 	"description": "Shelves for Tree Style Tab: put constant tabs of a project on a favicon strap inside their parent's row, fold their subtrees until selected.",
 	"browser_specific_settings": {
 		"gecko": {
@@ -15,11 +15,18 @@
 		"tabHide",
 		"storage",
 		"sessions",
-		"menus"
+		"menus",
+		"activeTab"
 	],
 	"background": {
 		"persistent": true,
 		"scripts": ["background.js"]
+	},
+	"commands": {
+		"tst-shelf:hints": {
+			"suggested_key": { "default": "Alt+U" },
+			"description": "Show hint codes for every visible tab of the focused window and switch to the typed code's tab"
+		}
 	},
 	"options_ui": { "page": "options.html", "open_in_tab": false },
 	"icons": { "48": "icons/48.png", "96": "icons/96.png" }

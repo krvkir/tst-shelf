@@ -121,6 +121,46 @@ What that leaves:
   pinned tabs): Firefox pinning and shelving are mutually exclusive
   states — a pinned tab lives in the global pinned box, outside the
   tree, and a shelved flag would hide it from both places.
+- **Hint mode (tab-hints)**: a keyboard command — default `Alt+U` (the
+  earlier `Alt+Shift+H` default collided with the Help menu accelerator
+  on Linux; rebind freely in about:addons' extension-shortcuts page) —
+  labels the tabs that are actually on screen with a short code
+  (`aa`, `ab`, …): shelf members' codes sit on their icons, rendered
+  rows' codes on the row above its caption. Type the code to activate
+  the tab; unique prefixes narrow the labels — rows and icon chips
+  together — Backspace un-types, Escape exits, and a few seconds of
+  not typing ends the mode. Codes cover exactly the painted surfaces
+  at entry — rendered rows and visible shelf icons; hidden tabs, tabs
+  inside folded subtrees and rows outside the sidebar's viewport carry
+  no code, so a mistyped code can never activate a tab you cannot
+  see, and the codes stay 1-2 letters even in a 350-tab window of
+  folded trees. A row scrolled out and back keeps its code; a row
+  that first appears after entry shows none until you re-enter after
+  scrolling. A closed sidebar makes the command a no-op, and so does
+  a special active page: on `about:…`, extension pages (TST's group
+  tabs among them) and every other page a key catcher can never be
+  injected into (MDN), the command does nothing — such a mode could
+  not receive keys from anywhere the user's focus already is, and
+  while the exclusion option is on (the default, options page) those
+  tabs carry no code either, so the keyboard can never navigate onto
+  a page it would be stranded on. The code alphabet is configurable
+  (options page); the default (`acqsew`) uses exactly the letters no
+  default Vimium mapping starts with.
+- **The hint command comes from the manifest's `commands` block.**
+  Firefox registers it when the extension starts (XUL `key` elements in
+  a per-window keyset; Firefox's ExtensionShortcuts.sys.mjs) and lists
+  it on the "Manage Extension Shortcuts" page. If that page shows
+  nothing for TST Shelf, the running session is not on a build with
+  the `commands` block — reload the add-on or restart Firefox. User
+  rebindings stored by Firefox survive updates and win over the
+  manifest default, and a remap takes effect immediately (Firefox
+  re-registers the keyset before emitting the change). A binding that
+  another command or the desktop environment owns simply never fires;
+  Firefox does not warn about collisions with its own menus.
+- **Private windows do not receive the hint command.** Firefox skips
+  key registration for a private window when the extension lacks
+  `privateBrowsingAllowed` (ours does — it reads no private data);
+  entering hint mode there is not offered.
 
 ## Permissions, honestly
 
@@ -141,10 +181,78 @@ What that leaves:
 - `storage` — a rolling diagnostics log (the last 80 boot events) and
   the one user option (`badgeMode`, the fold badge mode), nothing
   else.
-- No host permissions, no content scripts, no network code: the
-  extension has no way to send data anywhere.
+- `commands` — the hint-mode hotkey. A single user-triggerable
+  shortcut; it starts the label overlay for the focused window and is
+  rebindable in about:addons.
+- `activeTab` — granted by the hint command's own invocation (MDN: a
+  commands-API shortcut grants activeTab, Firefox 63+). It is what lets
+  the mode inject its key catcher into the active page — once per mode
+  entry, into that one tab only, never at any other time. No install
+  warning is shown for it, and it grants nothing else.
+- No host permissions, no manifest content scripts, no network code:
+  the extension has no way to send data anywhere. The one injected file
+  (`hint-catcher.js`) runs only in the active tab, only while hint
+  mode is up, only after the user invoked the command, and only
+  forwards letters to the background.
 
 ## Caveats, measured in E2E
+- **The hint command's keydown is delivered where Firefox delivers it.**
+  A registered command is a XUL `key` in the browser window's keyset;
+  Firefox fires it for keys pressed while a normal web page or the
+  browser chrome (address bar, menus) has focus. If the key seems dead,
+  first click a web page tab and press the key there — with all of the
+  focus options exhausted, read the bootlog:
+  `about:debugging#/runtime/this-firefox` → TST Shelf → Inspect →
+  `browser.storage.local.get("bootlog").then(r => console.log(r.bootlog.slice(-12)))`.
+  `hints-command-fired` appears the moment Firefox delivers the command;
+  `hints-decline <reason>` explains a declined entry; nothing at all in
+  the bootlog means the keypress never reached the extension (a
+  Firefox-side delivery problem, reported to Bugzilla, not ours).
+- **Hint-mode key capture runs on two channels.** Vimium's link hints
+  work because their key listener lives in the page the user types
+  into; the same mechanism is ported: on every mode entry a tiny
+  on-demand key catcher (`hint-catcher.js`) is injected into the
+  window's active tab — legal without host permissions, because the
+  command's own invocation grants `activeTab` (MDN: a commands-API
+  shortcut, Firefox 63+), and activeTab is exactly what covers
+  `tabs.executeScript` in MV2. The catcher forwards the code letters
+  to the background and suppresses them from the page (modifier combos
+  like Ctrl+L pass through untouched); it tears itself down on the
+  mode's exit message, and an orphan answers its own first key with a
+  teardown. The sidebar's own channel stays for when the tree has the
+  focus: a zero-size catcher span rides the root strap, receives
+  `focus-to-extra-contents`, and every keydown in it arrives as
+  `extra-contents-keydown`. The first key of either channel confirms
+  the mode (Firefox 158 does not dispatch focus/blur for shadow-
+  internal targets — measured), and the bounded timeout tears an
+  unconfirmed mode down with nothing painted. Pages the injection
+  cannot touch split in two: pages Firefox rejects outright —
+  top-level `about:` frames and extension pages, the TST group tabs
+  among them (MDN) — DECLINE the entry itself (`hints-decline
+  active-tab-not-injectable` in the bootlog; no mode, no labels, and
+  with the exclusion option on, no codes on such tabs either); pages
+  that merely fail at arming — the PDF viewer, reader view — enter,
+  log `hints-arm-fail`, and keep the sidebar channel: click a row in
+  the tree first, then type.
+- **Vimium and other page-keyboard extensions.** Vimium hangs its
+  keydown listener on `window` with capture and consumes every key it
+  maps before any other listener in the page can see it (measured in
+  the Vimium sources: `stopImmediatePropagation` on mapped keys) — a
+  hint code built from a letter Vimium maps would be eaten as typed.
+  The default alphabet `acqsew` is exactly the six lowercase letters
+  no default Vimium mapping starts with, so with stock Vimium nothing
+  collides; while hint mode is armed, the catcher also suppresses
+  EVERY printable key from the page, so Vimium's normal mode cannot
+  react to hint typing either. If your Vimium (or any other
+  extension's) keymap differs, the alphabet field on the options page
+  takes any two or more distinct letters or digits.
+- **Extra-contents writes have no reply.** Every extra-contents case in
+  tst-api-frontend.js ends with a bare `return`, and the runtime reply
+  race leaves some send promises settled late or never. The row-label
+  ledger is intent-tracked for that reason; the strap ledger keeps the
+  acknowledged semantics (a failed clear is retried by the
+  vanished-shelves loop), and both are idempotent re-send safe.
+
 
 - **Session-value persistence requires session restore.** Without
   `browser.sessionstore` the tabs themselves do not come back, so the
