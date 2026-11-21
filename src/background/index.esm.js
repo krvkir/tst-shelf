@@ -18,11 +18,28 @@
  * live TST light tree + browser.tabs on every structural event.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, mustShowTabs, ROOT_SHELF } from "./logic.esm.js";
+import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, resolveFavicons, mustShowTabs, danglingMembers, ROOT_SHELF } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
 import { SHELF_STYLE } from "./style.esm.js";
 
 const RECOMPUTE_DELAY_MS = 120;
+
+/** The smoke page and the E2E driver only exist in `make e2e` builds. */
+const E2E_BUILD = String(browser.runtime.getManifest().version).endsWith("-e2e");
+
+// The internal test API must answer BOTH our own pages (runtime.onMessage)
+// and pages of OTHER extensions (runtime.onMessageExternal — the E2E drives
+// the addon from the tab-hosted TST sidebar, which is TST's page).  It is
+// registered here, before the TST client below: Firefox takes the FIRST
+// non-undefined response, and the donor client answers `true` to every
+// external message it does not recognize.
+if (E2E_BUILD) {
+	// eslint-disable-next-line no-use-before-define
+	browser.runtime.onMessage.addListener(onTestMessage);
+	// eslint-disable-next-line no-use-before-define
+	browser.runtime.onMessageExternal.addListener(onTestMessage);
+}
+
 const STATE_SHELVED = "tst-shelf-shelved";
 const FLAG_KEY = "tst-shelf";
 
@@ -45,6 +62,37 @@ const preparedWindows = new Set;
 /** @type {Map<number, any>} per-window re-derivation timers */
 const timers = new Map;
 let tstUsable = false;
+/** @type {Map<number|string, number>} owner -> rows the shelf needs.
+ *  Used by the E2E to drive the A3 gate directly; normally the line count
+ *  comes from computeShelfLines() below. */
+const lineOverrides = new Map;
+/** Whether the TST build supports rows of N whole lines and row-less tabs
+ *  (the A3/B patch).  Advertised through TST's minor version — a stock
+ *  4.4.x ignores both. */
+let tstShelfCapabilities = { lines: false, rowLess: false, };
+/** @type {Map<number, number>} windowId -> width of the tab bar area, as
+ *  reported by TST.  The sidebar is the only party that knows its own width,
+ *  and a shelf's line count depends on it (TST 4.5 "tabbar-resized"). */
+const sidebarWidths = new Map;
+/** @type {Map<number, Map<number|null, number>>} windowId -> owner -> lines
+ *  computed by the last derivation. */
+const shelfLines = new Map;
+/** @type {Set<number>} members rendered row-less through TST (feature 1:
+ *  a childless shelved tab has no row at all, yet is never hidden). */
+const rowLessByUs = new Set;
+/** "auto" | "scroll" | "extend" — what a crowded shelf does.  "auto" extends
+ *  the row in whole lines when TST supports it, and scrolls otherwise. */
+const SETTING_LAYOUT = "shelf-layout";
+let shelfLayout = "auto";
+
+/** One shelf icon cell: TST's faviconized tab size (34 px at scale 1) plus
+ *  the strap's 3 px gap. */
+const SHELF_CELL_WIDTH = 37;
+const SHELF_CELL_GAP = 3;
+/** Share of the tab bar width the shelf may use (spec: at most 2/3 of the
+ *  owner's row), minus a small allowance for the row's own margins. */
+const SHELF_WIDTH_SHARE = 2 / 3;
+const SHELF_WIDTH_MARGIN = 8;
 
 // ---------------------------------------------------------------------------
 // 1. state, persistence and diagnostics
@@ -63,6 +111,24 @@ async function logBoot (kind, detail) {
 		await browser.storage.local.set({ bootlog: entries.slice(-80), });
 	}).catch(() => { /* diagnostics must never break the caller */ });
 }
+
+/** The one user-facing setting: what a crowded shelf does.  "auto" grows the
+ *  owner row in whole lines when TST supports it (TST 4.5), and scrolls
+ *  within one line otherwise. */
+async function loadSettings () {
+	const stored = await browser.storage.local.get({ [SETTING_LAYOUT]: "auto", }).catch(() => ({}));
+	const value = stored[SETTING_LAYOUT];
+	shelfLayout = ["auto", "scroll", "extend",].includes(value) ? value : "auto";
+	logBoot("settings", `layout=${shelfLayout}`);
+}
+
+browser.storage.onChanged.addListener((changes, area) => {
+	if (area != "local" || !(SETTING_LAYOUT in changes)) { return; }
+	const value = changes[SETTING_LAYOUT].newValue;
+	shelfLayout = ["auto", "scroll", "extend",].includes(value) ? value : "auto";
+	logBoot("settings", `layout=${shelfLayout}`);
+	scheduleRederiveAll();
+});
 
 /** Rebuild the shelved set from per-tab session values after (re)start. */
 async function loadShelvedFromSessions () {
@@ -123,7 +189,18 @@ const TST = tstApi({
 			onTreeMutated(message?.tab?.windowId);
 		},
 		"tabs-rendered": message => onTabsRendered(message?.tabs || []),
-		"sidebar-show": message => onTabsRendered([], message?.windowId),
+		"sidebar-show": message => {
+			recordSidebarWidth(message);
+			// A sidebar that opens LATER missed every state we applied while it
+			// was closed: TST exports only its own safe states on a sidebar's
+			// initial import (common/TreeItem.js exportTab), so addon states are
+			// not in it.  Forget both ledgers and re-apply from scratch.
+			rowLessByUs.clear();
+			renderer.forceStateResync();
+			if (message?.windowId != null) { scheduleRederive(message.windowId); }
+			onTabsRendered([], message?.windowId);
+		},
+		"tabbar-resized": message => recordSidebarWidth(message),
 		"extra-contents-mousedown": message => onExtraContentsMousedown(message),
 		"extra-contents-clicked": message => onExtraContentsClicked(message),
 		"try-collapse-tree-from-other-expansion": message => shelved.has(message?.tab?.id),
@@ -131,6 +208,45 @@ const TST = tstApi({
 	},
 	onError: error => logBoot("tst-error", String(error && error.message || error).slice(0, 120)),
 });
+
+/** "extend" grows the owner row in whole lines; "scroll" keeps one line and
+ *  scrolls the strap horizontally. */
+function shelfLayoutMode () {
+	if (shelfLayout == "scroll") { return "scroll"; }
+	if (shelfLayout == "extend") { return tstShelfCapabilities.lines ? "extend" : "scroll"; }
+	return tstShelfCapabilities.lines ? "extend" : "scroll";
+}
+
+/** How many whole lines the strap of one shelf needs.  1 means "fits on the
+ *  owner's own line".  Requires TST's A3 capability and the sidebar width;
+ *  without either the shelf stays on one line and scrolls. */
+function computeShelfLines (windowId, members) {
+	if (shelfLayoutMode() != "extend") { return 1; }
+	const width = sidebarWidths.get(windowId);
+	if (!(width > 0)) { return 1; }
+	// the last cell of a line needs no trailing gap
+	const available = Math.floor((width * SHELF_WIDTH_SHARE) - SHELF_WIDTH_MARGIN);
+	const columns = Math.max(1, Math.floor((available + SHELF_CELL_GAP) / SHELF_CELL_WIDTH));
+	return Math.max(1, Math.ceil(members.length / columns));
+}
+
+/** The line count the renderer declares for one owner's strap. */
+function linesOf (owner, windowId) {
+	const override = lineOverrides.get(owner ?? "root");
+	if (override) { return override; }
+	const perWindow = shelfLines.get(windowId);
+	return (perWindow && perWindow.get(owner ?? ROOT_SHELF)) || 1;
+}
+
+function recordSidebarWidth (message) {
+	const windowId = message?.windowId;
+	const width = Number(message?.width);
+	if (windowId == null || !(width > 0)) { return; }
+	if (sidebarWidths.get(windowId) == width) { return; }
+	sidebarWidths.set(windowId, width);
+	// every shelf's line count depends on it
+	scheduleRederive(windowId);
+}
 
 /** register() can transiently fail while TST's background initializes
  * (it answers `undefined` to register-self and drops the registration).
@@ -159,7 +275,17 @@ async function checkTstUsable () {
 	const version = await TST.methods.getVersion({}).catch(() => null);
 	const major = parseInt(String(version || "0").split(".")[0], 10);
 	tstUsable = major >= 4;
+	// A3 (rows of N whole lines) and B (row-less tabs) are what TST 4.5
+	// carries.  A stock 4.4.x silently ignores both: `lines` is not read
+	// and the `row-less` state is inert, so the addon degrades to hiding
+	// members and to a single-line scrolling shelf.
+	const minor = parseInt(String(version || "0").split(".")[1], 10) || 0;
+	tstShelfCapabilities = {
+		lines:   major > 4 || (major == 4 && minor >= 5),
+		rowLess: major > 4 || (major == 4 && minor >= 5),
+	};
 	if (!tstUsable) { logBoot("tst-too-old", String(version)); }
+	logBoot("tst-capabilities", JSON.stringify(tstShelfCapabilities));
 }
 
 // ---------------------------------------------------------------------------
@@ -238,9 +364,22 @@ async function rederive (windowId, { reconcile = false, } = {}) {
 	if (!tree) { return; }
 	// members keep NO row: hide them (and bring back any we hid that
 	// left the shelf, or that must stay visible).
-	await reconcileHidden(windowId, tabs, mustShowTabs({ tree, activeId: tabs.find(tab => tab.active)?.id ?? null, }));
+	// FOLD FIRST: a member's subtree may stay unfolded only while its own
+	// row is on screen (logic.esm.js danglingMembers).  Folding arms the
+	// hide guard for exactly those members, so the hide below waits for
+	// TST's collapse animation instead of orphaning the children's rows.
+	const mustShow = mustShowTabs({ tree, activeId: tabs.find(tab => tab.active)?.id ?? null, });
+	foldDanglingMembers(windowId, tree, mustShow);
+	await reconcileHidden(windowId, tabs, mustShow, tree);
 
-const derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
+	const derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
+	// 0.2.0: a crowded shelf grows its row in whole lines instead of
+	// scrolling, when TST can do that and the sidebar width is known.
+	const lines = new Map;
+	for (const [owner, members] of derivation.shelves) {
+		lines.set(owner, computeShelfLines(windowId, members));
+	}
+	shelfLines.set(windowId, lines);
 	windows.set(windowId, { derivation, tabsById, tree, });
 	if (!preparedWindows.has(windowId)) {
 		// upgrade path: 0.1.2 parked straps on owner rows (second line)
@@ -279,23 +418,113 @@ const derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
 // `renderHiddenTabs` is on (tabs-store.js:538-553) — that option puts
 // members back into the flow and is unsupported (README).
 
+/** tabId -> times TST was asked to collapse a dangling member's subtree.
+ *  A collapse that never lands must not defer the hide forever, so the
+ *  request is bounded: past MAX_FOLD_TRIES the row is reclaimed anyway
+ *  (TST then removes the children's rows when its animation ends). */
+const foldTries = new Map;
+const MAX_FOLD_TRIES = 3;
+
+/**
+ * Fold the subtrees of "dangling" members (logic.esm.js
+ * danglingMembers): a shelved tab's subtree may stay unfolded only while
+ * its own row is on screen.  When the user activates an UNSHELVED
+ * sibling, the member's row is reclaimed without any shelf selection
+ * event, and 0.1.6 left the children rendered under a parent row that no
+ * longer existed (user-reported).
+ *
+ * `hideGuard` is armed BEFORE this returns, so the `reconcileHidden`
+ * pass that follows in the same derivation defers those hides until
+ * TST's collapse animation (configs.collapseDuration) has removed the
+ * children's rows — the parent's row must outlive its children's rows.
+ */
+function foldDanglingMembers (windowId, tree, mustShow) {
+	if (!tstUsable || !tree) { return 0; }
+	const ids = danglingMembers({ tree, shelved, mustShow, });
+	for (const id of [...foldTries.keys()]) {
+		if (!ids.includes(id)) { foldTries.delete(id); }
+	}
+	for (const id of ids) {
+		const tries = (foldTries.get(id) || 0) + 1;
+		foldTries.set(id, tries);
+		if (tries > MAX_FOLD_TRIES) {
+			logBoot("fold-give-up", `window ${windowId} tab ${id} tries=${tries}`);
+			continue;
+		}
+		guardRow(id);
+		TST.methods.collapseTree({ tab: id, windowId, })
+			.catch(error => logBoot("fold-fail", `${id} ${error && error.message || error}`));
+	}
+	return ids.length;
+}
+
 /** Hide the members of this window; bring back members we hid that left
  *  the shelf.  Mutates the `tabs` records so the derivation sees the
  *  truth: tabs.query snapshots taken before a hide are stale. */
-async function reconcileHidden (windowId, tabs, mustShow = new Set) {
+async function reconcileHidden (windowId, tabs, mustShow = new Set, tree = null) {
 	if (!tabs.length) { return; }
 	const byId = new Map(tabs.map(tab => [tab.id, tab]));
+
+	// Feature 1 and the fold-until-selected rule, on a TST with the row-less
+	// capability: a CHILDLESS member never renders a row at all (it is NOT
+	// hidden — the tab stays visible to the browser, nothing is revealed on
+	// activation and no row ever swaps in), and a member WITH children is
+	// row-less only while it is neither the active tab nor an ancestor of
+	// it: when it becomes active its row comes back, and its subtree hangs
+	// from it (spec shelf-nesting).  Its subtree is folded first —
+	// foldDanglingMembers ran before this and armed `hideGuard` — so the
+	// transition waits for TST's collapse animation to remove the children's
+	// rows, exactly like the hide path below.
+	//
+	// In this mode nothing is ever hidden: the `tabHide` lever stays unused.
+	const now = Date.now();
+	let deferredUntil = 0;
+	const wantRowLess = new Set;
+	const rowLessMode = tstShelfCapabilities.rowLess && !!tree;
+	if (rowLessMode) {
+		const { hasChildIds, } = indexTree(tree);
+		for (const id of shelved) {
+			const tab = byId.get(id);
+			if (!tab || tab.pinned) { continue; }
+			const childless = !hasChildIds.has(id);
+			if (!childless && mustShow.has(id)) { continue; } // row is the subtree's anchor
+			if (!childless) {
+				const guardedUntil = hideGuard.get(id);
+				if (guardedUntil && now < guardedUntil) {
+					deferredUntil = Math.max(deferredUntil, guardedUntil);
+					continue;
+				}
+				if (guardedUntil) { hideGuard.delete(id); }
+			}
+			wantRowLess.add(id);
+		}
+	}
+	const toRowLess = [...wantRowLess].filter(id => !rowLessByUs.has(id));
+	const offRowLess = [...rowLessByUs].filter(id => !wantRowLess.has(id));
+	if (toRowLess.length) {
+		await Promise.all(toRowLess.map(id => TST.methods.addTabState({ tab: id, state: "row-less", windowId, })
+			.catch(error => logBoot("rowless-fail", `${id} ${error && error.message || error}`))));
+		for (const id of toRowLess) { rowLessByUs.add(id); }
+		logBoot("rowless", `window ${windowId} tabs=${toRowLess.join(",")}`);
+	}
+	if (offRowLess.length) {
+		await Promise.all(offRowLess.map(id => TST.methods.removeTabState({ tab: id, state: "row-less", windowId, })
+			.catch(() => {})));
+		for (const id of offRowLess) { rowLessByUs.delete(id); }
+		logBoot("rowless-off", `window ${windowId} tabs=${offRowLess.join(",")}`);
+	}
 	// Firefox refuses to hide the ACTIVE tab and refuses to empty a
 	// window: both cases are filtered out here rather than failing the
 	// whole batch (one bad id rejects the entire tabs.hide call).
 	// `mustShow` adds the active tab's ancestors: a hidden parent has no
 	// rendered descendants, so reclaiming an ancestor's row would take
 	// the active tab's own row (and any nested shelf's strap) with it.
-	const now = Date.now();
-	let deferredUntil = 0;
 	const toHide = [...shelved].filter(id => {
 		const tab = byId.get(id);
 		if (!tab || tab.hidden || tab.pinned || mustShow.has(id)) { return false; }
+		// a row-less member is already absent from the sidebar; hiding it
+		// would add the tabHide lever for no gain
+		if (wantRowLess.has(id)) { return false; }
 		const guardedUntil = hideGuard.get(id);
 		if (guardedUntil && now < guardedUntil) {
 			// its subtree is still animating; come back when the guard
@@ -336,6 +565,12 @@ async function reconcileHidden (windowId, tabs, mustShow = new Set) {
 	// row at all, and a nested shelf would lose the row its strap lives
 	// in.
 	for (const id of mustShow) {
+		if (hiddenByUs.has(id) && byId.has(id)) { toShow.add(id); }
+	}
+	// a member that switched to the row-less presentation must stop being
+	// hidden: `hidden` is a browser-level state and would make the tab
+	// appear/disappear on activation again
+	for (const id of wantRowLess) {
 		if (hiddenByUs.has(id) && byId.has(id)) { toShow.add(id); }
 	}
 	const toShowIds = [...toShow];
@@ -387,7 +622,10 @@ async function rehideMembersNow (windowId) {
 	const cached = windows.get(windowId)?.tree ?? null;
 	if (!cached) { return; }
 	const mustShow = mustShowTabs({ tree: cached, activeId: tabs.find(tab => tab.active)?.id ?? null, });
-	await reconcileHidden(windowId, tabs, mustShow).catch(error =>
+	// the member that just lost activation may still have an unfolded
+	// subtree: fold it before reclaiming its row (danglingMembers)
+	foldDanglingMembers(windowId, cached, mustShow);
+	await reconcileHidden(windowId, tabs, mustShow, cached).catch(error =>
 		logBoot("rehide-fail", `${windowId} ${error && error.message || error}`));
 }
 
@@ -520,6 +758,7 @@ async function onTabsRendered (tabs, windowIdHint) {
 }
 
 const renderer = createRenderer({
+	linesOf: (owner, windowId) => linesOf(owner, windowId),
 	send: (type, params) => {
 		const camel = type.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 		const method = TST.methods[camel];
@@ -678,7 +917,9 @@ async function selectShelfTab (memberId) {
 	// rows painted, which reads as the tree bouncing by one row.
 	// The hide may be processed before the activation (and be refused
 	// because the tab is still active); the retry covers that order.
-	const reclaimable = outgoingId != null && !hideGuard.has(outgoingId);
+	// a row-less member has no row to reclaim (feature 1): nothing to hide,
+	// nothing to race with
+	const reclaimable = outgoingId != null && !hideGuard.has(outgoingId) && !rowLessByUs.has(outgoingId);
 	const activation = browser.tabs.update(memberId, { active: true, }).catch(() => null);
 	// issued without awaiting the activation: the parent processes the two
 	// messages in order, so the reveal and the hide land in the same task
@@ -693,6 +934,7 @@ async function selectShelfTab (memberId) {
 
 /** Hide one tab right away, recording it as OUR hide (see hiddenByUs). */
 async function hideNow (tabId) {
+	if (rowLessByUs.has(tabId)) { return true; } // no row to reclaim
 	try {
 		const hid = await browser.tabs.hide([tabId]);
 		if (Array.isArray(hid) && hid.includes(tabId)) {
@@ -755,7 +997,12 @@ async function takeOffShelf (tabId) {
 	appendSeq.delete(tabId);
 	// the row comes back: a tab we hid has none at all (0.1.4)
 	const wasHidden = hiddenByUs.delete(tabId);
+	const wasRowLess = rowLessByUs.delete(tabId);
 	const tab = await browser.tabs.get(tabId).catch(() => null);
+	if (wasRowLess && tab) {
+		// the row comes back
+		await TST.methods.removeTabState({ tab: tabId, state: "row-less", windowId: tab.windowId, }).catch(() => {});
+	}
 	if (tab) {
 		// only OUR hides are ours to lift: a tab that a container filter
 		// hid must stay hidden, or taking it off the shelf would defeat
@@ -791,7 +1038,9 @@ async function restorePreShelvePosition (tab, prev) {
 browser.tabs.onRemoved.addListener(tabId => {
 	faviconMemory.delete(tabId);
 	hideGuard.delete(tabId);
+	foldTries.delete(tabId);
 	hiddenByUs.delete(tabId);
+	rowLessByUs.delete(tabId);
 	if (shelved.delete(tabId)) { scheduleRederiveAll(); }
 });
 
@@ -841,6 +1090,7 @@ browser.windows.onRemoved.addListener(async windowId => {
 	// menu items are TST-independent: create them even when TST is absent
 	// or broken, so the menu is present from the very first moment.
 	createMenuItems();
+	await loadSettings();
 	await loadShelvedFromSessions();
 	await register();
 	if (tstUsable) {
@@ -856,9 +1106,9 @@ browser.windows.onRemoved.addListener(async windowId => {
 // ---------------------------------------------------------------------------
 // 9. internal API for the E2E smoke page (-e2e builds only)
 
-browser.runtime.onMessage.addListener((message, _sender) => {
+function onTestMessage (message) {
 	(message = message || {});
-	if (!String(browser.runtime.getManifest().version).endsWith("-e2e")) { return undefined; }
+	if (!E2E_BUILD || !String(message.type || "").startsWith("test:")) { return undefined; }
 	const outcome = (async () => {
 		switch (message.type) {
 		case "test:state": {
@@ -882,6 +1132,11 @@ browser.runtime.onMessage.addListener((message, _sender) => {
 			return {
 				registered: TST.isRegistered, usable: tstUsable,
 				shelved: [...shelved], hiddenByUs: [...hiddenByUs],
+				rowLessByUs: [...rowLessByUs],
+				capabilities: tstShelfCapabilities,
+				layout: shelfLayoutMode(),
+				widths: [...sidebarWidths.entries()],
+				lines: [...windows.entries()].map(([id, win]) => [id, [...(shelfLines.get(id) || new Map).entries()]]),
 				shelves, favicons,
 				menu: { ...menuTelemetry, items: menuItems, },
 			};
@@ -917,6 +1172,23 @@ browser.runtime.onMessage.addListener((message, _sender) => {
 			await applyMenuVisibility(message.tabId);
 			return { ok: true, menu: { ...menuTelemetry, items: menuTelemetry.items, }, };
 		}
+		case "test:lines": {
+			// A3 gate: make an owner's row N whole lines tall (0 = back to the
+			// addon's own computation).
+			const key = message.owner == null ? "root" : message.owner;
+			if (message.lines > 0) { lineOverrides.set(key, message.lines); }
+			else { lineOverrides.delete(key); }
+			renderer.invalidate(message.windowId);
+			await rederive(message.windowId);
+			return { ok: true, capabilities: tstShelfCapabilities, };
+		}
+		case "test:tab-state": {
+			// B gate: apply a TST tab state (e.g. row-less) through the API.
+			const method = message.add === false ? "removeTabState" : "addTabState";
+			const ok = await TST.methods[method]({ tab: message.tabId, state: message.state, windowId: message.windowId, })
+				.catch(error => { logBoot("test-tab-state-fail", String(error && error.message || error)); return false; });
+			return { ok, capabilities: tstShelfCapabilities, };
+		}
 		case "test:redrive": {
 			await rederive(message.windowId, { reconcile: !!message.reconcile, });
 			return { ok: true, };
@@ -926,7 +1198,7 @@ browser.runtime.onMessage.addListener((message, _sender) => {
 	})();
 	outcome.catch(error => logBoot("msg-fail", `${message.type} ${error && error.message || error}`));
 	return outcome;
-});
+}
 
 // E2E build gate: the smoke page is only ever shipped in `make e2e` runs.
 if (String(browser.runtime.getManifest().version).endsWith("-e2e")) {

@@ -157,15 +157,32 @@ async function phaseOneAndTwo () {
 	// breaking its uniform-row arithmetic (a blank member row would be
 	// the "gaps" 0.1.3 shipped).
 	{
-		const settled = await eventually(null, async () => {
-			const hidden = {};
-			for (const id of [ids.B, ids.C]) { hidden[id] = (await browser.tabs.get(id)).hidden; }
-			return hidden[ids.B] === true && hidden[ids.C] === true ? hidden : null;
+		// Two presentations exist (0.2.0).  On a TST with the row-less
+		// capability NOTHING is hidden: every member is row-less, except a
+		// member with children while it is the active tab — then its row
+		// comes back and its subtree hangs from it.  On a TST without the
+		// capability the only lever is browser.tabs.hide(), so members are
+		// hidden and the browser reveals the one that gets activated.
+		const state = await eventually(null, async () => {
+			const s = await send({ type: "test:state" });
+			const ready = s.capabilities.rowLess ?
+				s.rowLessByUs.includes(ids.B) && s.rowLessByUs.includes(ids.C) && s.hiddenByUs.length == 0 :
+				s.hiddenByUs.includes(ids.B) && s.hiddenByUs.includes(ids.C);
+			return ready ? s : null;
 		}, 8000);
-		const state = await send({ type: "test:state" });
-		record("members keep no row at all (hidden tabs)",
-			!!settled && state.hiddenByUs.includes(ids.B) && state.hiddenByUs.includes(ids.C),
-			`hidden=${JSON.stringify(settled)} hiddenByUs=${JSON.stringify(state.hiddenByUs)}`);
+		const live = {
+			B: (await browser.tabs.get(ids.B)).hidden,
+			C: (await browser.tabs.get(ids.C)).hidden,
+		};
+		const caps = state ? state.capabilities : {};
+		const ok = state && (caps.rowLess ?
+			state.rowLessByUs.includes(ids.B) && state.rowLessByUs.includes(ids.C)
+			&& state.hiddenByUs.length == 0 && live.B === false && live.C === false
+			: state.hiddenByUs.includes(ids.B) && state.hiddenByUs.includes(ids.C)
+			&& live.B === true && live.C === true);
+		record("members keep no row — and on a row-less TST nothing is hidden",
+			ok,
+			`caps=${JSON.stringify(caps)} rowLess=${JSON.stringify(state && state.rowLessByUs)} hiddenByUs=${JSON.stringify(state && state.hiddenByUs)} live=${JSON.stringify(live)}`);
 	}
 
 	// Our context menu items must exist as OUR OWN browser.menus items
@@ -303,12 +320,24 @@ async function phaseOneAndTwo () {
 		let elapsed = -1;
 		for (let attempt = 0; attempt < 500; attempt++) {
 			const live = await browser.tabs.get(ids.B).catch(() => null);
-			if (live && live.hidden) { elapsed = Date.now() - startedAt; break; }
+			// row-less member: it must NEVER be hidden — there is no row to
+			// reclaim in the first place, which is the whole point of 0.2.0
+			const ready = live && (live.hidden || false);
+			if (ready) { elapsed = Date.now() - startedAt; break; }
 			await Promise.resolve();
 		}
-		record("the member is hidden again the moment another tab becomes active", elapsed >= 0 && elapsed < 250,
-			`elapsed=${elapsed}ms (a full re-derivation costs 120ms of debounce on top)`);
-		record("a member's row disappears when it stops being active", elapsed >= 0, `elapsed=${elapsed}ms`);
+		const afterSwitch = await send({ type: "test:state" });
+		if (afterSwitch && afterSwitch.capabilities.rowLess) {
+			const live = await browser.tabs.get(ids.B);
+			record("a row-less member is never hidden — no row to reclaim, no reveal to undo",
+				live.hidden === false && afterSwitch.rowLessByUs.includes(ids.B),
+				`hidden=${live.hidden} rowLess=${JSON.stringify(afterSwitch.rowLessByUs)}`);
+		}
+		else {
+			record("the member is hidden again the moment another tab becomes active", elapsed >= 0 && elapsed < 250,
+				`elapsed=${elapsed}ms (a full re-derivation costs 120ms of debounce on top)`);
+			record("a member's row disappears when it stops being active", elapsed >= 0, `elapsed=${elapsed}ms`);
+		}
 		const state = await eventually(null, async () => {
 			const s = await send({ type: "test:state" });
 			const shelf = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);

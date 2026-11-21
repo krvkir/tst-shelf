@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
 	subtreeSizes, treePositions, nextPlacementMove, resolveFavicons,
-	mustShowTabs, ROOT_SHELF,
+	mustShowTabs, danglingMembers, ROOT_SHELF,
 } from "../src/background/logic.esm.js";
 
 /** Light-tree node helper. */
@@ -409,4 +409,51 @@ test("mustShowTabs ignores settled states", () => {
 	const tree = [node(1, [], [node(2, ["subtree-collapsed"], [node(5, ["collapsed-completely"])])]), node(3)];
 	const must = mustShowTabs({ tree, activeId: 3 });
 	assert.deepEqual([...must], [3], "a finished collapse protects nobody");
+});
+
+test("a member's unfolded subtree dangles once its row is gone", () => {
+	// A <- (D: plain sibling, S: shelved, with children s1/s2).
+	// S was active and unfolded; the user activated D.  S's row is
+	// reclaimed (it is neither active nor an ancestor of the active tab),
+	// so its subtree must be folded — 0.1.6 left s1/s2 rendered under a
+	// parent row that no longer existed.
+	const tree = [node(1, [], [node(2), node(3, [], [node(5), node(6)])])];
+	const shelved = new Set([3]);
+	const must = mustShowTabs({ tree, activeId: 2 });
+	assert.deepEqual(danglingMembers({ tree, shelved, mustShow: must }), [3],
+		"unfolded member with no row on screen");
+});
+
+test("the active member's subtree is not dangling", () => {
+	const tree = [node(1, [], [node(2), node(3, [], [node(5), node(6)])])];
+	const shelved = new Set([3]);
+	const must = mustShowTabs({ tree, activeId: 3 });
+	assert.deepEqual(danglingMembers({ tree, shelved, mustShow: must }), []);
+});
+
+test("a member whose descendant is active is not dangling", () => {
+	// s1 is the active tab: S is an ancestor of it, so S keeps its row
+	// and its subtree may stay unfolded.
+	const tree = [node(1, [], [node(3, [], [node(5), node(6)])])];
+	const shelved = new Set([3]);
+	const must = mustShowTabs({ tree, activeId: 5 });
+	assert.deepEqual(danglingMembers({ tree, shelved, mustShow: must }), []);
+});
+
+test("folded and childless members are never dangling", () => {
+	const tree = [node(1, [], [node(2), node(3, ["subtree-collapsed"], [node(5)])])];
+	const shelved = new Set([2, 3]);
+	const must = mustShowTabs({ tree, activeId: 1 });
+	assert.deepEqual(danglingMembers({ tree, shelved, mustShow: must }), []);
+});
+
+test("a member already collapsing is not dangling again", () => {
+	// TST is folding it right now, so mustShowTabs protects its row until
+	// the animation ends — the fold request must not be repeated, and the
+	// hide stays deferred by that same protection.
+	const tree = [node(1, [], [node(3, ["collapsing"], [node(5, ["collapsed-completely"])])])];
+	const shelved = new Set([3]);
+	const must = mustShowTabs({ tree, activeId: 1 });
+	assert.equal(must.has(3), true, "protected mid-animation");
+	assert.deepEqual(danglingMembers({ tree, shelved, mustShow: must }), []);
 });

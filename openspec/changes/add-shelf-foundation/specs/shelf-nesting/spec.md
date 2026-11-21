@@ -26,20 +26,21 @@ The extension SHALL unfold at most one shelved tab's subtree per shelf at any ti
 - **WHEN** shelf tab A's children are unfolded and the user selects shelf tab B on the same shelf
 - **THEN** A's child rows hide and B's child rows show, if B has children
 
-### Requirement: The unfolded subtree stays visible until another tab of the same shelf is selected
-The extension SHALL keep the children of a shelf's selected tab visible even when the active tab moves outside the shelf or to one of the selected tab's descendants, and SHALL fold them only when another tab of the same shelf becomes selected.
+### Requirement: A shelved tab's subtree is unfolded only while that tab's own row is shown
+The extension SHALL fold the subtree of a shelved tab whenever that tab's own row is not shown in the tree. A shelved tab keeps its row only while it is the active tab or an ancestor of the active tab; in every other state its descendants would render below the shelf with no parent row above them.
 
-#### Scenario: Activating an unrelated tab keeps the subtree open
-- **WHEN** a shelf's selected tab has its children unfolded and the user activates an unrelated tab elsewhere in the tree
-- **THEN** the selected tab's child rows remain visible
+#### Scenario: Activating an unrelated tab folds the subtree
+- **WHEN** a shelf tab's children are unfolded and the user activates a tab that is neither that tab nor one of its descendants
+- **THEN** the shelf tab's child rows hide, and the shelf tab's own row is reclaimed only after they are gone
+- **AND** no frame of the transition shows a child row while the shelf tab's row is absent
 
-#### Scenario: Activating a child of the selected tab keeps it selected
-- **WHEN** the active tab is a child of the selected shelf tab and the user switches to another child of the same shelf tab
-- **THEN** the shelf tab remains selected and its children stay visible
+#### Scenario: Activating a child of the shelved tab keeps it unfolded
+- **WHEN** the active tab is a child of the shelved tab and the user switches to another child of the same shelved tab
+- **THEN** the shelved tab keeps its row and its children stay visible
 
-#### Scenario: The unfolded subtree survives a browser restart
-- **WHEN** a shelf's selected tab has its children unfolded and the browser restarts with session restore
-- **THEN** that tab is selected again and its child rows come back visible, while no other shelf tab's children appear
+#### Scenario: The fold state survives a browser restart
+- **WHEN** the browser restarts with session restore
+- **THEN** the shelved tab's folded state is the one TST persisted, and the subtree of the member that is active again is unfolded
 
 ### Requirement: A selected shelved tab unfolds its own nested shelf under the parent shelf
 The extension SHALL hide the shelf owned by a shelved tab while that tab is not selected on its parent's shelf, and SHALL show that nested shelf directly below the parent shelf area when the tab is selected, so a selected shelved tab presents its own shelf and then its children in the order they would have as regular rows.

@@ -86,9 +86,14 @@ export function strapHtml ({ members, tabsById, highlightIds, badgeIds, }) {
  * targets that vanished (an empty shelf, a closed owner).
  * `send(type, params)` is TST's message route; the caller injects it.
  */
-export function createRenderer ({ send, log, }) {
+export function createRenderer ({ send, log, linesOf = () => 1, }) {
 	const renderedStraps = new Map; // `${windowId}:${owner}` -> { owner, contents } (null = cleared)
 	const tabStates = new Map;      // tabId -> Set of applied tst-shelf-* states
+	/** Re-send every wanted state even if the ledger says it is applied: a
+	 *  sidebar that attaches late never saw the earlier broadcasts (TST
+	 *  exports only its own safe states to a newly opened sidebar, see
+	 *  exportTab in common/TreeItem.js), so its model is missing ours. */
+	let forceStateSync = false;
 	const strapKey = (windowId, owner) => `${windowId}:${owner ?? "root"}`;
 
 	/** Apply one window's derivation: straps first, then state classes. */
@@ -108,10 +113,17 @@ export function createRenderer ({ send, log, }) {
 		}
 
 		const sends = [];
-		const strapSend = ({ owner, contents, }) => send("set-extra-contents",
-			owner === ROOT_SHELF
-				? { place: "tabbar-top", windowId, contents, }
-				: { place: "tab-below", tab: owner, windowId, contents, });
+		// `lines` is the TST capability (A3): the row is rendered as N whole
+		// lines tall and TST's scroll geometry accounts for it.  A TST
+		// without the capability ignores the parameter and the strap simply
+		// scrolls (the stylesheet keeps a single line there).
+		const strapSend = ({ owner, contents, }) => {
+			const lines = linesOf(owner, windowId);
+			return send("set-extra-contents",
+				owner === ROOT_SHELF
+					? { place: "tabbar-top", windowId, contents, lines, }
+					: { place: "tab-below", tab: owner, windowId, contents, lines, });
+		};
 
 		for (const [key, strap] of desired) {
 			const current = renderedStraps.get(key);
@@ -144,10 +156,14 @@ export function createRenderer ({ send, log, }) {
 		const wanted = new Map; // tabId -> Set of states
 		for (const owner of derivation.ownerIds) {
 			if (owner === ROOT_SHELF) { continue; }
-			wanted.set(owner, new Set(["tst-shelf-owner"]));
+			const states = new Set(["tst-shelf-owner"]);
+			if (linesOf(owner, windowId) > 1) { states.add("tst-shelf-lines"); }
+			wanted.set(owner, states);
 		}
 
 		const sends = [];
+		const force = forceStateSync;
+		forceStateSync = false;
 		for (const [id, states] of wanted) {
 			const current = tabStates.get(id) || new Set;
 			for (const state of states) {
@@ -156,7 +172,7 @@ export function createRenderer ({ send, log, }) {
 				// (or unfocused) session that resolves to a window whose
 				// active tab is null => the request silently processes
 				// ZERO tabs while still answering `true`.
-				if (!current.has(state)) { sends.push(send("add-tab-state", { tab: id, state, windowId, })); }
+				if (force || !current.has(state)) { sends.push(send("add-tab-state", { tab: id, state, windowId, })); }
 			}
 			for (const state of current) {
 				if (!states.has(state)) { sends.push(send("remove-tab-state", { tab: id, state, windowId, })); }
@@ -198,9 +214,10 @@ export function createRenderer ({ send, log, }) {
 				highlightIds: derivation.highlightIds,
 				badgeIds: derivation.badgeIds,
 			});
+			const lines = linesOf(owner, windowId);
 			const params = owner === ROOT_SHELF
-				? { place: "tabbar-top", windowId, contents, }
-				: { place: "tab-below", tab: owner, windowId, contents, };
+				? { place: "tabbar-top", windowId, contents, lines, }
+				: { place: "tab-below", tab: owner, windowId, contents, lines, };
 			sends.push(send("set-extra-contents", params)
 				.catch(error => log("restore-send-fail", `${owner} ${error && error.message || error}`)));
 		}
@@ -224,6 +241,19 @@ export function createRenderer ({ send, log, }) {
 		log("legacy-clear", `window ${windowId} tabs=${tabIds.length}`);
 	}
 
+	function forceStateResync () {
+		forceStateSync = true;
+	}
+
+	/** Drop the remembered straps so the next derivation re-sends them
+	 *  (used when something outside the contents changed, e.g. the row's
+	 *  line count). */
+	function invalidate (windowId) {
+		for (const key of [...renderedStraps.keys()]) {
+			if (key.startsWith(`${windowId}:`)) { renderedStraps.delete(key); }
+		}
+	}
+
 	/** Forget a window (closed): stop tracking its keys and states. */
 	function forgetWindow (windowId, liveTabIds) {
 		for (const key of [...renderedStraps.keys()]) {
@@ -234,5 +264,5 @@ export function createRenderer ({ send, log, }) {
 		}
 	}
 
-	return { applyDerivation, restoreStraps, clearLegacyStraps, forgetWindow };
+	return { applyDerivation, restoreStraps, clearLegacyStraps, forgetWindow, invalidate, forceStateResync };
 }

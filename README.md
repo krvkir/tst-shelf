@@ -14,9 +14,49 @@ the previous one. Shelved state survives restarts. Take a tab off the
 shelf and it returns to the exact place it had — the tree was never
 moved.
 
-Full behavior contract: `openspec/` (change `add-shelf-foundation`,
-capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
-`shelf-interaction`).
+Full behavior contract: `openspec/` (changes `add-shelf-foundation` and
+`add-discrete-row-geometry`, capabilities `shelf-pinning`,
+`shelf-presentation`, `shelf-nesting`, `shelf-interaction`,
+`companion-capabilities`).
+
+## Two capabilities it can use, and does without
+
+Two things the shelf really wants are impossible from an addon on a stock
+Tree Style Tab, so they live in a companion patch to TST itself
+(`docs/tst-row-geometry-patch.md`, applied in a local clone of TST; the
+addon never requires it):
+
+| capability | what it enables | without it |
+|---|---|---|
+| **row-less tabs** (`row-less` state) | a shelved tab has no row while staying visible to the browser — no `hidden`, no reveal on activation, no `tabHide` | members are hidden with `browser.tabs.hide()`, and Firefox reveals the one you activate |
+| **rows of N whole lines** (`lines` on `set-extra-contents`) | a crowded shelf grows its owner row in whole lines, so every icon stays visible | the shelf stays on one line and scrolls horizontally |
+
+The patch is detected from TST's version (`>= 4.5`); the test build marks
+itself, the upstreamable diff carries no version bump. `tests/patch-tst.sh`
+builds it from the AMO release plus the patch, and the E2E runs the whole
+suite against **both** builds — that is what keeps the fallbacks honest.
+
+### What changes with the patch
+
+- A childless shelved tab has **no row at all**, even while it is the
+  active tab. Its icon is its presentation: right-click it for the tab's own
+  menu, middle-click to close, hover for the title. Nothing in the tree
+  moves when you select it.
+- A shelved tab **with children keeps its row while it is active** (that row
+  is what its subtree hangs from) and loses it when you select something
+  else — after its subtree has folded, so no frame shows a child without a
+  parent.
+- A shelf that does not fit into 2/3 of the tab bar grows: 2 lines, 3 lines,
+  and so on, with the icons laid out in exactly that many rows. Icons are
+  never hidden behind a scroll.
+- **No tab is hidden** while the capability exists: the `tabHide` permission
+  is declared for the fallback only.
+
+### The one setting
+
+`shelf-layout` in the extension's storage: `auto` (default) extends the row
+when the capability exists and scrolls otherwise, `extend` always prefers
+extending, `scroll` always keeps one line and scrolls.
 
 ## What it does
 
@@ -36,11 +76,13 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
   the below-pinned placement needs an upstream TST slot; recorded in
   the openspec design). A newly shelved tab becomes the rightmost
   icon.
-- **Shelved tabs have no rows at all** (0.1.4): they are hidden with
-  `browser.tabs.hide()`, the only lever that removes a tab from TST's
-  renderable set without breaking its uniform-row arithmetic. A shelf
-  therefore costs exactly one line, and the tree is exactly as tall as
-  the same tree with those tabs deleted.
+- **Shelved tabs have no rows at all** (0.1.4): on a stock TST they are
+  hidden with `browser.tabs.hide()`, the only lever that removes a tab
+  from TST's renderable set without breaking its uniform-row
+  arithmetic; on a TST with the `row-less` capability they are marked
+  instead, which needs no hiding at all (0.2.0). A shelf therefore
+  costs exactly one line, and the tree is exactly as tall as the same
+  tree with those tabs deleted.
 - **Members stay contiguous directly under their owner**, so the
   selected member's children appear right below the owner's row.
   Placement uses TST's own subtree-preserving move API
@@ -71,9 +113,11 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
 
 - `tabs` — reading tab metadata (titles, URLs, favicons) for icons
   and tooltips.
-- `tabHide` — shelved tabs are hidden so they take no row; TST itself
-  requests this permission for its own hidden-tab support. Taking a tab
-  off the shelf shows it again.
+- `tabHide` — on a stock TST, shelved tabs are hidden so they take no
+  row; TST itself requests this permission for its own hidden-tab
+  support. Taking a tab off the shelf shows it again. On a TST with the
+  `row-less` capability the extension never calls it: members are marked
+  instead of hidden, and no tab leaves the screen.
 - `menus` — the two tab-context-menu items are the extension's OWN
   `browser.menus` items (see implementation notes); they appear in
   the TST sidebar's tab menu and in the native tab bar's menu.
@@ -105,6 +149,14 @@ capabilities `shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
   reclaimed as soon as nothing depends on it, and a member whose children
   are folding away keeps its row until the animation ends (300 ms guard)
   so no frame shows children without their parent.
+- **A shelf tab's subtree is unfolded only while its own row is shown.**
+  Activating a tab that is neither the shelf tab nor one of its
+  descendants reclaims the shelf tab's row, so its children fold first
+  and the row goes away after them: no frame shows a child row with no
+  parent above it. (0.1.6 collapsed the subtree only when another tab of
+  the *same shelf* was selected, so switching to a plain sibling left the
+  children dangling under the shelf owner's row — user-reported, fixed in
+  0.1.7 and gated by an E2E frame sampler.)
 - **Switching between two shelf tabs moves the tree at most one frame.**
   The swap cannot be atomic — the browser reveals the incoming tab, the
   extension hides the outgoing one, and TST paints them in separate

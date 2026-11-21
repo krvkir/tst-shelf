@@ -621,3 +621,36 @@ take back, and in what order.
   restart such a tab was mistaken for one hidden by another add-on, so it
   vanished from the tree *and* from the root shelf.  The bit is now
   written beside a fresh flag when the value is missing.
+
+### 0.1.7 — the dangling-subtree invariant
+
+**Symptom (user-reported).** A parent has an unshelved child D and a
+shelved child S with a subtree. Activating S from the shelf reveals its
+row and its children; activating D reclaims S's row and leaves the
+children rendered — attached to nothing.
+
+**Cause.** The collapse of a member's subtree was requested in exactly
+one place: `selectShelfTab`, i.e. only when another tab of the *same
+shelf* is selected. Any other activation path (a plain sibling, an
+unrelated tab, a keyboard switch) merely reclaimed the row. And a
+hidden tab's descendants are still renderable in TST
+(`updateVirtualScrollRenderabilityIndexForTab` is per-tab: it excludes a
+hidden tab, not its children), so the children stayed painted.
+
+**Fix.** The rule is stated globally instead of per event:
+*a shelved tab's subtree is unfolded only while that tab's own row is
+shown*, and its row is shown only while it is the active tab or an
+ancestor of the active tab (`mustShowTabs`). `danglingMembers` reports
+every shelved tab with children that is unfolded and not in `mustShow`;
+`foldDanglingMembers` arms `hideGuard` for each and asks TST to
+collapse it. Because the guard is armed before the hide pass of the same
+derivation, `reconcileHidden` defers the row until TST's collapse
+animation has removed the children's rows — the parent's row outlives
+its children's rows, which is exactly the frame invariant the E2E
+samples for. The fold request is bounded (`MAX_FOLD_TRIES = 3`) so a
+collapse TST refuses cannot defer a hide forever.
+
+**Evidence.** The new E2E gate activates the shelved tab's *unshelved*
+sibling and samples every frame: before the fix, 132 of 150 frames
+showed `ids = 3,7,8,6` — owner, both children, sibling, no parent; after
+it, zero orphan frames and every row of the member's subtree gone.

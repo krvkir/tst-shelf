@@ -218,6 +218,37 @@ export function mustShowTabs ({ tree, activeId, animationStates = ["collapsing",
 }
 
 /**
+ * Members whose subtree must be FOLDED: "a shelved tab's subtree is
+ * unfolded only while that tab's own row is on screen".
+ *
+ * A member keeps its row only while it is the active tab or an ancestor
+ * of it (mustShowTabs): the rest of the time the tab is hidden, and a
+ * hidden tab's children are still rendered by TST — the row of the
+ * parent is simply not there, so its children appear dangling under the
+ * shelf owner's row, attached to nothing (0.1.6 bug: activating an
+ * UNSHELVED sibling reclaimed the member's row without collapsing its
+ * subtree, because the collapse was only requested when another tab of
+ * the same shelf was selected).
+ *
+ * So the invariant is checked globally, not per selection event: every
+ * shelved tab with children that is unfolded and not in `mustShow` is a
+ * dangling member and must be collapsed by TST (its own animation then
+ * removes the children's rows before the parent's row goes away).
+ *
+ * @returns {number[]} ids to collapse, shelving-set order
+ */
+export function danglingMembers ({ tree, shelved, mustShow, }) {
+	const { hasChildIds, foldedIds, } = indexTree(tree);
+	const ids = [];
+	for (const id of shelved) {
+		if (!hasChildIds.has(id) || foldedIds.has(id)) { continue; }
+		if (mustShow.has(id)) { continue; }
+		ids.push(id);
+	}
+	return ids;
+}
+
+/**
  * Boot reconciliation (spec shelf-nesting): at most one selected tab per
  * shelf.  Returns the member ids to collapse — every member that has an
  * unfolded subtree but is not its shelf's selection.

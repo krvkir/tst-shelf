@@ -55,6 +55,11 @@ const TIMEOUT_S = Number(flag("--timeout", 150));
 const KEEP = argv.includes("--keep");
 const HEADED = argv.includes("--headed");
 const FIREFOX_BIN = flag("--bin", "/usr/bin/firefox");
+/** Path to a PATCHED Tree Style Tab xpi (tests/patch-tst.sh).  When set,
+ *  the fixture's sideloaded release build is removed and this one is
+ *  temporary-installed first — that is how the A3/B upstream patch is
+ *  exercised (discrete row heights, row-less tabs). */
+const TST_PATCH = flag("--tst", null) && path.resolve(flag("--tst", null));
 
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), "tst-shelf-e2e-"));
 const PREFS = path.join(SCRATCH, "prefs.js");
@@ -103,6 +108,13 @@ async function commandTry (marionette, name, fallbacks, params) {
 
 function prepareProfile () {
 	fs.cpSync(FIXTURE, SCRATCH, { recursive: true, });
+	if (TST_PATCH) {
+		// the patched build replaces the sideloaded one: same addon id, and
+		// a temporary install of it must not collide with a signed copy
+		const sideloaded = path.join(SCRATCH, "extensions", "treestyletab@piro.sakura.ne.jp.xpi");
+		fs.rmSync(sideloaded, { force: true, });
+		console.log(`[drive] patched TST mode: removed sideloaded release build`);
+	}
 	fs.appendFileSync(path.join(SCRATCH, "prefs.js"), `user_pref("marionette.port", ${PORT});\n`);
 }
 
@@ -231,29 +243,37 @@ const sidebarScript = String.raw`
 	});
 `;
 
-/** Conformance probe: TST's uniform-row law (the drop-zone guarantee).
- *  TST never measures painted rows — drop zones, virtual scroll and
- *  sticky all compute positions as itemSize * index over renderable
- *  items (scroll.js getItemRect).  Every rendered row must therefore
- *  sit exactly one rowH from its predecessor, and the first row must
- *  sit at the content origin.  Any per-row height deviation (a grown
- *  strap row, a negative-margin member row) breaks this — 0.1.1
- *  shipped that way and drops below every shelf landed as siblings. */
+/** Conformance probe: painted rows against TST's geometry model.
+ *  TST never measures painted rows: drop zones, virtual scroll and sticky all
+ *  derive positions from the tab model (scroll.js getItemRect).  The model's
+ *  contract is: every renderable row is an INTEGER number of one-line heights
+ *  (a stock TST allows only 1, the A3 patch allows N), the rows are laid out
+ *  contiguously, and the first row starts at the content origin.  Any painted
+ *  deviation — a grown strap row on a model that says one line (0.1.1) or a
+ *  zero-height member row — shifts every computed rect below it and makes
+ *  drop-overs resolve to the wrong position. */
 const conformanceScript = String.raw`
 	const container = document.querySelector("#normal-tabs-container");
 	const rows = [...container.querySelectorAll("tab-item[data-tab-id]")];
-	const plain = arguments[0] != null ? document.querySelector('tab-item[data-tab-id="' + arguments[0] + '"]') : null;
-	const rowH = plain ? plain.getBoundingClientRect().height : 0;
+	const heights = rows.map(row => Math.round(row.getBoundingClientRect().height * 10) / 10);
+	const rowH = heights.length ? Math.min(...heights) : 0;
 	const containerTop = container.getBoundingClientRect().top;
 	const scrollTop = container.scrollTop;
-	const drift = [];
 	const origin = containerTop - scrollTop;
+	const drift = [];
+	let previousBottom = null;
 	rows.forEach((row, index) => {
-		const paintedTop = row.getBoundingClientRect().top;
-		const expected = origin + index * rowH;
-		if (Math.abs(paintedTop - expected) > 1.5) {
-			drift.push({ id: row.dataset.tabId, index: index, painted: Math.round(paintedTop - containerTop), expected: Math.round(expected - containerTop) });
+		const rect = row.getBoundingClientRect();
+		// 1. the painted height must be an integer number of lines
+		const lines = rowH > 0 ? rect.height / rowH : 0;
+		if (rowH > 0 && Math.abs(lines - Math.round(lines)) > 0.05) {
+			drift.push({ id: row.dataset.tabId, index: index, reason: "height", height: heights[index], rowH: rowH });
 		}
+		// 2. rows must be contiguous: no gaps, no overlaps
+		if (previousBottom != null && Math.abs(rect.top - previousBottom) > 1.5) {
+			drift.push({ id: row.dataset.tabId, index: index, reason: "gap", top: Math.round(rect.top), previousBottom: Math.round(previousBottom) });
+		}
+		previousBottom = rect.bottom;
 	});
 	return JSON.stringify({ rows: rows.length, rowH: rowH, anchor: Math.abs((rows[0] ? rows[0].getBoundingClientRect().top : 0) - origin), drift: drift });
 `;
@@ -334,6 +354,142 @@ const strapGeometryScript = String.raw`
 	});
 `;
 
+/** Line-fitting probe: what does the engine report about a row whose extra
+ *  contents want more room than the row's pinned height?  Injects a wrapping
+ *  strap + a released cap, measures, then removes the injected style.  The
+ *  numbers decide how TST can round a row's height up to whole lines. */
+const lineProbeScript = String.raw`
+	const owner = arguments[0];
+	const row = document.querySelector('tab-item[data-tab-id="' + owner + '"]');
+	const read = label => {
+		const below = row.querySelector('.extra-items-container.below');
+		const strap = below && below.shadowRoot && below.shadowRoot.querySelector('[part~="shelf-strap"]');
+		const span = below && below.querySelector('.extra-item');
+		return {
+			label,
+			rowClient: row.clientHeight,
+			rowScroll: row.scrollHeight,
+			rowRect: Math.round(row.getBoundingClientRect().height * 10) / 10,
+			belowClient: below ? below.clientHeight : -1,
+			belowScroll: below ? below.scrollHeight : -1,
+			belowRect: below ? Math.round(below.getBoundingClientRect().height * 10) / 10 : -1,
+			spanRect: span ? Math.round(span.getBoundingClientRect().height * 10) / 10 : -1,
+			strapRect: strap ? Math.round(strap.getBoundingClientRect().height * 10) / 10 : -1,
+			strapScroll: strap ? strap.scrollHeight : -1,
+			strapColumns: strap ? getComputedStyle(strap).gridTemplateColumns : '',
+		};
+	};
+	const before = read('pinned-1-line');
+	const template = row.querySelector('.extra-items-container.below').shadowRoot.querySelector('[part~="shelf-icon"]');
+	const clones = [];
+	for (let i = 0; i < 12 && template; i++) {
+		const clone = template.cloneNode(true);
+		template.parentNode.appendChild(clone);
+		clones.push(clone);
+	}
+	const style = document.createElement('style');
+	style.textContent = 'tab-item.tst-shelf-owner .extra-items-container.below { max-height: none !important; }'
+		+ 'tab-item.tst-shelf-owner .extra-items-container.below::part(shelf-strap) { flex-wrap: wrap !important; overflow: visible !important; }';
+	document.documentElement.appendChild(style);
+	const after = read('released-wrap');
+	for (const clone of clones) { clone.parentNode.removeChild(clone); }
+	style.remove();
+	return JSON.stringify({ before, after, });
+`;
+
+/** Calls tst-shelf's internal test API from the tab-hosted sidebar page.
+ *  Cross-extension runtime messaging works from any extension page, so the
+ *  driver can drive the addon without a second page. */
+const shelfCallScript = String.raw`
+	return (async () => {
+		const response = await browser.runtime.sendMessage("tst-shelf@example.com", arguments[0]);
+		return JSON.stringify(response);
+	})();
+`;
+
+/** Row metrics of one tab plus TST's computed scroll extent.  The extent is
+ *  the virtual-scroll container's min-height, i.e. exactly
+ *  `totalRenderableItemsSize` from sidebar/scroll.js — the expression the
+ *  A3 patch generalizes.  It is only set when the tab bar overflows, so the
+ *  driver shrinks the window first. */
+const extentScript = String.raw`
+	const ownerId = arguments[0];
+	const plainId = arguments[1];
+	const container = document.querySelector('#normal-tabs-container');
+	const scroller = container.querySelector('.virtual-scroll-container');
+	const rect = id => {
+		const row = document.querySelector('tab-item[data-tab-id="' + id + '"]');
+		return row ? Math.round(row.getBoundingClientRect().height * 10) / 10 : -1;
+	};
+	const top = id => {
+		const row = document.querySelector('tab-item[data-tab-id="' + id + '"]');
+		return row ? Math.round(row.getBoundingClientRect().top) : -1;
+	};
+	const rowList = [...container.querySelectorAll('tab-item[data-tab-id]')].map(row => ({
+		id: row.dataset.tabId,
+		top: Math.round(row.getBoundingClientRect().top),
+		height: Math.round(row.getBoundingClientRect().height),
+	}));
+	const lastTop = rowList.length ? rowList[rowList.length - 1].top : -1;
+	const below = document.querySelector('tab-item[data-tab-id="' + ownerId + '"] .extra-items-container.below');
+	const root = below && below.shadowRoot;
+	const strap = root && root.querySelector('[part~="shelf-strap"]');
+	return JSON.stringify({
+		minHeight: Math.round((parseFloat(getComputedStyle(scroller).minHeight) || 0) * 10) / 10,
+		ownerHeight: rect(ownerId),
+		rowList, lastTop,
+		ownerStyleVar: (document.querySelector('tab-item[data-tab-id="' + ownerId + '"]').style.getPropertyValue('--tab-lines') || '(unset)'),
+		ownerComputedHeight: getComputedStyle(document.querySelector('tab-item[data-tab-id="' + ownerId + '"]')).height,
+		tabSize: getComputedStyle(document.querySelector('tab-item[data-tab-id="' + ownerId + '"]')).getPropertyValue('--tab-size'),
+		ownerClasses: [...document.querySelector('tab-item[data-tab-id="' + ownerId + '"]').classList].join(','),
+		plainHeight: rect(plainId),
+		plainTop: top(plainId),
+		strapHeight: strap ? Math.round(strap.getBoundingClientRect().height) : -1,
+		rows: container.querySelectorAll('tab-item[data-tab-id]').length,
+		ids: [...container.querySelectorAll('tab-item[data-tab-id]')].map(row => row.dataset.tabId).join(","),
+		viewport: Math.round(innerWidth) + 'x' + Math.round(innerHeight),
+		scrollTopMax: Math.round((container.scrollTopMax || 0) * 10) / 10,
+	});
+`;
+
+/** Crowded-shelf probe: the strap's icons against its own box, plus the row
+ *  height.  "All icons visible, no horizontal scroll" is the requirement for
+ *  the extend layout. */
+const shelfFitScript = String.raw`
+	const owner = arguments[0];
+	const row = document.querySelector('tab-item[data-tab-id="' + owner + '"]');
+	const below = row && row.querySelector('.extra-items-container.below');
+	const strap = below && below.shadowRoot && below.shadowRoot.querySelector('[part~="shelf-strap"]');
+	if (!strap) { return JSON.stringify({ missing: true, }); }
+	const box = strap.getBoundingClientRect();
+	const icons = [...strap.querySelectorAll('[part~="shelf-icon"]')].map(icon => {
+		const rect = icon.getBoundingClientRect();
+		return { right: Math.round(rect.right), bottom: Math.round(rect.bottom), width: Math.round(rect.width), height: Math.round(rect.height), };
+	});
+	return JSON.stringify({
+		rowHeight: Math.round(row.getBoundingClientRect().height),
+		rowWidth: Math.round(row.getBoundingClientRect().width),
+		icons: icons.length,
+		scrolls: strap.scrollWidth > strap.clientWidth + 1,
+		overflowX: getComputedStyle(strap).overflowX,
+		display: getComputedStyle(strap).display,
+		strapHeight: Math.round(box.height),
+		strapWidth: Math.round(box.width),
+		allInside: icons.every(icon => icon.right <= Math.round(box.right) + 1 && icon.bottom <= Math.round(box.bottom) + 1),
+		rows: new Set(icons.map(icon => icon.bottom)).size,
+	});
+`;
+
+/** Row + browser visibility of one tab, read from the sidebar page. */
+const rowlessProbeScript = String.raw`
+	const id = arguments[0];
+	return (async () => {
+		const row = document.querySelector('tab-item[data-tab-id="' + id + '"]');
+		const tab = await browser.tabs.get(id);
+		return JSON.stringify({ hasRow: !!row, hidden: tab.hidden, active: tab.active, });
+	})();
+`;
+
 /** Frame sampler: records, once per animation frame, where a marker row
  *  sits and how many rows exist.  Starting it before a shelf-tab switch
  *  and reading it afterwards yields the tree's motion in pixels — the
@@ -363,6 +519,37 @@ const sampleStartScript = String.raw`
 
 const sampleReadScript = String.raw`
 	return JSON.stringify(window.__shelfSamples || []);
+`;
+
+/** The sidebar page URL of an installed extension, by addon id.  Works for
+ *  temporary installs, whose UUID is never written to prefs.js. */
+const sidebarUrlScript = String.raw`
+	const id = arguments[0];
+	const policy = WebExtensionPolicy.getByID(id);
+	return policy ? policy.getURL("sidebar/sidebar.html") : null;
+`;
+
+/** Activates a tab the way a user click does.  Runs in the tab-hosted
+ *  TST sidebar page: it is a WebExtension page (TST holds the `tabs`
+ *  permission), so browser.tabs.update is available from content
+ *  context — chrome-context XULTab.id is NOT the WebExtension id.
+ *  Used for the path that left a dangling subtree in 0.1.6: switching to
+ *  a tab that is NOT on a shelf, so no shelf-selection event happens. */
+const activateScript = String.raw`
+	const tabId = arguments[0];
+	return (async () => {
+		await browser.tabs.update(tabId, { active: true, });
+		return "activated " + tabId;
+	})();
+`;
+
+/** Which of the given tab ids currently have a rendered row. */
+const rowPresenceScript = String.raw`
+	const out = {};
+	for (const id of arguments[0]) {
+		out[id] = !!document.querySelector('tab-item[data-tab-id="' + id + '"]');
+	}
+	return JSON.stringify(out);
 `;
 
 /** Model probe: dumps every tab's states from the TST background. */
@@ -422,6 +609,12 @@ async function main () {
 		});
 		console.log(`[drive] console mirror: ${JSON.stringify(mirror?.value ?? mirror)}`);
 
+		if (TST_PATCH) {
+			const tstInstall = await marionette.command("Addon:Install", {
+				path: TST_PATCH, temporary: true,
+			});
+			console.log(`[drive] temporary install (patched TST): ${JSON.stringify(tstInstall?.value ?? tstInstall)}`);
+		}
 		const install = await marionette.command("Addon:Install", {
 			path: DIST, temporary: true, allowPrivateBrowsing: false,
 		});
@@ -443,16 +636,26 @@ async function main () {
 
 		// -- phase 2: sidebar DOM assertions + synthetic clicks ------------
 		if (windowId != null) {
-			let uuid = null;
-			for (let i = 0; i < 40 && !uuid; i++) {
-				uuid = readTstUuid(PREFS);
-				if (!uuid) { await new Promise(resolve => setTimeout(resolve, 500)); }
+			// A temporary install never reaches prefs.js, so ask the policy
+			// registry for the sidebar URL and fall back to the sideloaded
+			// UUID only if that fails.
+			let baseUrl = null;
+			for (let i = 0; i < 40 && !baseUrl; i++) {
+				const url = await marionette.command("Marionette:SetContext", { value: "chrome", })
+					.then(() => marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarUrlScript, args: ["treestyletab@piro.sakura.ne.jp",], newSandbox: false,
+					}))
+					.then(response => response && response.value, () => null);
+				const uuid = readTstUuid(PREFS);
+				baseUrl = url || (uuid ? `moz-extension://${uuid}/sidebar/sidebar.html` : null);
+				if (!baseUrl) { await new Promise(resolve => setTimeout(resolve, 500)); }
 			}
-			if (!uuid) {
-				console.log("FAIL [driver] TST uuid readable from prefs");
+			await marionette.command("Marionette:SetContext", { value: "content", }).catch(() => {});
+			if (!baseUrl) {
+				console.log("FAIL [driver] TST sidebar URL resolvable");
 				process.exitCode = process.exitCode || 1;
 			} else {
-				const pageUrl = `moz-extension://${uuid}/sidebar/sidebar.html?windowId=${windowId}`;
+				const pageUrl = `${baseUrl}?windowId=${windowId}`;
 				console.log(`[drive] phase 2: opening ${pageUrl}`);
 				await marionette.command("Marionette:SetContext", { value: "content", });
 				try {
@@ -586,6 +789,102 @@ async function main () {
 						}
 					}
 					{
+						const probe = await marionette.command("WebDriver:ExecuteScript", {
+							script: lineProbeScript, args: [e.owner,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] line probe failed: ${error.message}`); return null; });
+						console.log(`[drive] line probe: ${probe && probe.value}`);
+					}
+					if (TST_PATCH) {
+						// -- A3: a row can be N whole lines, and the geometry
+						// accounts for it exactly.  The addon declares the count
+						// (`lines` on set-extra-contents); TST makes the row that
+						// tall and computes every position from a sum of pitches.
+						// Measured at 1 line and at 3: the row must be 3 pitches
+						// tall and TST's computed extent must grow by exactly two.
+						const call = async message => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: shelfCallScript, args: [message,], newSandbox: false,
+							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+							return response && response.value ? JSON.parse(response.value) : null;
+						};
+						const readExtent = async () => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: extentScript, args: [e.owner, e.plain,], newSandbox: false,
+							}).catch(() => null);
+							return response && response.value ? JSON.parse(response.value) : null;
+						};
+						// the extent is only materialized while the tab bar overflows
+						await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 220, }).catch(() => {});
+						await new Promise(resolve => setTimeout(resolve, 1200));
+						await call({ type: "test:lines", owner: e.owner, lines: 1, windowId, });
+						await new Promise(resolve => setTimeout(resolve, 1200));
+						const one = await readExtent();
+						await call({ type: "test:lines", owner: e.owner, lines: 3, windowId, });
+						await new Promise(resolve => setTimeout(resolve, 1200));
+						const three = await readExtent();
+						console.log(`[drive] A3 one line: ${JSON.stringify(one)}`);
+						console.log(`[drive] A3 three lines: ${JSON.stringify(three)}`);
+						const rendered = (one && one.rowList) || [];
+						const pitch = rendered.length
+							? rendered.map(row => row.height).sort((a, b) => a - b)[0]
+							: 0;
+						const rowGrew = one && three && pitch > 0
+							&& Math.abs(one.ownerHeight - pitch) <= 2
+							&& Math.abs(three.ownerHeight - 3 * pitch) <= 2;
+						console.log(`${rowGrew ? "PASS" : "FAIL"} [driver] A3: a row of N declared lines paints N lines (1 line=${one && one.ownerHeight}, 3 lines=${three && three.ownerHeight}, pitch=${pitch})`);
+						if (!rowGrew) { process.exitCode = process.exitCode || 1; }
+						const extentGrew = one && three && pitch > 0 && one.minHeight > 0
+							&& Math.abs((three.minHeight - one.minHeight) - 2 * pitch) <= 2;
+						console.log(`${extentGrew ? "PASS" : "FAIL"} [driver] A3: TST's computed scroll extent grows by exactly the extra lines (${one && one.minHeight} -> ${three && three.minHeight}, pitch=${pitch})`);
+						if (!extentGrew) { process.exitCode = process.exitCode || 1; }
+						// the row that follows the grown one must start exactly where
+						// the grown row ends: painted flow and computed geometry agree
+						const ownerTop = three && (three.rowList.find(row => row.id == String(e.owner)) || {}).top;
+						const follower = three && three.rowList.find(row => row.id != String(e.owner));
+						const contiguous = three && ownerTop != null && follower
+							&& Math.abs(follower.top - (ownerTop + three.ownerHeight)) <= 2;
+						console.log(`${contiguous ? "PASS" : "FAIL"} [driver] A3: the next row starts exactly where the grown row ends (owner=${ownerTop}+${three && three.ownerHeight}, next=${follower && follower.top})`);
+						if (!contiguous) { process.exitCode = process.exitCode || 1; }
+						// restore: the addon's own computation, tall window
+						await call({ type: "test:lines", owner: e.owner, lines: 0, windowId, });
+						await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 900, }).catch(() => {});
+						await new Promise(resolve => setTimeout(resolve, 1500));
+					}
+					{
+						// -- B: a row-less tab keeps the tab but loses its row.
+						// This is the capability feature 1 of 0.2.0 needs; a stock
+						// TST ignores the state and keeps the row (that is the
+						// documented fallback).  Read it on a PLAIN tab, so the
+						// answer is not confused with our own hiding of members.
+						const call = async message => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: shelfCallScript, args: [message,], newSandbox: false,
+							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+							return response && response.value ? JSON.parse(response.value) : null;
+						};
+						const probe = async () => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: rowlessProbeScript, args: [e.plain,], newSandbox: false,
+							}).catch(() => null);
+							return response && response.value ? JSON.parse(response.value) : null;
+						};
+						const before = await probe();
+						await call({ type: "test:tab-state", tabId: e.plain, state: "row-less", windowId, });
+						await new Promise(resolve => setTimeout(resolve, 1500));
+						const during = await probe();
+						await call({ type: "test:tab-state", tabId: e.plain, state: "row-less", add: false, windowId, });
+						await new Promise(resolve => setTimeout(resolve, 1500));
+						const after = await probe();
+						console.log(`[drive] row-less probe: ${JSON.stringify({ before, during, after, patched: !!TST_PATCH })}`);
+						const lostRow = TST_PATCH ? (during && !during.hasRow) : (during && during.hasRow);
+						const stayedVisible = during && during.hidden === false;
+						const restored = after && after.hasRow;
+						console.log(`${lostRow && stayedVisible ? "PASS" : "FAIL"} [driver] ${TST_PATCH ? "B: a row-less tab loses its row while staying visible" : "B fallback: a stock TST ignores row-less and keeps the row"} (hasRow=${during && during.hasRow} hidden=${during && during.hidden})`);
+						if (!(lostRow && stayedVisible)) { process.exitCode = process.exitCode || 1; }
+						console.log(`${restored ? "PASS" : "FAIL"} [driver] clearing row-less brings the row back`);
+						if (!restored) { process.exitCode = process.exitCode || 1; }
+					}
+					{
 						const conformance = await marionette.command("WebDriver:ExecuteScript", {
 							script: conformanceScript, args: [e.plain,], newSandbox: false,
 						}).catch(error => { console.log(`[drive] conformance probe failed: ${error.message}`); return null; });
@@ -702,6 +1001,69 @@ async function main () {
 						process.exitCode = process.exitCode || 1;
 					}
 
+					const readSamples = async label => {
+						const read = await marionette.command("WebDriver:ExecuteScript", {
+							script: sampleReadScript, args: [], newSandbox: false,
+						}).catch(error => { console.log(`[drive] sampler read failed: ${error.message}`); return null; });
+						const samples = read && read.value ? JSON.parse(read.value) : [];
+						const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
+						console.log(`[drive] ${label} trail: tops=${JSON.stringify([...new Set(tops)])} frames=${samples.length}`);
+						return samples;
+					};
+
+					// -- 0.1.7: an UNSHELVED sibling takes the row AND the subtree
+					// C is active and unfolded (c1/c2 are rows).  D is a plain
+					// sibling, not on the shelf, so NO shelf-selection event
+					// happens: the member's row is reclaimed by the activation
+					// path alone.  0.1.6 reclaimed the row and left the children
+					// painted under a parent row that no longer existed
+					// (user-reported).  The subtree must fold FIRST, so that no
+					// frame ever shows a child without its parent.
+					console.log("[drive] phase 2: sampling while the plain sibling D is activated");
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
+					}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 120));
+					const activated = await marionette.command("WebDriver:ExecuteScript", {
+						script: activateScript, args: [e.plain,], newSandbox: false,
+					}).catch(error => { console.log(`[drive] activation failed: ${error.message}`); return null; });
+					console.log(`[drive] activate D: ${JSON.stringify(activated && activated.value)}`);
+					await new Promise(resolve => setTimeout(resolve, 3000));
+					{
+						const samples = await readSamples("plain sibling");
+						const parents = { [e.children[0]]: e.clickFirst, [e.children[1]]: e.clickFirst, };
+						const orphans = samples.filter(sample => {
+							const ids = String(sample.ids || "").split(",").filter(Boolean);
+							return Object.keys(parents).some(child => ids.includes(String(child)) && !ids.includes(String(parents[child])));
+						});
+						const startIds = String((samples[0] || {}).ids || "").split(",").filter(Boolean);
+						const startedWithMember = startIds.includes(String(e.clickFirst));
+						if (!startedWithMember) {
+							console.log(`FAIL [driver] sampling starts with the member's row on screen (start=${JSON.stringify(startIds)})`);
+							process.exitCode = process.exitCode || 1;
+						}
+						if (samples.length >= 30 && orphans.length == 0 && startedWithMember) {
+							console.log("PASS [driver] an unshelved sibling reclaims the member's row without orphaning its subtree");
+						} else {
+							console.log(`FAIL [driver] an unshelved sibling reclaims the member's row without orphaning its subtree (${orphans.length} orphan frames of ${samples.length}: ${JSON.stringify(orphans.slice(0, 3))})`);
+							process.exitCode = process.exitCode || 1;
+						}
+						const presence = await marionette.command("WebDriver:ExecuteScript", {
+							script: rowPresenceScript,
+							args: [[e.clickFirst, e.children[0], e.children[1], e.plain,],],
+							newSandbox: false,
+						}).catch(() => null);
+						const rows = presence && presence.value ? JSON.parse(presence.value) : null;
+						const gone = rows && !rows[e.clickFirst] && !rows[e.children[0]] && !rows[e.children[1]];
+						const siblingShown = rows && rows[e.plain];
+						if (gone && siblingShown) {
+							console.log(`PASS [driver] the member's row and its whole subtree are gone after the switch (${JSON.stringify(rows)})`);
+						} else {
+							console.log(`FAIL [driver] the member's row and its whole subtree are gone after the switch (${JSON.stringify(rows)})`);
+							process.exitCode = process.exitCode || 1;
+						}
+					}
+
 					// -- switching between shelf tabs must not move the tree
 					// C is active and unfolded (its two children are rows);
 					// the plain sibling D is the marker below the shelf.
@@ -722,15 +1084,6 @@ async function main () {
 						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
 					}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
 					await new Promise(resolve => setTimeout(resolve, 2600));
-					const readSamples = async label => {
-						const read = await marionette.command("WebDriver:ExecuteScript", {
-							script: sampleReadScript, args: [], newSandbox: false,
-						}).catch(error => { console.log(`[drive] sampler read failed: ${error.message}`); return null; });
-						const samples = read && read.value ? JSON.parse(read.value) : [];
-						const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
-						console.log(`[drive] ${label} trail: tops=${JSON.stringify([...new Set(tops)])} frames=${samples.length}`);
-						return samples;
-					};
 					{
 						const samples = await readSamples("switch");
 						// (1) orphan check: no frame where a child's row exists
@@ -851,13 +1204,85 @@ async function main () {
 							console.log(`FAIL [driver] activating a tab of a nested shelf keeps that shelf's owner visible (owner=${JSON.stringify(row)})`);
 							process.exitCode = process.exitCode || 1;
 						}
-						if (activeRow) {
-							console.log("PASS [driver] the activated nested member has a row of its own");
+						// A CHILDLESS member is row-less on a TST with the B
+						// capability (feature 1): activating it must NOT produce a
+						// row — that is what removes the reveal/row-swap flicker.
+						// On a stock TST the member is hidden by us and Firefox
+						// reveals it, so it does get a row.
+						const expectRow = !TST_PATCH;
+						const asExpected = !!activeRow === expectRow;
+						console.log(`${asExpected ? "PASS" : "FAIL"} [driver] ${expectRow ? "the activated nested member has a row (hidden-tab fallback)" : "a row-less member gets no row even while active"} (hasRow=${!!activeRow})`);
+						if (!asExpected) { process.exitCode = process.exitCode || 1; }
+					}
+					// -- crowded shelf: grow the row in whole lines instead of
+					// scrolling, so every icon stays visible (0.2.0 "extend").
+					// One more member is put on A's shelf while it is ACTIVE —
+					// a childless member is row-less, so its own row must not
+					// appear even though it is the selected tab.
+					if (TST_PATCH) {
+						const call = async message => {
+							const response = await marionette.command("WebDriver:ExecuteScript", {
+								script: shelfCallScript, args: [message,], newSandbox: false,
+							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+							return response && response.value ? JSON.parse(response.value) : null;
+						};
+						const stateBefore = await call({ type: "test:state", });
+						const width = stateBefore && stateBefore.widths && (stateBefore.widths.find(([id]) => id == windowId) || [])[1];
+						await call({ type: "test:put", tabId: e.plain, });
+						// the member is childless, so it must be row-less — and it
+						// must STAY row-less while it is the active tab
+						await marionette.command("WebDriver:ExecuteScript", {
+							script: activateScript, args: [e.plain,], newSandbox: false,
+						}).catch(error => console.log(`[drive] activation failed: ${error.message}`));
+						await new Promise(resolve => setTimeout(resolve, 2500));
+						const grown = await call({ type: "test:state", });
+						const linesOf = state => {
+							const entry = state && state.lines && state.lines.find(([id]) => id == windowId);
+							const map = entry && new Map(entry[1]);
+							return map ? (map.get("root") || null, map.get(String(e.owner)) || map.get(e.owner)) : null;
+						};
+						const expectedLines = linesOf(grown);
+						const fit = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfFitScript, args: [e.owner,], newSandbox: false,
+						}).catch(() => null);
+						const f = fit && fit.value ? JSON.parse(fit.value) : null;
+						const pitch = f && f.icons > 0 ? 39 : 0;
+						console.log(`[drive] crowded shelf: width=${width} lines=${expectedLines} fit=${JSON.stringify(f)}`);
+						const grewLines = expectedLines > 1;
+						const tallRow = f && pitch > 0 && Math.abs(f.rowHeight - expectedLines * pitch) <= 2;
+						const allVisible = f && !f.scrolls && f.allInside;
+						const stacked = f && f.rows === expectedLines;
+						console.log(`${grewLines ? "PASS" : "FAIL"} [driver] a crowded shelf asks for more than one line (lines=${expectedLines}, width=${width})`);
+						console.log(`${tallRow ? "PASS" : "FAIL"} [driver] the crowded shelf's row is exactly that many lines (row=${f && f.rowHeight} lines=${expectedLines})`);
+						console.log(`${stacked ? "PASS" : "FAIL"} [driver] the icons are laid out in that many rows (rows=${f && f.rows})`);
+						console.log(`${allVisible ? "PASS" : "FAIL"} [driver] every icon is visible without horizontal scrolling (icons=${f && f.icons} scrolls=${f && f.scrolls})`);
+						if (!(grewLines && tallRow && stacked && allVisible)) { process.exitCode = process.exitCode || 1; }
+						// the member we just put on the shelf is ACTIVE and has no
+						// children: it must be row-less, i.e. no row, not hidden
+						const presence = await marionette.command("WebDriver:ExecuteScript", {
+							script: rowPresenceScript, args: [[e.plain,],], newSandbox: false,
+						}).catch(() => null);
+						const rows = presence && presence.value ? JSON.parse(presence.value) : null;
+						const live = await marionette.command("WebDriver:ExecuteScript", {
+							script: rowlessProbeScript, args: [e.plain,], newSandbox: false,
+						}).catch(() => null);
+						const info = live && live.value ? JSON.parse(live.value) : null;
+						if (rows && rows[e.plain] === false && info && info.hidden === false && info.active === true) {
+							console.log("PASS [driver] an ACTIVE childless member has no row and is not hidden");
 						} else {
-							console.log("FAIL [driver] the activated nested member has a row of its own");
+							console.log(`FAIL [driver] an ACTIVE childless member has no row and is not hidden (${JSON.stringify({ rows, info })})`);
 							process.exitCode = process.exitCode || 1;
 						}
+						await call({ type: "test:take", tabId: e.plain, });
+						await new Promise(resolve => setTimeout(resolve, 2000));
+						const back = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfFitScript, args: [e.owner,], newSandbox: false,
+						}).catch(() => null);
+						const b = back && back.value ? JSON.parse(back.value) : null;
+						console.log(`${b && b.rowHeight <= pitch + 2 ? "PASS" : "FAIL"} [driver] taking it off the shelf returns the row to one line (row=${b && b.rowHeight})`);
+						if (!(b && b.rowHeight <= pitch + 2)) { process.exitCode = process.exitCode || 1; }
 					}
+
 					// leave C folded again: phase 3 asserts that TST's native
 					// fold state survives the reinstall
 					await marionette.command("WebDriver:ExecuteScript", {
