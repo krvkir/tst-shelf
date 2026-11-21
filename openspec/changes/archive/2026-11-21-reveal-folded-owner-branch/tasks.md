@@ -34,7 +34,7 @@
 - [x] 4.1 spec delta on `shelf-nesting`
 - [x] 4.2 design notes with the measured fold-marker trap
 - [x] 4.3 README caveat
-- [ ] 4.4 upstream: mention the reveal rule in the row-geometry proposal (a helper-facing note, no API change needed)
+- [x] 4.4 upstream: mention the reveal rule in the row-geometry proposal (a helper-facing note, no API change needed). Resolution: superseded — the row-geometry proposal was deleted together with the patched-TST support (remove-companion-patch, task 7.3).
 
 ## 5. Stock-companion support (0.2.2)
 

@@ -1,5 +1,8 @@
-## ADDED Requirements
+# shelf-presentation Specification
 
+## Purpose
+TBD - created by archiving change add-shelf-foundation. Update Purpose after archive.
+## Requirements
 ### Requirement: A shelf lives inside its owner's row
 The extension SHALL render a shelf's icons inside the shelf owner's own tab row, on the opposite side of the caption, so that a shelf costs no vertical space beyond the row TST already renders for the owner. Shelved tabs SHALL NOT get rows of their own; the extension removes them from the tab strip through the browser's tab-hiding API.
 
@@ -11,10 +14,6 @@ The extension SHALL render a shelf's icons inside the shelf owner's own tab row,
 #### Scenario: The owner's row keeps its normal height
 - **WHEN** a parent holds a shelf with any number of icons
 - **THEN** the owner's row renders at the same height as any plain tab row
-
-#### Scenario: A shelf costs exactly one line
-- **WHEN** a parent with children holds a shelf of ten tabs
-- **THEN** the tree shows the owner's row and the owner's non-shelved children, with no blank rows where the shelved tabs used to be
 
 ### Requirement: Shelved tabs are hidden from the tab strip
 The extension SHALL keep every shelved tab hidden through the browser's tab-hiding API, and SHALL show it again when it leaves the shelf or when the browser refuses to keep it hidden. The hidden state the extension applies SHALL be distinguishable from a hidden state applied by another extension, so that the shelf still lists its own tabs while leaving tabs filtered out by another extension unlisted.
@@ -205,3 +204,4 @@ The extension SHALL show a shelf icon exactly while its tab is not filtered out 
 #### Scenario: A fully filtered-out shelf closes its space
 - **WHEN** workspace filtering hides every tab of a shelf
 - **THEN** the shelf renders no strap at all
+

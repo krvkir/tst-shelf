@@ -198,11 +198,14 @@
 - [x] 7c.3 Upgrade path: one-shot `clearLegacyStraps` clears 0.1.2's
   owner/ghost-row straps (TST keeps extra contents per addon+tab
   across addon updates).
-- [ ] 7c.4 Follow-up: per-line icon slicing for shelves wider than
+- [x] 7c.4 Follow-up: per-line icon slicing for shelves wider than
   one line — currently wrapped lines spill across member rows, which
   stays inside the shelf's space but reserves one row per member;
   slicing needs the sidebar width, which a background page cannot
   know (the width-blocked F2 paging variant, design.md 0.1.3 notes).
+  Resolution: dropped — multi-line shelves were rejected with the
+  patched-TST support (remove-companion-patch); the single-line
+  scrolling strap is the only form.
 
 ## 8. Packaging
 
@@ -236,14 +239,20 @@
 - [x] 7d.5 E2E: owner row carries the strap; member rows absent; 2/3
   cap; horizontal scroll; title truncation under a full shelf; row
   height unchanged; children directly below the owner row.
-- [ ] 7d.6 Follow-up: scroll a long shelf with the mouse wheel without
+- [x] 7d.6 Follow-up: scroll a long shelf with the mouse wheel without
   shift (needs a wheel listener on the strap; TST's own wheel handler
   leaves the row area alone, so this is ours to add).
-- [ ] 7d.7 Follow-up: `renderHiddenTabs` interplay. When the user
+  Resolution: dropped — horizontal scroll (shift+wheel, trackpad) is
+  enough.
+- [x] 7d.7 Follow-up: `renderHiddenTabs` interplay. When the user
   enables TST's expert "show hidden tabs" option, member rows come
   back and the shelf loses its compaction (geometry stays correct —
   the rows are counted and painted at full height). Detect the option
   and fall back to a visible warning / blank-row mode.
+  Resolution: dropped the detection mode — the limitation is
+  documented in the README caveats, and the "A shelf costs exactly one
+  line" scenario was removed in favour of the owner-row placement
+  requirement ("A shelf lives inside its owner's row").
 
 ## 7e. v0.1.5 shelf width and the reveal invariant
 
@@ -258,9 +267,13 @@
   120 ms debounce (measured 37 ms vs 150 ms).
 - [x] 7e.4 Characterization tests for the browser invariant: activating
   a hidden tab reveals it, and `tabs.hide([activeId])` is a no-op.
-- [ ] 7e.5 Blocked by the browser: a childless member cannot stay
+- [x] 7e.5 Blocked by the browser: a childless member cannot stay
   row-less while it is the active tab (see design.md 0.1.5). Revisit if
   Firefox ever allows hiding the selected tab.
+  Resolution: dropped — Firefox reveals an activated hidden tab and
+  refuses to hide it again; the spec keeps the row for the active tab
+  ("The active tab and its ancestors always keep their rows") instead
+  of fighting the browser.
 
 ## 7f. v0.1.6 rows that must not be reclaimed
 
@@ -279,6 +292,9 @@
 - [x] 7f.6 E2E: frame sampler asserts no orphaned children and a
   two-frame displacement budget for a childless↔childless swap; nested
   shelf case (owner stays visible with its strap) covered.
-- [ ] 7f.7 Blocked by the platform: an atomic row swap. Both the reveal
+- [x] 7f.7 Blocked by the platform: an atomic row swap. Both the reveal
   (browser-driven) and the hide (our API call) would have to land in one
   sidebar frame; there is no batched tab-visibility API.
+  Resolution: dropped — the spec's bar is the frame-budget
+  displacement, which 7f.6 asserts and 7f.3 measured (0–34 ms);
+  atomicity was a stronger ideal the spec never demanded.

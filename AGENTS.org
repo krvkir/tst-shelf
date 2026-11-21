@@ -24,7 +24,7 @@ Target platform: stock Tree Style Tab 4.x from AMO, Firefox 115+.
 - =build.mjs= :: esbuild bundle of =src/background/index.esm.js= into one IIFE (=firefox115= target) plus static-asset copy; =E2E=1= produces the test flavor.
 - =scripts/verify-dist.mjs= :: Release gate over a built tree: required files present, no test-only file, no =-e2e= version, no =downloads= permission, no unexpected file.
 - =Makefile= :: Build, test, perf, E2E and release targets. =.NOTPARALLEL:= because =dist/= is shared.
-- =openspec/= :: =project.md= (glossary and invariants), =changes/= (three changes: =add-shelf-foundation= 49/54 tasks, =reveal-folded-owner-branch= 33/34, =remove-companion-patch= complete), =specs/= (empty until changes are archived; the delta specs are the contract).
+- =openspec/= :: =project.md= (glossary and invariants), =changes/= (empty; the three merged changes live under =changes/archive/2026-11-21-*=), =specs/= (four capabilities, 34 requirements — the contract).
 - =README.md= :: User-facing documentation, caveats measured in E2E, and the implementation notes verified against TST 4.4.10.
 - =ideas.org= :: the user's backlog of shelf refinements (favicon fallback, shelf drag-reorder, keyboard shortcuts, tab-count badge, sound indicator).
 - =2026-11-21-*.org= :: LLM session notebooks and the 0.2.3 audit. History, not contract.
@@ -51,7 +51,7 @@ Consequences that constrain every change:
 - =#dummy-tab .extra-items-container.below { display: none }= is load-bearing: the dummy tab mirrors the latest extra contents, and without that rule every row in the tree inflates.
 
 * Development Approach
-1. *Read the contract first.* =openspec/project.md= fixes the vocabulary (shelved, shelf owner, selected shelf tab, root shelf); the delta specs under =openspec/changes/*/specs/= fix the behaviour. Requirements and GIVEN/WHEN/THEN scenarios win over code comments.
+1. *Read the contract first.* =openspec/project.md= fixes the vocabulary (shelved, shelf owner, selected shelf tab, root shelf); the requirement specs under =openspec/specs/= fix the behaviour. Requirements and GIVEN/WHEN/THEN scenarios win over code comments.
 2. *Keep derivation pure.* Anything computable from =(tree, shelved, tabsById, hiddenByUs)= belongs in =logic.esm.js= and gets a unit test. =index.esm.js= does I/O and orchestration only.
 3. *Derive, do not remember.* A new piece of runtime state needs a boot-release or a derivation path before it can hold a tab's visibility.
 4. *Re-derive, do not patch incrementally.* Every structural event schedules the same whole-window, idempotent pass; special-casing one event type is how dangling rows and stale decisions appear.

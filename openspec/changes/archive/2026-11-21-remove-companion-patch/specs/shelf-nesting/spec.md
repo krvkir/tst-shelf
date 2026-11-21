@@ -1,4 +1,4 @@
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: A member's row is absent unless it anchors an expanded subtree
 A shelved tab SHALL have a row while it is the active tab or an ancestor of
@@ -21,9 +21,11 @@ up again once its subtree has folded.
 - **WHEN** a childless tab is put on a shelf and is not the active tab
 - **THEN** its row is gone and its shelf icon is its whole presentation
 
-#### Scenario: A childless member keeps no row while it is active
+#### Scenario: Firefox itself returns the row of an activated childless member
 - **WHEN** the user activates a childless shelved tab by its shelf icon
 - **THEN** Firefox reveals the hidden tab, so the row comes back for as long as it stays active, and no other row appears
+
+## MODIFIED Requirements
 
 ### Requirement: A folded shelf owner reveals only the activated tab's branch
 Activating a tab inside a folded shelf owner SHALL make that owner's subtree
@@ -75,17 +77,6 @@ if the browser stopped while a reveal was running.
 - **THEN** that tab is not treated as a shelved tab whose icon must stay on a shelf, and it is not shown again by the member reconcile
 
 ## REMOVED Requirements
-
-### Requirement: Hiding remains the fallback presentation
-**Reason**: It described hiding as the alternative to the `row-less` state.
-Hiding is now the only presentation, so this requirement is satisfied by "A
-member's row is absent unless it anchors an expanded subtree" above and by
-"Shelved tabs are hidden from the tab strip" (`shelf-presentation`,
-`add-shelf-foundation`).
-
-**Migration**: No action. The rule that the active tab and every ancestor of
-it always keep their rows is unchanged, and is required by "The active tab and
-its ancestors always keep their rows".
 
 ### Requirement: A failed row removal is retried against observed reality
 **Reason**: The retry existed because a `row-less` state lives in TST's own

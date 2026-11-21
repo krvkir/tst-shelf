@@ -47,14 +47,25 @@ them. Vanilla TST is the only target that can actually be released.
 None.
 
 ### Modified Capabilities
-- `companion-capabilities`: removed entirely — the addon stops adapting to
-  the TST build it runs on.
-- `shelf-presentation`: a crowded shelf always scrolls in one line; the
-  multi-line "extend" layout and the `lines` declaration are gone.
 - `shelf-nesting`: a member's row is removed by hiding the tab, always;
   "a childless member never has a row, not even while active" becomes "a
   member's row is reclaimed when it is not the active tab and not an
-  ancestor of it".
+  ancestor of it". The row-presence policy is added as its own
+  requirement ("A member's row is absent unless it anchors an expanded
+  subtree"); the row-removal retry is removed, because a browser-level
+  `hidden` flag cannot be dropped by a sidebar import.
+
+### Deltas not carried, and why
+- `companion-capabilities` and `shelf-presentation` carry no deltas here:
+  their requirement bases ("A crowded shelf grows its owner's row",
+  "The shelf keeps its single-line scrolling form without the
+  capability", "The line count follows the sidebar width", the
+  capability-detection rules, "Hiding remains the fallback
+  presentation") lived in the `add-discrete-row-geometry` change, which
+  this change deleted before it was ever archived — there is nothing in
+  the spec chain to remove. The one-line scrolling form is the only form
+  `add-shelf-foundation` ever specified, and the hiding presentation is
+  the one its `shelf-presentation` delta already requires.
 
 ## Impact
 

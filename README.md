@@ -176,7 +176,15 @@ What that leaves:
   debounce and never makes a foreign-filtered tab appear on a shelf.
   Do not enable TST's expert option "Show hidden tabs which are hidden
   by other extensions" (`renderHiddenTabs`): it puts shelved tabs back
-  into the flow and the shelf loses its compaction.
+  into the flow and the shelf loses its compaction (geometry stays
+  correct — the rows are counted and painted at full height). Between
+  this option and Firefox's rule that an activated hidden tab stays
+  visible, "a shelved tab has no row in the tree" is a promise the
+  extension cannot keep unconditionally: it holds under TST's default
+  settings and while the tab is not active. The contract therefore
+  guarantees the weaker, checkable form — the shelf lives inside the
+  owner's row and never adds one — and this README is the documented
+  limitation of the stronger reading.
 - **Variable row heights vs TST's virtual scroll** (historical, 0.1.3
   and earlier): TST computes the scroll extent as rendered-count ×
   `--tab-size`; owner rows that grew and CSS-hidden member rows drifted
