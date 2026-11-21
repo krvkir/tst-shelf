@@ -1,0 +1,134 @@
+#+title: Project Overview
+tst-shelf is a Firefox extension (Manifest V2, persistent background page)
+that adds "shelves" to Tree Style Tab: a set of tabs is put on a favicon
+strap inside their parent's row, loses its own rows, and has its subtree
+folded until one of its icons is selected. It is a companion addon, not a
+TST fork: it talks to TST only through the external API
+(~register-self~, ~set-extra-contents~, ~add-tab-state~, ~collapse-tree~,
+~move-before~/-after~), never by editing TST's tree data.
+
+Target scale: trees of 350+ tabs (performance gate in =tests/perf.mjs=).
+Target platform: stock Tree Style Tab 4.x from AMO, Firefox 115+.
+
+* Basic Project Structure
+- =src/manifest.json= :: MV2 manifest. Permissions: =tabs=, =tabHide=, =storage=, =sessions=, =menus=. No host permissions, no content scripts, no network code.
+- =src/background/index.esm.js= :: The whole runtime (~1400 lines, nine numbered sections: state/persistence, TST registration, uniform re-derivation, menu items, icon interaction, TST-behavior cancellation, put/take state machine, tab/window events + pin guard, E2E test API). Owns every piece of mutable module state (=shelved=, =hiddenByUs=, =suppressedHiddenByUs=, =faviconMemory=, =windows=, =reveals=, =hideGuard=, =appendSeq=, =suppressHold=, =treeFetchTries=, =foldTries=, =bootlogWrite=).
+- =src/background/logic.esm.js= :: Pure derivation: no =browser.*=, no TST calls, no I/O. Exports =indexTree=, =derive=, =mustShowTabs=, =danglingMembers=, =isSubtreeFolded=, =planReveals=, =straysToCollapse=, =ownersAffectedByActivation=, =subtreeSizes=, =treePositions=, =nextPlacementMove=, =siblingListOf=, =subtreeIds=, =planRestoreMove=, =resolveFavicons=, =isFolded=, =ROOT_SHELF= (=null=).
+- =src/background/render.esm.js= :: Strap markup builders (=escapeHtml=, =escapeAttributeValue=, =faviconStyleOf=, =iconHtml=, =strapHtml=) plus =createRenderer=, the addon's only writer of TST state. The renderer keeps two acknowledged-only ledgers (=renderedStraps=, =tabStates=) and exposes =applyDerivation=, =restoreStraps=, =clearLegacyStraps=, =forgetWindow=, =forceStateResync=.
+- =src/background/style.esm.js= :: =SHELF_STYLE=, the sidebar stylesheet shipped as the =register-self= =style= string, with =%EXTRA_CONTENTS_PART%= placeholders expanded by TST.
+- =src/background/tst-api.esm.js= :: The TST external-API client, copied from tst-search via tst-workspace (MPL-2.0) with three documented deviations (register-response shape validation, boolean response passthrough, bulk-frame fan-out). Rarely needs edits; when it does, re-check against TST sources.
+- =src/tests.html=, =src/tests-smoke.js=, =src/tree-tab.html=, =src/tree-tab.js=, =src/favicon.svg= :: E2E-only assets. Never present in a production build.
+- =tests/logic.test.mjs=, =tests/render.test.mjs= :: =node:test= unit suites (72 tests total): pure derivation, planning, favicon memory, markup, and the renderer's acknowledgement ledgers.
+- =tests/perf.mjs= :: 350-tab derivation gate; prints median and worst case.
+- =tests/marionette.mjs=, =tests/e2e-drive.mjs=, =tests/fixture.sh=, =tests/probe-mexec.mjs= :: Headless E2E rig: a minimal Marionette protocol-3 client, the three-phase driver, the clean fixture-profile builder (TST from AMO only), and a standalone probe of =WebDriver:ExecuteScript= semantics.
+- =build.mjs= :: esbuild bundle of =src/background/index.esm.js= into one IIFE (=firefox115= target) plus static-asset copy; =E2E=1= produces the test flavor.
+- =scripts/verify-dist.mjs= :: Release gate over a built tree: required files present, no test-only file, no =-e2e= version, no =downloads= permission, no unexpected file.
+- =Makefile= :: Build, test, perf, E2E and release targets. =.NOTPARALLEL:= because =dist/= is shared.
+- =openspec/= :: =project.md= (glossary and invariants), =changes/= (three changes: =add-shelf-foundation= 49/54 tasks, =reveal-folded-owner-branch= 33/34, =remove-companion-patch= complete), =specs/= (empty until changes are archived; the delta specs are the contract).
+- =README.md= :: User-facing documentation, caveats measured in E2E, and the implementation notes verified against TST 4.4.10.
+- =ideas.org= :: the user's backlog of shelf refinements (favicon fallback, shelf drag-reorder, keyboard shortcuts, tab-count badge, sound indicator).
+- =2026-11-21-*.org= :: LLM session notebooks and the 0.2.3 audit. History, not contract.
+
+* State: One Sticky Flag, Everything Else Derived
+The only persisted tab state is a session value on the tab itself:
+
+- =tst-shelf=, ={on: true, prev: PLACE}= :: the sticky shelved flag. =prev= is the pre-shelve place: ={windowId, index, parentId, slot, beforeId, afterId}=, where the neighbours are /siblings only/.
+- =tst-shelf-suppressed=, =true= :: written while a reveal keeps the tab hidden; runtime state, released at boot so a crash mid-reveal never leaves an invisible tab.
+- =storage.local.bootlog= :: the last 80 boot/diagnostic lines, nothing else.
+
+Shelf membership, owners, icons, badges, highlight and the selected shelf tab are re-derived from TST's light tree plus =browser.tabs= on every structural event, debounced by =RECOMPUTE_DELAY_MS= (120 ms), and applied as a diff against what the renderer last got acknowledged. There is no auto-unshelve: only "Take off the shelf" clears the flag. Do not add a second source of truth; a new feature that needs memory should be derivable or session-scoped with a boot-release path.
+
+* Two Hiding Ledgers, Never One
+=hiddenByUs= (in =index.esm.js=) means "hidden by us *because it lives on a shelf*, so it still gets an icon". =reconcileHidden= shows every tab in it that is no longer shelved. =suppressedHiddenByUs= means "hidden because a reveal keeps only one branch". A suppressed tab must never enter =hiddenByUs=, or the next derivation reveals it again; a shelved tab must never enter =suppressedHiddenByUs=, or it stops getting an icon. =tabs.hide()= is also what tst-workspace uses for container filtering, so "hidden" read from =browser.tabs= is only meaningful together with our ledger.
+
+* The Uniform-Row Law
+TST never measures painted rows: drag zones, virtual scroll and sticky rows compute geometry as =renderedTabHeight × index over renderable items= (=Scroll.getItemRect=, scroll.js:664-716; the drag zones quarter that rect, drag-and-drop.js:458-500). Every rendered row must therefore paint at exactly one =--tab-size=.
+
+Consequences that constrain every change:
+- The shelf is a flex item beside the caption inside the owner's own row; the row keeps its default height.
+- A member has no row at all; it is hidden with =browser.tabs.hide()=.
+- A crowded shelf stays one line and scrolls horizontally. Multi-line owner rows and the companion TST patch that enabled them were removed in 0.2.3 (=openspec/changes/remove-companion-patch=). Do not reintroduce row-height variance.
+- =#dummy-tab .extra-items-container.below { display: none }= is load-bearing: the dummy tab mirrors the latest extra contents, and without that rule every row in the tree inflates.
+
+* Development Approach
+1. *Read the contract first.* =openspec/project.md= fixes the vocabulary (shelved, shelf owner, selected shelf tab, root shelf); the delta specs under =openspec/changes/*/specs/= fix the behaviour. Requirements and GIVEN/WHEN/THEN scenarios win over code comments.
+2. *Keep derivation pure.* Anything computable from =(tree, shelved, tabsById, hiddenByUs)= belongs in =logic.esm.js= and gets a unit test. =index.esm.js= does I/O and orchestration only.
+3. *Derive, do not remember.* A new piece of runtime state needs a boot-release or a derivation path before it can hold a tab's visibility.
+4. *Re-derive, do not patch incrementally.* Every structural event schedules the same whole-window, idempotent pass; special-casing one event type is how dangling rows and stale decisions appear.
+5. *Keep functions small.* ~60 lines is the ceiling; the pure planners are split exactly for that reason.
+6. *Never touch TST's tree data.* Order changes go through =move-before= / =move-after= / =outdent= with =followChildren: true= and references chosen inside the owner's children only.
+7. *Fail the operation, not the state.* A put whose session write is rejected returns =false= and is not shelved; a take-off whose =removeTabValue= is rejected keeps the tab shelved.
+
+* Essential Development Commands
+- =make deps= :: =npm install= (esbuild, web-ext).
+- =make test= :: =node --test tests/= — the 72 pure unit tests. The first thing to run after any edit to =logic.esm.js= or =render.esm.js=.
+- =make perf= :: 350-tab derivation gate (budgets: full pass median < 20 ms / worst < 100 ms, one put median < 10 ms).
+- =make build= :: production bundle into =dist/=.
+- =make watch= :: rebuild =dist/= on source changes; pair with =make run= for the edit-and-test loop.
+- =make run= :: dev Firefox with auto-reload on a throwaway profile.
+- =make lint= :: =web-ext lint= over =dist/=.
+- =make verify-dist= :: assert =dist/= is a production tree.
+- =make xpi= :: pack =web-ext-artifacts/tst_shelf-<version>.zip=.
+- =make fixture= :: build =tests/fixture-profile= (clean profile + signed TST from AMO); idempotent.
+- =make iso-tst= :: GUI Firefox on that fixture profile with this extension.
+- =make e2e= :: headless Marionette run against the fixture, building =dist-e2e/= first.
+- =make release= :: =test=, =perf=, =e2e=, then a clean =build= + =lint= + =verify-dist= + pack.
+- =openspec list=, =openspec validate --all= :: change state and delta validation.
+
+Long runs (=make e2e=) belong under a hard timeout; the driver kills its own browser, but a stray headless Firefox squatting on the Marionette port will make the next run bind-fail.
+
+* Integration Surface
+Every change must respect these contracts. All of them are verified against TST 4.4.10 sources in =~/repos/firefox/treestyletab/webextensions/=.
+
+- ~register-self~ manifest :: =style= MUST be a string (an array throws inside TST's style-install listener and aborts its whole frontend init); =lightTree: true= keeps notification payloads structural; =allowBulkMessaging: true= coalesces events into ={messages: [...]}= frames, which the client fans out.
+- TST methods used :: =get-version=, =get-tree=, =get-light-tree=, =add-tab-state=, =remove-tab-state=, =collapse-tree=, =expand-tree=, =set-extra-contents=, =clear-extra-contents=, =move-before=, =move-after=, =outdent=, =scroll=. Every TST call carries =windowId=.
+- TST events subscribed :: =ready=, =tree-attached=, =tree-detached=, =tabs-rendered=, =sidebar-show=, =extra-contents-mousedown=, =extra-contents-clicked=, =try-collapse-tree-from-other-expansion=, =try-expand-tree-from-focused-collapsed-tab=, =try-scroll-to-activated-tab=.
+- The cancellation rule :: TST's =tryOperationAllowed= cancels an operation when /any/ subscribed listener resolves truthy. A listener may answer =true= only when this extension actually takes over. The donor client's original unconditional =true= would have frozen TST's collapse UX; that is why the client passes booleans through.
+- Icon markup contract :: =data-tab-id= (TST routes right-clicks to that tab's native context menu and drags), =data-drag-data= with =asTree: true= (TST-native subtree drag), =draggable="true"=, =title= (=title\nurl=). The icon element must NOT be a =<button>=: TST cancels drags started on button/select/scrollbar targets.
+- Tab states :: =tst-shelf-owner= on owners only (members have no rows). Styled through =::part()= selectors in =SHELF_STYLE=.
+- Menu items :: our own =browser.menus= items =tst-shelf:put= and =tst-shelf:take= with =contexts: ["tab"]=, visibility flipped in =menus.onShown=, clicks in =menus.onClicked=. TST's =contextMenu-create= route is rejected: those items stay =visible: false= for plain tab rows.
+- Browser APIs with a semantic edge :: =tabs.hide()= (member rows, reveal suppression), =sessions.setTabValue/getTabValue/removeTabValue= (the sticky flag), =storage.local= (bootlog), =menus= (only the two items).
+
+* Traps That Have Already Bitten
+Each of these cost an E2E run or a user bug report; the README and =openspec/= design files carry the measurements.
+
+- *TST has three tab orders* that disagree for ~250 ms after every internal move: the physical strip (=tabs.query= indices), TST's internal index order, and the children-array walk that =get-light-tree= returns and the sidebar renders. Without =doNotOptimize=, =move-before= updates the tree synchronously and defers the physical move. Plan placement in walk order, never against =tabs.query= indices.
+- *=windowId= is load-bearing in every TST request.* Without it, =getTargetTabs= falls back to the last focused window; in a headless or unfocused session that resolves to a null active tab, and the request processes zero tabs while answering =true=.
+- *Hidden root tabs vanish from =get-light-tree=.* A hidden tab leaves TST's controllable index, so a hidden member of the /root/ shelf disappears from the export while hidden /children/ survive. =fetchLightTree= re-fetches such roots with ={windowId, tab: id}= (=Tab.get=, no filter) and splices them back by =tab.index=.
+- *Firefox reveals a hidden tab when it becomes active, and refuses to hide it again — and refuses to empty a window.* That is what makes a member's row come back on selection without the extension acting, and why =rehideMembersNow= must hide the outgoing member ~30 ms after the focus moves. =mustShowTabs= keeps the active tab and its ancestors rendered; =reconcileHidden= pops ids from the batch until one visible tab remains, because one ineligible id rejects the whole =tabs.hide= call. A tab that must anchor visible content (a nested shelf's owner) keeps its row.
+- *A member's subtree may stay unfolded only while its own row is on screen.* =danglingMembers= + =foldDanglingMembers= fold first, then hide. Otherwise a frame shows children with no parent above them. =hideGuard= keeps a folding member's row for =COLLAPSE_ANIMATION_GRACE_MS= (300 ms), which outlives TST's ~150 ms collapse animation.
+- *Re-read the active tab after the tree fetch.* The pre-fetch snapshot still marks a just-activated tab inactive, and =mustShow= hangs on exactly that flag: the tab was hidden and its children dangled.
+- *A failed tree export must not end the pass.* It used to, leaving the previous decision in force. Now bounded retry (=MAX_TREE_FETCH_TRIES= 5) with a logged =tree-fetch-fail=; =MAX_FOLD_TRIES= 3 bounds the fold retries.
+- *Favicons disappear mid-navigation.* Firefox reports no =favIconUrl= for a loading tab, so a raw re-derivation renders a blank icon. =resolveFavicons= threads a per-session =Map<tabId, url>= through every query and hands back shallow copies; the diffing renderer then emits nothing, and the sidebar keeps the old style attribute. TST's own rows are sticky the same way.
+- *The renderer's ledger means "acknowledged", not "wanted".* A write recorded before its reply is never retried, and the strap silently never appears. Both ledgers are updated from the promise outcomes.
+- *A sidebar that opens late missed every state we ever applied.* TST's initial import carries only its own safe states. Do not drop the ledger on =sidebar-show=; set =forceStateResync()= and let the next pass re-send every claim.
+- *State cleanup must be window-scoped.* A derivation of window W may only remove shelf states of tabs that exist in W; a global cleanup nuked the other window's straps.
+- *A restore neighbour must be a sibling.* =move-after= a cousin or uncle re-parents the mover into that subtree: the tab comes off the shelf onto the wrong shelf entirely. =preShelvePlaceOf= records siblings only and =planRestoreMove= falls back to the saved slot.
+- *Booting into a stale log.* Two in-flight =logBoot= calls used to race on =storage.local= and drop each other's entries. All writes go through the =bootlogWrite= promise chain; diagnostics must never break the caller.
+- *=browser.menus.getAll= does not exist*, and native menus open only for trusted events — the E2E drives =applyMenuVisibility= through a test hook instead of a real menu.
+- *Marionette =WebDriver:ExecuteScript= takes a plain function body* on Firefox 158. The IIFE-with-=arguments= form silently returns =null= (probe: =tests/probe-mexec.mjs=).
+- *Two build flavors, two directories.* =dist/= is production and the only tree =web-ext= may pack; =dist-e2e/= is the test flavor (smoke page, =-e2e= version, =downloads= permission). =make e2e= once left its output in =dist/= and =make release= packaged it. =verify-dist= exists to fail that.
+
+* Testing
+- Unit: =make test=. Spec-derived tests over the pure modules. 72 tests, no browser needed; run before every commit.
+- Performance: =make perf=. The full pure pipeline on a deterministic 350-tab fixture (5 shelves × 5 members). A regression shows up as a number.
+- E2E: =make e2e=. Headless Firefox on a copy of the fixture profile; =dist-e2e/= is temporary-installed through =Addon:Install=, then three phases run:
+  1. *Setup* — the smoke page builds tree A ← (B, C, D), C ← (c1, c2), plus root tab E, shelves B, C and E, asserts the state machine, downloads a setup report.
+  2. *Sidebar DOM* — the driver opens TST's own sidebar page in a tab, asserts the rendered straps, then dispatches synthetic mousedown events on the icons; the smoke page asserts the selection choreography.
+  3. *Reinstall* — =Addon:Install= into the same session (runtime wiped, session values intact); the smoke page must rebuild the shelved set: the restart-persistence proxy.
+- Every E2E assertion goes through one =check(name, ok, detail)=, which prints, records and sets the exit status. Exit 0 = all passed, 1 = failing checks, 2 = harness failure. Two consecutive clean runs are required before merging a change that touches the runtime.
+- =node tests/probe-mexec.mjs= characterises Marionette =ExecuteScript= on the current Firefox build.
+
+* Release Checklist
+- =make release=, on a tree where =git status= holds only intended changes.
+- Confirm the final =verify-dist= line names =dist/= and the expected version, and that =web-ext-artifacts/= holds the production package.
+- Bump =version= in =src/manifest.json= and =package.json= together; E2E appends =-e2e= to the manifest version, so nothing else may.
+- Update the README caveats when an E2E measurement changes a claim.
+
+* Donors and References
+- =README.md= :: behaviour contract, permissions rationale, measured caveats, implementation notes against TST 4.4.10.
+- =openspec/project.md=, =openspec/changes/*/{proposal,design,tasks}.md=, =openspec/changes/*/specs/*/spec.md= :: the executable contract.
+- TST sources (contract reference, no code copied): =~/repos/firefox/treestyletab/webextensions/=.
+- =~/repos/firefox/tst-workspace= :: build pipeline, E2E harness layout, TST client origin, console-mirror pattern.
+- =~/repos/firefox/tst-search= ([[https://github.com/NiklasGollenstede/tst-search][tst-search]]) :: original author of =src/background/tst-api.esm.js= (MPL-2.0).
+- KB notes: =~/kb/firefox/tst-companion-api-mechanics.org= (extra contents, menus, sizing), =~/kb/firefox/marionette-extension-e2e-harness.org= (wire protocol and gotchas), =~/kb/firefox/tst-css-hooks.org=, =~/kb/firefox/amo-release.org=.
