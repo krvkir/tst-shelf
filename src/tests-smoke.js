@@ -157,32 +157,22 @@ async function phaseOneAndTwo () {
 	// breaking its uniform-row arithmetic (a blank member row would be
 	// the "gaps" 0.1.3 shipped).
 	{
-		// Two presentations exist (0.2.0).  On a TST with the row-less
-		// capability NOTHING is hidden: every member is row-less, except a
-		// member with children while it is the active tab — then its row
-		// comes back and its subtree hangs from it.  On a TST without the
-		// capability the only lever is browser.tabs.hide(), so members are
-		// hidden and the browser reveals the one that gets activated.
+		// A member's row goes away by HIDING the tab: the only lever that
+		// removes a tab from TST's renderable set without breaking its
+		// uniform-row arithmetic.  A member with children keeps its row while
+		// it is the active tab, because its subtree hangs from it.
 		const state = await eventually(null, async () => {
 			const s = await send({ type: "test:state" });
-			const ready = s.capabilities.rowLess ?
-				s.rowLessByUs.includes(ids.B) && s.rowLessByUs.includes(ids.C) && s.hiddenByUs.length == 0 :
-				s.hiddenByUs.includes(ids.B) && s.hiddenByUs.includes(ids.C);
-			return ready ? s : null;
+			return s.hiddenByUs.includes(ids.B) && s.hiddenByUs.includes(ids.C) ? s : null;
 		}, 8000);
 		const live = {
 			B: (await browser.tabs.get(ids.B)).hidden,
 			C: (await browser.tabs.get(ids.C)).hidden,
 		};
-		const caps = state ? state.capabilities : {};
-		const ok = state && (caps.rowLess ?
-			state.rowLessByUs.includes(ids.B) && state.rowLessByUs.includes(ids.C)
-			&& state.hiddenByUs.length == 0 && live.B === false && live.C === false
-			: state.hiddenByUs.includes(ids.B) && state.hiddenByUs.includes(ids.C)
-			&& live.B === true && live.C === true);
-		record("members keep no row — and on a row-less TST nothing is hidden",
-			ok,
-			`caps=${JSON.stringify(caps)} rowLess=${JSON.stringify(state && state.rowLessByUs)} hiddenByUs=${JSON.stringify(state && state.hiddenByUs)} live=${JSON.stringify(live)}`);
+		record("members keep no row — they are hidden tabs",
+			!!state && state.hiddenByUs.includes(ids.B) && state.hiddenByUs.includes(ids.C)
+			&& live.B === true && live.C === true,
+			`hiddenByUs=${JSON.stringify(state && state.hiddenByUs)} live=${JSON.stringify(live)}`);
 	}
 
 	// Our context menu items must exist as OUR OWN browser.menus items
@@ -221,6 +211,38 @@ async function phaseOneAndTwo () {
 		const root = s.shelves[ids.windowId].shelves.find(([owner]) => owner == "root");
 		return root && root[1].includes(ids.E) ? s : null;
 	});
+
+	// -- take-off restores the pre-shelve place ------------------------
+	// G is created at the END of the strip and then shelved, so the place
+	// recorded at put time is the last index; taking it off must put it
+	// back there.  Planning "move before the tab that now occupies the
+	// saved index" left such a tab one slot short (before the last tab)
+	// whenever it had to move toward a later index.
+	{
+		const G = (await browser.tabs.create({ windowId: ids.windowId, url: browser.runtime.getURL("tree-tab.html"), })).id;
+		ids.G = G;
+		await browser.storage.local.set({ "e2e-ids": ids });
+		const stripOrder = async () => (await browser.tabs.query({ windowId: ids.windowId, }))
+			.slice().sort((a, b) => a.index - b.index).map(tab => tab.id);
+		const settledLast = await eventually(null, async () => {
+			const order = await stripOrder();
+			return order[order.length - 1] === G ? order : null;
+		}, 8000);
+		record("the extra root tab starts at the end of the strip", !!settledLast, JSON.stringify(settledLast));
+		await send({ type: "test:put", tabId: G });
+		await eventually("the extra root tab lands on the root shelf", async () => {
+			const s = await send({ type: "test:state" });
+			const root = s.shelves[ids.windowId].shelves.find(([owner]) => owner == "root");
+			return root && root[1].includes(G) ? s : null;
+		}, 8000);
+		await send({ type: "test:take", tabId: G });
+		const restored = await eventually(null, async () => {
+			const order = await stripOrder();
+			const s = await send({ type: "test:state" });
+			return !s.shelved.includes(G) && order[order.length - 1] === G ? order : null;
+		}, 8000);
+		record("take off returns the tab to the end of the strip", !!restored, JSON.stringify(restored));
+	}
 
 	// -- take off ------------------------------------------------------
 	await send({ type: "test:take", tabId: ids.B });
@@ -320,24 +342,15 @@ async function phaseOneAndTwo () {
 		let elapsed = -1;
 		for (let attempt = 0; attempt < 500; attempt++) {
 			const live = await browser.tabs.get(ids.B).catch(() => null);
-			// row-less member: it must NEVER be hidden — there is no row to
-			// reclaim in the first place, which is the whole point of 0.2.0
+			// Firefox revealed B when it was activated; it must be hidden again
+			// as soon as it stops being active, so its row goes away
 			const ready = live && (live.hidden || false);
 			if (ready) { elapsed = Date.now() - startedAt; break; }
 			await Promise.resolve();
 		}
-		const afterSwitch = await send({ type: "test:state" });
-		if (afterSwitch && afterSwitch.capabilities.rowLess) {
-			const live = await browser.tabs.get(ids.B);
-			record("a row-less member is never hidden — no row to reclaim, no reveal to undo",
-				live.hidden === false && afterSwitch.rowLessByUs.includes(ids.B),
-				`hidden=${live.hidden} rowLess=${JSON.stringify(afterSwitch.rowLessByUs)}`);
-		}
-		else {
-			record("the member is hidden again the moment another tab becomes active", elapsed >= 0 && elapsed < 250,
-				`elapsed=${elapsed}ms (a full re-derivation costs 120ms of debounce on top)`);
-			record("a member's row disappears when it stops being active", elapsed >= 0, `elapsed=${elapsed}ms`);
-		}
+		record("the member is hidden again the moment another tab becomes active", elapsed >= 0 && elapsed < 250,
+			`elapsed=${elapsed}ms (a full re-derivation costs 120ms of debounce on top)`);
+		record("a member's row disappears when it stops being active", elapsed >= 0, `elapsed=${elapsed}ms`);
 		const state = await eventually(null, async () => {
 			const s = await send({ type: "test:state" });
 			const shelf = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == ids.A);

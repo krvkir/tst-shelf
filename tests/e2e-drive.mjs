@@ -23,7 +23,8 @@
  *      restart-persistence proxy (temporary installs never survive a
  *      real restart; the boot path is identical).
  *
- * Usage: node tests/e2e-drive.mjs [--port 2829] [--timeout 150] [--keep]
+ * Usage: node tests/e2e-drive.mjs [--dist dist-e2e]
+ *                                 [--port 2829] [--timeout 150] [--keep]
  * Exit codes: 0 all results ok, 1 failing results, 2 harness failure.
  */
 "use strict";
@@ -43,7 +44,6 @@ const SETUP_REPORT = path.join(DOWNLOADS, "tst-shelf-e2e-setup.json");
 const FINAL_REPORT = path.join(DOWNLOADS, "tst-shelf-e2e.json");
 const CONSOLE_LOG = path.join(HERE, "e2e-console.log");
 const FIREFOX_LOG = path.join(HERE, "e2e-firefox.log");
-const DIST = path.join(REPO, "dist");
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -55,12 +55,10 @@ const TIMEOUT_S = Number(flag("--timeout", 150));
 const KEEP = argv.includes("--keep");
 const HEADED = argv.includes("--headed");
 const FIREFOX_BIN = flag("--bin", "/usr/bin/firefox");
-/** Path to a PATCHED Tree Style Tab xpi (tests/patch-tst.sh).  When set,
- *  the fixture's sideloaded release build is removed and this one is
- *  temporary-installed first — that is how the A3/B upstream patch is
- *  exercised (discrete row heights, row-less tabs). */
-const TST_PATCH = flag("--tst", null) && path.resolve(flag("--tst", null));
-
+/** The built extension tree to install.  `make e2e` passes dist-e2e, so the
+ *  production dist/ is never installed by the harness (and can never be
+ *  left holding a test build). */
+const DIST = path.resolve(REPO, flag("--dist", "dist"));
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), "tst-shelf-e2e-"));
 const PREFS = path.join(SCRATCH, "prefs.js");
 const die = error => { console.error(error && error.stack || String(error)); process.exitCode = 2; };
@@ -108,13 +106,6 @@ async function commandTry (marionette, name, fallbacks, params) {
 
 function prepareProfile () {
 	fs.cpSync(FIXTURE, SCRATCH, { recursive: true, });
-	if (TST_PATCH) {
-		// the patched build replaces the sideloaded one: same addon id, and
-		// a temporary install of it must not collide with a signed copy
-		const sideloaded = path.join(SCRATCH, "extensions", "treestyletab@piro.sakura.ne.jp.xpi");
-		fs.rmSync(sideloaded, { force: true, });
-		console.log(`[drive] patched TST mode: removed sideloaded release build`);
-	}
 	fs.appendFileSync(path.join(SCRATCH, "prefs.js"), `user_pref("marionette.port", ${PORT});\n`);
 }
 
@@ -407,89 +398,6 @@ const shelfCallScript = String.raw`
 	})();
 `;
 
-/** Row metrics of one tab plus TST's computed scroll extent.  The extent is
- *  the virtual-scroll container's min-height, i.e. exactly
- *  `totalRenderableItemsSize` from sidebar/scroll.js — the expression the
- *  A3 patch generalizes.  It is only set when the tab bar overflows, so the
- *  driver shrinks the window first. */
-const extentScript = String.raw`
-	const ownerId = arguments[0];
-	const plainId = arguments[1];
-	const container = document.querySelector('#normal-tabs-container');
-	const scroller = container.querySelector('.virtual-scroll-container');
-	const rect = id => {
-		const row = document.querySelector('tab-item[data-tab-id="' + id + '"]');
-		return row ? Math.round(row.getBoundingClientRect().height * 10) / 10 : -1;
-	};
-	const top = id => {
-		const row = document.querySelector('tab-item[data-tab-id="' + id + '"]');
-		return row ? Math.round(row.getBoundingClientRect().top) : -1;
-	};
-	const rowList = [...container.querySelectorAll('tab-item[data-tab-id]')].map(row => ({
-		id: row.dataset.tabId,
-		top: Math.round(row.getBoundingClientRect().top),
-		height: Math.round(row.getBoundingClientRect().height),
-	}));
-	const lastTop = rowList.length ? rowList[rowList.length - 1].top : -1;
-	const below = document.querySelector('tab-item[data-tab-id="' + ownerId + '"] .extra-items-container.below');
-	const root = below && below.shadowRoot;
-	const strap = root && root.querySelector('[part~="shelf-strap"]');
-	return JSON.stringify({
-		minHeight: Math.round((parseFloat(getComputedStyle(scroller).minHeight) || 0) * 10) / 10,
-		ownerHeight: rect(ownerId),
-		rowList, lastTop,
-		ownerStyleVar: (document.querySelector('tab-item[data-tab-id="' + ownerId + '"]').style.getPropertyValue('--tab-lines') || '(unset)'),
-		ownerComputedHeight: getComputedStyle(document.querySelector('tab-item[data-tab-id="' + ownerId + '"]')).height,
-		tabSize: getComputedStyle(document.querySelector('tab-item[data-tab-id="' + ownerId + '"]')).getPropertyValue('--tab-size'),
-		ownerClasses: [...document.querySelector('tab-item[data-tab-id="' + ownerId + '"]').classList].join(','),
-		plainHeight: rect(plainId),
-		plainTop: top(plainId),
-		strapHeight: strap ? Math.round(strap.getBoundingClientRect().height) : -1,
-		rows: container.querySelectorAll('tab-item[data-tab-id]').length,
-		ids: [...container.querySelectorAll('tab-item[data-tab-id]')].map(row => row.dataset.tabId).join(","),
-		viewport: Math.round(innerWidth) + 'x' + Math.round(innerHeight),
-		scrollTopMax: Math.round((container.scrollTopMax || 0) * 10) / 10,
-	});
-`;
-
-/** Crowded-shelf probe: the strap's icons against its own box, plus the row
- *  height.  "All icons visible, no horizontal scroll" is the requirement for
- *  the extend layout. */
-const shelfFitScript = String.raw`
-	const owner = arguments[0];
-	const row = document.querySelector('tab-item[data-tab-id="' + owner + '"]');
-	const below = row && row.querySelector('.extra-items-container.below');
-	const strap = below && below.shadowRoot && below.shadowRoot.querySelector('[part~="shelf-strap"]');
-	if (!strap) { return JSON.stringify({ missing: true, }); }
-	const box = strap.getBoundingClientRect();
-	const icons = [...strap.querySelectorAll('[part~="shelf-icon"]')].map(icon => {
-		const rect = icon.getBoundingClientRect();
-		return { right: Math.round(rect.right), bottom: Math.round(rect.bottom), width: Math.round(rect.width), height: Math.round(rect.height), };
-	});
-	return JSON.stringify({
-		rowHeight: Math.round(row.getBoundingClientRect().height),
-		rowWidth: Math.round(row.getBoundingClientRect().width),
-		icons: icons.length,
-		scrolls: strap.scrollWidth > strap.clientWidth + 1,
-		overflowX: getComputedStyle(strap).overflowX,
-		display: getComputedStyle(strap).display,
-		strapHeight: Math.round(box.height),
-		strapWidth: Math.round(box.width),
-		allInside: icons.every(icon => icon.right <= Math.round(box.right) + 1 && icon.bottom <= Math.round(box.bottom) + 1),
-		rows: new Set(icons.map(icon => icon.bottom)).size,
-	});
-`;
-
-/** Row + browser visibility of one tab, read from the sidebar page. */
-const rowlessProbeScript = String.raw`
-	const id = arguments[0];
-	return (async () => {
-		const row = document.querySelector('tab-item[data-tab-id="' + id + '"]');
-		const tab = await browser.tabs.get(id);
-		return JSON.stringify({ hasRow: !!row, hidden: tab.hidden, active: tab.active, });
-	})();
-`;
-
 /** Frame sampler: records, once per animation frame, where a marker row
  *  sits and how many rows exist.  Starting it before a shelf-tab switch
  *  and reading it afterwards yields the tree's motion in pixels — the
@@ -552,11 +460,11 @@ const rowPresenceScript = String.raw`
 	return JSON.stringify(out);
 `;
 
-/** Rows AND browser visibility for a set of tabs.  `hidden` is the
- *  capability-sensitive half of a reveal: on a patched companion the row
- *  goes through `row-less` and the tab stays visible, on a stock one the
- *  row goes through browser.tabs.hide().  (Async IIFE: Marionette runs the
- *  script as a *body*, so a top-level await is a syntax error.) */
+/** Rows AND browser visibility for a set of tabs.  `hidden` is the other
+ *  half of a reveal's claim: a suppressed row goes through
+ *  browser.tabs.hide(), so a tab without a row must report `hidden`.
+ *  (Async IIFE: Marionette runs the script as a *body*, so a top-level
+ *  await is a syntax error.) */
 const rowAndStateScript = String.raw`
 	return (async () => {
 		const ids = arguments[0];
@@ -588,12 +496,554 @@ const stateProbeScript = String.raw`
 	})();
 `;
 
+/** Every assertion the driver makes, in one place: it prints, it records,
+ *  and a failure sets the exit status.  Assertions used to be raw
+ *  `console.log` calls, and two of them (the folded-owner check and the
+ *  nested-member check) printed FAIL without touching `process.exitCode` —
+ *  `make e2e` exited 0 while the log said FAIL.  A `detail` is evaluated
+ *  only on failure so the happy path stays quiet. */
+const results = [];
+function check (name, ok, detail = null, scope = "driver") {
+	const text = typeof detail == "function" ? (ok ? null : detail()) : detail;
+	const entry = { name, ok: !!ok, detail: text == null || text === "" ? null : String(text), };
+	results.push(entry);
+	console.log(`${entry.ok ? "PASS" : "FAIL"} [${scope}] ${entry.name}${entry.detail ? " " + entry.detail : ""}`);
+	if (!entry.ok) { process.exitCode = process.exitCode || 1; }
+	return entry.ok;
+}
+
 function printReport (path, phase) {
 	const report = JSON.parse(fs.readFileSync(path, "utf8"));
 	for (const entry of report.results || []) {
-		console.log(`${entry.ok ? "PASS" : "FAIL"} [${phase}] ${entry.name}${entry.detail ? " " + entry.detail : ""}`);
+		check(entry.name, entry.ok, entry.detail, phase);
 	}
-	if ((report.results || []).some(entry => !entry.ok)) { process.exitCode = process.exitCode || 1; }
+}
+
+/**
+ * Phase 2: open TST's own sidebar page in a tab and assert what the
+ * shelf really paints there — strap ownership, row geometry, member
+ * rows, the selection choreography, the reveal rules.  Extracted from
+ * main() so each harness phase is a named routine; every assertion goes
+ * through check(), the single oracle that also sets the exit status.
+ */
+async function runSidebarPhase (marionette, { windowId, expect, }) {
+	if (windowId != null) {
+		// A temporary install never reaches prefs.js, so ask the policy
+		// registry for the sidebar URL and fall back to the sideloaded
+		// UUID only if that fails.
+		let baseUrl = null;
+		for (let i = 0; i < 40 && !baseUrl; i++) {
+			const url = await marionette.command("Marionette:SetContext", { value: "chrome", })
+				.then(() => marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarUrlScript, args: ["treestyletab@piro.sakura.ne.jp",], newSandbox: false,
+				}))
+				.then(response => response && response.value, () => null);
+			const uuid = readTstUuid(PREFS);
+			baseUrl = url || (uuid ? `moz-extension://${uuid}/sidebar/sidebar.html` : null);
+			if (!baseUrl) { await new Promise(resolve => setTimeout(resolve, 500)); }
+		}
+		await marionette.command("Marionette:SetContext", { value: "content", }).catch(() => {});
+		check("TST sidebar URL resolvable", !!baseUrl);
+		if (baseUrl) {
+			const pageUrl = `${baseUrl}?windowId=${windowId}`;
+			console.log(`[drive] phase 2: opening ${pageUrl}`);
+			await marionette.command("Marionette:SetContext", { value: "content", });
+			try {
+				const win = await commandTry(marionette, "WebDriver:NewWindow", ["Marionette:NewWindow"], { type: "tab", });
+				const handle = (win && (win.handle || (win.value && win.value.handle))) || null;
+				if (handle) {
+					await commandTry(marionette, "WebDriver:SwitchToWindow", ["Marionette:SwitchToWindow"], { handle, });
+				}
+				await commandTry(marionette, "WebDriver:Navigate", ["Marionette:GetURL"], { url: pageUrl, });
+			// A tall window keeps every row inside TST's virtual-scroll
+			// render range; a short headless viewport legitimately skips
+			// off-screen rows (exists: false), which is TST working as
+			// designed, not a shelf bug.
+			await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 900, }).catch(() => {});
+			} catch (error) {
+				console.log(`[drive] phase 2 navigation failed: ${error.message}`);
+			}
+			await new Promise(resolve => setTimeout(resolve, 6000));
+
+			// poll until the straps rendered (the tabs-rendered restore path)
+			let dump = null;
+			for (let attempt = 0; attempt < 24; attempt++) {
+				const response = await marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarScript, args: [null,], newSandbox: false,
+				}).catch(error => { console.log(`[drive] sidebar dump failed: ${error.message}`); return null; });
+				dump = response && response.value ? JSON.parse(response.value) : null;
+				if (dump && dump.icons.length >= 2) { break; }
+				await new Promise(resolve => setTimeout(resolve, 1000));
+			}
+			// decisive probe: push a state through TST's own bridge
+			const probe = await marionette.command("WebDriver:ExecuteScript", {
+				script: stateProbeScript, args: [windowId,], newSandbox: false,
+			}).catch(error => { console.log(`[drive] state probe failed: ${error.message}`); return null; });
+			console.log(`[drive] state probe: ${probe && probe.value}`);
+			if (!dump || dump.icons.length < 2) {
+				const diag = dump ?
+					`href=${dump.href} ready=${dump.readyState} tabItems=${dump.allTabItems} rows=${dump.rowsWithTabId} normalChildren=${dump.normalChildren}` :
+					"(no dump)";
+				check("shelf icons render in the owner strap", false, diag);
+			} else {
+				console.log(`[drive] row classes: ${JSON.stringify((dump.rows || []).map(row => [row.id, row.classes]))}`);
+				const e = expect.expect;
+				const byId = Object.fromEntries(dump.icons.map(icon => [icon.id, icon]));
+
+				check("owner row carries the tst-shelf-owner class", dump.rows.find(row => row.id == String(e.owner) && row.classes.includes("tst-shelf-owner")));
+
+				// uniform-row law (0.1.4): the strap lives INSIDE the
+				// owner's own row (beside the caption), so the owner row
+				// keeps its DEFAULT height and every rendered row sits
+				// exactly where TST's index arithmetic expects it (the
+				// drop-zone guarantee: 0.1.1 grew owner rows and collapsed
+				// member rows, shifting every computed rect below each
+				// shelf, and drops there always landed as siblings).
+				{
+					const ownerRow = dump.rows.find(row => row.id == String(e.owner));
+					const plainRow = dump.rows.find(row => row.id == String(e.plain));
+					const sameHeight = ownerRow && plainRow && Math.abs(ownerRow.height - plainRow.height) < 2;
+					check("the owner row keeps its normal height", sameHeight, () =>
+						`owner=${ownerRow && ownerRow.height} plain=${plainRow && plainRow.height}`);
+				}
+				{
+					const ownerRow = dump.rows.find(row => row.id == String(e.owner));
+					check("the strap renders inside the owner's own row", ownerRow && ownerRow.strap && ownerRow.classes.includes("tst-shelf-owner"), () => `the strap renders inside the owner's own row (${JSON.stringify(ownerRow)})`);
+				}
+				// no member rows at all: a hidden tab has no row, so the
+				// shelf costs exactly one line (0.1.3's blank member boxes
+				// were the "vertical gaps").  The invariant is about the
+				// SETTLED sidebar — the addon re-applies addon states when a
+				// sidebar appears (TST's initial import carries only its own
+				// safe states), and that pass is debounced — so poll instead
+				// of reading the very first frame that has icons.
+				{
+					let memberRows = [];
+					for (let attempt = 0; attempt < 6; attempt++) {
+						const fresh = await marionette.command("WebDriver:ExecuteScript", {
+							script: sidebarScript, args: [null,], newSandbox: false,
+						}).catch(() => null);
+						const again = fresh && fresh.value ? JSON.parse(fresh.value) : null;
+						if (!again) { break; }
+						memberRows = e.members.filter(id => again.rows.some(row => row.id == String(id)));
+						if (memberRows.length == 0) { break; }
+						await new Promise(resolve => setTimeout(resolve, 500));
+					}
+					let detail = () => `rows=${JSON.stringify(memberRows)}`;
+					if (memberRows.length != 0) {
+						const diag = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfCallScript, args: [{ type: "test:state", },], newSandbox: false,
+						}).catch(() => null);
+						const diagState = diag && diag.value ? JSON.parse(diag.value) : null;
+						detail = () => JSON.stringify({
+							rows: memberRows,
+							hiddenByUs: diagState && diagState.hiddenByUs,
+						});
+					}
+					check("members keep no rows — a shelf costs one line", memberRows.length == 0, detail);
+				}
+				// the owner's row: title on the left, shelf on the right,
+				// capped at 2/3 of the width, one line, horizontally
+				// scrollable when the icons do not fit, and the row still
+				// does not grow.
+				{
+					const geometry = await marionette.command("WebDriver:ExecuteScript", {
+						script: strapGeometryScript, args: [e.owner, e.plain,], newSandbox: false,
+					}).catch(error => { console.log(`[drive] strap geometry probe failed: ${error.message}`); return null; });
+					const g = geometry && geometry.value ? JSON.parse(geometry.value) : null;
+					// the shelf exactly as it is: as wide as its icons need, or
+					// exactly as wide as the 2/3 cap allows — never narrower
+					// (0.1.4 squeezed it to a scrolling sliver beside a long
+					// title), and never scrolling while the icons fit (the old
+					// oracle ignored `naturalScrolls` and printed PASS next to
+					// scrolls=true).
+					const unit = g && g.expectedIconSize > 0 ? g.expectedIconSize : g && g.iconWidth;
+					const content = g ? g.naturalIcons * (unit + g.gap) - g.gap : 0;
+					const cap = g ? 0.66 * g.uiWidth : 0;
+					const overflows = content > cap + 2;
+					const fits = g && unit > 0 && g.naturalIcons > 0
+						&& g.iconWidth >= unit - 1
+						&& g.naturalWidth >= Math.min(content, cap) - 2
+						&& !(g.naturalScrolls && !overflows);
+					const geometryDetail = () => JSON.stringify(g);
+					check(`the natural shelf is as wide as its icons and does not scroll while they fit (icons=${g && g.naturalIcons} iconW=${g && g.iconWidth && g.iconWidth.toFixed(1)} unit=${g && g.expectedIconSize} shelfW=${g && g.naturalWidth && g.naturalWidth.toFixed(1)} cap=${cap.toFixed(1)} scrolls=${g && g.naturalScrolls})`, fits, geometryDetail);
+					const capped = g && g.ratio > 0 && g.ratio <= 0.68;
+					const scrolls = g && g.overflowX == "auto" && g.scrolls;
+					const truncated = g && g.inflatedLabelTruncated;
+					const noGrowth = g && Math.abs(g.rowHeight - g.plainHeight) < 2;
+					const cleaned = g && g.cleaned >= 2;
+					check(`the shelf never exceeds 2/3 of the owner row (ratio=${g && g.ratio.toFixed(2)})`, capped, geometryDetail);
+					check(`a shelf that does not fit scrolls horizontally (overflowX=${g && g.overflowX} scrolls=${g && g.scrolls})`, scrolls, geometryDetail);
+					check(`the owner title truncates to make room (label truncated=${g && g.inflatedLabelTruncated})`, truncated, geometryDetail);
+					check(`a full shelf still does not grow the owner row (row=${g && g.rowHeight} plain=${g && g.plainHeight})`, noGrowth, geometryDetail);
+					check("the geometry probe cleaned up its cloned icons", cleaned, geometryDetail);
+				}
+				{
+					const probe = await marionette.command("WebDriver:ExecuteScript", {
+						script: lineProbeScript, args: [e.owner,], newSandbox: false,
+					}).catch(error => { console.log(`[drive] line probe failed: ${error.message}`); return null; });
+					console.log(`[drive] line probe: ${probe && probe.value}`);
+				}
+				{
+					const conformance = await marionette.command("WebDriver:ExecuteScript", {
+						script: conformanceScript, args: [e.plain,], newSandbox: false,
+					}).catch(error => { console.log(`[drive] conformance probe failed: ${error.message}`); return null; });
+					const c = conformance && conformance.value ? JSON.parse(conformance.value) : null;
+					// `anchor` (first row minus the content origin) is part of the
+					// contract and was previously computed and then ignored:
+					// TST's computed positions are absolute, so a shifted first
+					// row shifts every drop zone below it.
+					check(`every rendered row sits at TST's computed position — drop zones exact (rows=${c && c.rows} rowH=${c && c.rowH && c.rowH.toFixed(1)} anchor=${c && c.anchor && c.anchor.toFixed(1)})`,
+						c && c.rows >= 2 && c.drift.length == 0 && c.rowH > 20 && c.anchor <= 1.5,
+						() => JSON.stringify(c));
+				}
+
+				// bug 3: the re-put member (B, the newest put) is the
+				// RIGHTMOST icon; C kept its earlier block slot.
+				{
+					const order = (dump.icons || []).map(icon => icon.id);
+					const expected = [String(e.members[1]), String(e.members[0]), String(e.f)];
+					check(`the newest member is the rightmost icon (${order.join(",")})`,
+						JSON.stringify(order) == JSON.stringify(expected),
+						() => `expected ${expected.join(",")}`);
+				}
+
+				check("both members are icons on the owner strap", byId[String(e.members[0])] && byId[String(e.members[1])], () => `both members are icons on the owner strap ${JSON.stringify(dump.icons)}`);
+
+				const iconB = byId[String(e.members[0])];
+				const iconC = byId[String(e.members[1])];
+				check("icons carry title tooltips", iconB && iconB.title == "shelf tree tab", () => `icons carry title tooltips ${iconB && iconB.title}`);
+
+				check("the folded member carries the plus badge", iconC && iconC.badge, () => `the folded member carries the plus badge ${JSON.stringify(iconC)}`);
+
+				check("icons are native drag sources", iconB && iconB.draggable == "true", () => `icons are native drag sources ${iconB && iconB.draggable}`);
+
+				check("favicons ride the style attribute through the sanitizer", iconB && iconB.hasBg, () => `favicons ride the style attribute through the sanitizer ${iconB && JSON.stringify(iconB)}`);
+
+				check("the root shelf strap holds the shelved root tab", (dump.rootIcons || []).some(icon => icon.id == String(e.rootMember)), () => `the root shelf strap holds the shelved root tab ${JSON.stringify(dump.rootIcons)}`);
+
+				// interaction: click C (unfold+activate), then B (one per shelf)
+				console.log("[drive] phase 2: clicking the C icon");
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
+				}).catch(error => console.log(`[drive] click-1 failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 4000));
+
+				let visibleInfo = null;
+				for (let i = 0; i < 10 && !(visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0); i++) {
+					const afterFirst = await marionette.command("WebDriver:ExecuteScript", {
+						script: visibilityScript,
+						args: [e.children[0], e.children[1], e.plain, e.owner,], newSandbox: false,
+					}).catch(error => { console.log(`[drive] visibility probe failed: ${error.message}`); return null; });
+					visibleInfo = afterFirst && afterFirst.value ? JSON.parse(afterFirst.value) : null;
+					if (visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0) { break; }
+					await new Promise(resolve => setTimeout(resolve, 1000));
+				}
+				check("the selected shelved tab's children render below the shelf", visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0, () => `the selected shelved tab's children render below the shelf ${JSON.stringify(visibleInfo)}`);
+
+				// bug 2 (0.1.4): the children dangle from the SHELF — the
+				// shelf is a single line inside the owner's row, so the
+				// children sit directly below that row and above the plain
+				// sibling that follows the member block, not below it.
+				// Rows must EXIST (a missing row would make the top
+				// comparison vacuously true).
+				check("the selected member's subtree dangles from the shelf, above the following siblings",
+					visibleInfo && visibleInfo.c1.exists && visibleInfo.c1.height > 0
+						&& visibleInfo.c2.exists && visibleInfo.c2.height > 0
+						&& visibleInfo.plain && visibleInfo.plain.height > 0
+						&& visibleInfo.c1.top < visibleInfo.plain.top && visibleInfo.c2.top < visibleInfo.plain.top,
+					() => JSON.stringify(visibleInfo && { c1: visibleInfo.c1, c2: visibleInfo.c2, plain: visibleInfo.plain && visibleInfo.plain.top }));
+				check("the selected member's children render directly below the owner row",
+					visibleInfo && visibleInfo.owner && visibleInfo.owner.height > 0
+						&& visibleInfo.c1.top >= visibleInfo.owner.top + visibleInfo.owner.height - 1,
+					() => JSON.stringify(visibleInfo && { owner: visibleInfo.owner.top + visibleInfo.owner.height, c1: visibleInfo.c1.top }));
+
+				const readSamples = async label => {
+					const read = await marionette.command("WebDriver:ExecuteScript", {
+						script: sampleReadScript, args: [], newSandbox: false,
+					}).catch(error => { console.log(`[drive] sampler read failed: ${error.message}`); return null; });
+					const samples = read && read.value ? JSON.parse(read.value) : [];
+					const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
+					console.log(`[drive] ${label} trail: tops=${JSON.stringify([...new Set(tops)])} frames=${samples.length}`);
+					return samples;
+				};
+
+				// -- 0.1.7: an UNSHELVED sibling takes the row AND the subtree
+				// C is active and unfolded (c1/c2 are rows).  D is a plain
+				// sibling, not on the shelf, so NO shelf-selection event
+				// happens: the member's row is reclaimed by the activation
+				// path alone.  0.1.6 reclaimed the row and left the children
+				// painted under a parent row that no longer existed
+				// (user-reported).  The subtree must fold FIRST, so that no
+				// frame ever shows a child without its parent.
+				const diagC = await marionette.command("WebDriver:ExecuteScript", {
+					script: shelfCallScript, args: [{ type: "test:state", },], newSandbox: false,
+				}).catch(() => null);
+				const diagCState = diagC && diagC.value ? JSON.parse(diagC.value) : null;
+				// the member's row must be back BEFORE the next activation
+				// (0.2.2: it is restored at activation time, not by the
+				// debounced re-derivation) — diagnostic on failure only
+				const memberRowBack = await marionette.command("WebDriver:ExecuteScript", {
+					script: rowPresenceScript, args: [[e.clickFirst,],], newSandbox: false,
+				}).catch(() => null);
+				const memberRowState = memberRowBack && memberRowBack.value ? JSON.parse(memberRowBack.value) : null;
+				check("the activated member's row is back before the next activation",
+					!!(memberRowState && memberRowState[e.clickFirst]),
+					() => JSON.stringify({ row: memberRowState, hiddenByUs: diagCState && diagCState.hiddenByUs, diag: diagCState && diagCState.diagLog, }));
+				console.log("[drive] phase 2: sampling while the plain sibling D is activated");
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
+				}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 120));
+				const activated = await marionette.command("WebDriver:ExecuteScript", {
+					script: activateScript, args: [e.plain,], newSandbox: false,
+				}).catch(error => { console.log(`[drive] activation failed: ${error.message}`); return null; });
+				console.log(`[drive] activate D: ${JSON.stringify(activated && activated.value)}`);
+				await new Promise(resolve => setTimeout(resolve, 3000));
+				{
+					const samples = await readSamples("plain sibling");
+					const parents = { [e.children[0]]: e.clickFirst, [e.children[1]]: e.clickFirst, };
+					const orphans = samples.filter(sample => {
+						const ids = String(sample.ids || "").split(",").filter(Boolean);
+						return Object.keys(parents).some(child => ids.includes(String(child)) && !ids.includes(String(parents[child])));
+					});
+					const startIds = String((samples[0] || {}).ids || "").split(",").filter(Boolean);
+					const startedWithMember = startIds.includes(String(e.clickFirst));
+					check("sampling starts with the member's row on screen", startedWithMember,
+						() => `start=${JSON.stringify(startIds)}`);
+					check("an unshelved sibling reclaims the member's row without orphaning its subtree", samples.length >= 30 && orphans.length == 0 && startedWithMember, () => `an unshelved sibling reclaims the member's row without orphaning its subtree (${orphans.length} orphan frames of ${samples.length}: ${JSON.stringify(orphans.slice(0, 3))})`);
+					const presence = await marionette.command("WebDriver:ExecuteScript", {
+						script: rowPresenceScript,
+						args: [[e.clickFirst, e.children[0], e.children[1], e.plain,],],
+						newSandbox: false,
+					}).catch(() => null);
+					const rows = presence && presence.value ? JSON.parse(presence.value) : null;
+					const gone = rows && !rows[e.clickFirst] && !rows[e.children[0]] && !rows[e.children[1]];
+					const siblingShown = rows && rows[e.plain];
+					check(`the member's row and its whole subtree are gone after the switch (${JSON.stringify(rows)})`,
+						gone && siblingShown);
+				}
+
+				// -- switching between shelf tabs must not move the tree
+				// C is active and unfolded (its two children are rows);
+				// the plain sibling D is the marker below the shelf.
+				// Two distinct requirements, measured separately:
+				//  (1) a parent's row must never disappear while its
+				//      children are still painted — TST animates a
+				//      collapse for 150 ms before it removes the rows,
+				//      so reclaiming the parent's row mid-way orphans
+				//      them (0.1.4 did exactly that);
+				//  (2) switching between two CHILDLESS members is a pure
+				//      row swap: the tree must not move at all.
+				console.log("[drive] phase 2: clicking the B icon (switch sampling)");
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
+				}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 120));
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
+				}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 2600));
+				{
+					const samples = await readSamples("switch");
+					// (1) orphan check: no frame where a child's row exists
+					// but its parent's row is gone
+					const parentOf = { [e.children[0]]: e.clickFirst, [e.children[1]]: e.clickFirst, };
+					const orphans = samples.filter(sample => {
+						const ids = String(sample.ids || "").split(",").filter(Boolean);
+						return Object.keys(parentOf).some(child => ids.includes(String(child)) && !ids.includes(String(parentOf[child])));
+					});
+					check("a parent's row never disappears while its children are still painted", samples.length >= 30 && orphans.length == 0, () => `a parent's row never disappears while its children are still painted (${orphans.length} frames of ${samples.length}: ${JSON.stringify(orphans.slice(0, 3))})`);
+				}
+
+				// (2) childless to childless: a pure row swap, no motion
+				console.log("[drive] phase 2: waiting for the childless member F's icon");
+				let sawF = false;
+				for (let attempt = 0; attempt < 20 && !sawF; attempt++) {
+					const response = await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [null,], newSandbox: false,
+					}).catch(() => null);
+					const dump2 = response && response.value ? JSON.parse(response.value) : null;
+					sawF = !!dump2 && (dump2.icons || []).some(icon => icon.id == String(e.f));
+					if (!sawF) { await new Promise(resolve => setTimeout(resolve, 500)); }
+				}
+				check("the childless member's icon appears (pure-swap switch)", sawF);
+				if (sawF) {
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.f,], newSandbox: false,
+					}).catch(error => console.log(`[drive] click-F failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 1500));
+					console.log("[drive] phase 2: clicking the B icon (pure swap sampling)");
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
+					}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 120));
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
+					}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 2600));
+					const samples = await readSamples("pure swap");
+					const seenSwap = [];
+					for (const sample of samples) {
+						const key = `${sample.rows}|${sample.ids}`;
+						if (!seenSwap.length || seenSwap[seenSwap.length - 1].key != key) { seenSwap.push({ key, t: sample.t, top: sample.top, }); }
+					}
+					console.log(`[drive] pure swap row sets: ${JSON.stringify(seenSwap.map(entry => [entry.t, entry.top, entry.key]))}`);
+					// the swap cannot be atomic: the incoming member is revealed by
+					// the activation and the outgoing one is hidden by us, two IPC
+					// messages that TST's sidebar paints in separate frames.  The
+					// measurable goal is therefore "one frame, not a visible jump":
+					// the tree returns to its exact position and is never displaced
+					// for more than a single sampled frame.
+					const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
+					const restingTop = tops.length ? tops[tops.length - 1] : null;
+					const displaced = samples.filter(sample => sample.top >= 0 && restingTop != null && Math.abs(sample.top - tops[0]) > 2);
+					const frameBudget = 2;
+					check(`switching between childless shelf tabs displaces the tree for at most ${displaced.length} frame(s) and returns it (${displaced.length * 17}ms)`,
+						samples.length >= 30 && displaced.length <= frameBudget && restingTop != null && Math.abs(restingTop - tops[0]) <= 2,
+						() => `${displaced.length} frames of ${samples.length}, trail ${JSON.stringify([...new Set(tops)])}`);
+
+				}
+
+				// -- a shelf of shelves: the owner must not vanish while a
+				// tab of ITS shelf is active.  Activate C (a member of A's
+				// shelf that owns a nested shelf), click c1 on that nested
+				// shelf, and check that C keeps its row — with it, the
+				// nested strap stays on screen.
+				console.log("[drive] phase 2: nested shelf check");
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
+				}).catch(error => console.log(`[drive] nested owner click failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 2000));
+				let nestedDump = null;
+				for (let attempt = 0; attempt < 20; attempt++) {
+					const response = await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [null,], newSandbox: false,
+					}).catch(() => null);
+					nestedDump = response && response.value ? JSON.parse(response.value) : null;
+					const row = nestedDump && nestedDump.rows.find(candidate => candidate.id == String(e.nestedOwner));
+					if (row && row.strap) { break; }
+					await new Promise(resolve => setTimeout(resolve, 500));
+				}
+				{
+					const row = nestedDump && nestedDump.rows.find(candidate => candidate.id == String(e.nestedOwner));
+					const icon = nestedDump && (nestedDump.icons || []).find(candidate => candidate.id == String(e.nestedMember));
+					check("a shelved tab that owns a shelf shows that shelf in its own row", row && row.strap && icon, () => `a shelved tab that owns a shelf shows that shelf in its own row (owner=${JSON.stringify(row)} member=${JSON.stringify(icon)})`);
+				}
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarScript, args: [e.nestedMember,], newSandbox: false,
+				}).catch(error => console.log(`[drive] nested member click failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 2500));
+				{
+					const response = await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [null,], newSandbox: false,
+					}).catch(() => null);
+					const dump3 = response && response.value ? JSON.parse(response.value) : null;
+					const row = dump3 && dump3.rows.find(candidate => candidate.id == String(e.nestedOwner));
+					const activeRow = dump3 && dump3.rows.find(candidate => candidate.id == String(e.nestedMember));
+					// 0.1.5 hid the owner here and the nested shelf vanished
+					// with it; the owner must keep its row instead
+					check("activating a tab of a nested shelf keeps that shelf's owner visible", row && row.strap, () => `activating a tab of a nested shelf keeps that shelf's owner visible (owner=${JSON.stringify(row)})`);
+					// A member is a hidden tab, and Firefox reveals a hidden tab
+					// the moment it becomes active: the activated nested member
+					// does get a row, and its own shelf (if any) hangs from it.
+					check(`the activated nested member has a row (hasRow=${!!activeRow})`, !!activeRow);
+				}
+				// leave C folded again: phase 3 asserts that TST's native
+				// fold state survives the reinstall
+				await marionette.command("WebDriver:ExecuteScript", {
+					script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
+				}).catch(error => console.log(`[drive] refold click failed: ${error.message}`));
+				await new Promise(resolve => setTimeout(resolve, 1500));
+
+				// -- reveal: from a FOLDED owner's shelf, only the activated
+				// tab's branch may appear (0.2.1).  Before this, TST expanded
+				// the tab AND ALL ITS ANCESTORS (handle-tab-focus.js), so the
+				// owner's whole subtree — the unshelved sibling D included —
+				// popped into view.  The other descendants' rows go through
+				// browser.tabs.hide().
+				{
+					const call = async message => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: shelfCallScript, args: [message,], newSandbox: false,
+						}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+						return response && response.value ? JSON.parse(response.value) : null;
+					};
+					const presence = async ids => {
+						const response = await marionette.command("WebDriver:ExecuteScript", {
+							script: rowPresenceScript, args: [ids,], newSandbox: false,
+						}).catch(() => null);
+						return response && response.value ? JSON.parse(response.value) : {};
+					};
+					await call({ type: "test:collapse", tabId: e.owner, windowId, collapsed: true, });
+					await new Promise(resolve => setTimeout(resolve, 2000));
+					const folded = await presence([e.owner, e.clickFirst, e.children[0], e.children[1], e.plain]);
+					console.log(`[drive] rows while the owner is folded: ${JSON.stringify(folded)}`);
+					check(`a folded owner renders no rows for its subtree`, folded[e.clickFirst] === false && folded[e.plain] === false);
+					// click C's icon: C's branch comes back, D must not
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
+					}).catch(error => console.log(`[drive] reveal click failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 2500));
+					const revealed = await presence([e.owner, e.clickFirst, e.children[0], e.children[1], e.plain, e.clickSecond, e.f]);
+					console.log(`[drive] rows after the reveal: ${JSON.stringify(revealed)}`);
+					// c1 is a member of C's OWN shelf, so it stays row-less (hidden);
+					// the branch that must appear is the owner, C and c2.
+					const branchOk = revealed[e.owner] && revealed[e.clickFirst] && revealed[e.children[1]];
+					check(`the activated shelf tab's branch has rows (owner, member, its plain child)`, branchOk);
+					check(`a nested member of the branch stays row-less (c1)`, revealed[e.children[0]] === false);
+					check(`the unshelved sibling keeps NO row under a reveal`, revealed[e.plain] === false);
+					const state = await call({ type: "test:state", });
+					const revealState = (state && state.reveals && state.reveals[windowId]) || [];
+					const suppressedHidden = (state && state.suppressedHiddenByUs) || [];
+					console.log(`[driver] reveal state: ${JSON.stringify({ reveal: revealState, suppressedHidden, debug: state && state.revealDebug, })}`);
+					const revealOk = revealState.some(([owner]) => owner == e.owner) && suppressedHidden.includes(e.plain);
+					check(`the addon keeps the owner expanded and accounts for the suppressed sibling (hidden)`, revealOk);
+					const hiddenSibling = (state && state.hiddenByUs) || [];
+					check(`a suppressed tab is never counted as a member hide`, !(hiddenSibling.includes(e.plain)));
+					const live = await marionette.command("WebDriver:ExecuteScript", {
+						script: rowAndStateScript, args: [[e.plain,],], newSandbox: false,
+					}).catch(() => null);
+					const liveState = live && live.value ? JSON.parse(live.value) : null;
+					const hiddenFlag = !!(liveState && liveState.hidden[e.plain]);
+					check(`the suppressed sibling is hidden (the stock lever)`, hiddenFlag === true);
+					// nested shelf: c1 is a member of C's OWN shelf, whose strap
+					// lives in C's row.  Clicking c1 must keep C's row — the
+					// branch is anchored on the owner's DIRECT child, so the
+					// whole nested shelf stays visible.
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: sidebarScript, args: [e.nestedMember,], newSandbox: false,
+					}).catch(error => console.log(`[drive] nested reveal click failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 2500));
+					const nested = await presence([e.clickFirst, e.nestedMember, e.plain]);
+					console.log(`[driver] rows after the nested click: ${JSON.stringify(nested)}`);
+					const nestedOk = nested[e.clickFirst] === true && nested[e.plain] === false;
+					check(`clicking a nested shelf member keeps the nested owner's row (its strap host)`, nestedOk);
+					// leaving the owner's subtree ends the reveal and folds it back
+					await marionette.command("WebDriver:ExecuteScript", {
+						script: activateScript, args: [e.rootMember,], newSandbox: false,
+					}).catch(error => console.log(`[drive] root activation failed: ${error.message}`));
+					await new Promise(resolve => setTimeout(resolve, 2500));
+					const afterState = await call({ type: "test:state", });
+					const revealAfter = (afterState && afterState.reveals && afterState.reveals[windowId]) || [];
+					const suppressedHiddenAfter = (afterState && afterState.suppressedHiddenByUs) || [];
+					const backRows = await presence([e.owner, e.clickFirst, e.plain]);
+					const backLive = await marionette.command("WebDriver:ExecuteScript", {
+						script: rowAndStateScript, args: [[e.plain,],], newSandbox: false,
+					}).catch(() => null);
+					const backState = backLive && backLive.value ? JSON.parse(backLive.value) : null;
+					console.log(`[driver] after leaving: ${JSON.stringify({ revealAfter, suppressedHiddenAfter, backRows, backState, })}`);
+					const ended = revealAfter.length == 0 &&
+						suppressedHiddenAfter.length == 0 &&
+						backRows[e.clickFirst] === false;
+					check(`leaving the owner's subtree ends the reveal and the owner folds back`, ended);
+					// the suppressed sibling must come back to the browser too
+					const siblingBack = !(backState && backState.hidden[e.plain]);
+					check(`ending the reveal restores the suppressed sibling's visibility`, siblingBack);
+				}
+			}
+		}
+	}
 }
 
 async function main () {
@@ -630,12 +1080,6 @@ async function main () {
 		});
 		console.log(`[drive] console mirror: ${JSON.stringify(mirror?.value ?? mirror)}`);
 
-		if (TST_PATCH) {
-			const tstInstall = await marionette.command("Addon:Install", {
-				path: TST_PATCH, temporary: true,
-			});
-			console.log(`[drive] temporary install (patched TST): ${JSON.stringify(tstInstall?.value ?? tstInstall)}`);
-		}
 		const install = await marionette.command("Addon:Install", {
 			path: DIST, temporary: true, allowPrivateBrowsing: false,
 		});
@@ -650,810 +1094,13 @@ async function main () {
 		const windowId = expect && expect.windowId;
 		if (expect) {
 			for (const entry of expect.results || []) {
-				console.log(`${entry.ok ? "PASS" : "FAIL"} [setup] ${entry.name}${entry.detail ? " " + entry.detail : ""}`);
+				check(entry.name, entry.ok, entry.detail, "setup");
 			}
-			if ((expect.results || []).some(entry => !entry.ok)) { process.exitCode = process.exitCode || 1; }
 		}
 
 		// -- phase 2: sidebar DOM assertions + synthetic clicks ------------
-		if (windowId != null) {
-			// A temporary install never reaches prefs.js, so ask the policy
-			// registry for the sidebar URL and fall back to the sideloaded
-			// UUID only if that fails.
-			let baseUrl = null;
-			for (let i = 0; i < 40 && !baseUrl; i++) {
-				const url = await marionette.command("Marionette:SetContext", { value: "chrome", })
-					.then(() => marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarUrlScript, args: ["treestyletab@piro.sakura.ne.jp",], newSandbox: false,
-					}))
-					.then(response => response && response.value, () => null);
-				const uuid = readTstUuid(PREFS);
-				baseUrl = url || (uuid ? `moz-extension://${uuid}/sidebar/sidebar.html` : null);
-				if (!baseUrl) { await new Promise(resolve => setTimeout(resolve, 500)); }
-			}
-			await marionette.command("Marionette:SetContext", { value: "content", }).catch(() => {});
-			if (!baseUrl) {
-				console.log("FAIL [driver] TST sidebar URL resolvable");
-				process.exitCode = process.exitCode || 1;
-			} else {
-				const pageUrl = `${baseUrl}?windowId=${windowId}`;
-				console.log(`[drive] phase 2: opening ${pageUrl}`);
-				await marionette.command("Marionette:SetContext", { value: "content", });
-				try {
-					const win = await commandTry(marionette, "WebDriver:NewWindow", ["Marionette:NewWindow"], { type: "tab", });
-					const handle = (win && (win.handle || (win.value && win.value.handle))) || null;
-					if (handle) {
-						await commandTry(marionette, "WebDriver:SwitchToWindow", ["Marionette:SwitchToWindow"], { handle, });
-					}
-					await commandTry(marionette, "WebDriver:Navigate", ["Marionette:GetURL"], { url: pageUrl, });
-				// A tall window keeps every row inside TST's virtual-scroll
-				// render range; a short headless viewport legitimately skips
-				// off-screen rows (exists: false), which is TST working as
-				// designed, not a shelf bug.
-				await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 900, }).catch(() => {});
-				} catch (error) {
-					console.log(`[drive] phase 2 navigation failed: ${error.message}`);
-				}
-				await new Promise(resolve => setTimeout(resolve, 6000));
+		await runSidebarPhase(marionette, { windowId, expect, });
 
-				// poll until the straps rendered (the tabs-rendered restore path)
-				let dump = null;
-				for (let attempt = 0; attempt < 24; attempt++) {
-					const response = await marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarScript, args: [null,], newSandbox: false,
-					}).catch(error => { console.log(`[drive] sidebar dump failed: ${error.message}`); return null; });
-					dump = response && response.value ? JSON.parse(response.value) : null;
-					if (dump && dump.icons.length >= 2) { break; }
-					await new Promise(resolve => setTimeout(resolve, 1000));
-				}
-				// decisive probe: push a state through TST's own bridge
-				const probe = await marionette.command("WebDriver:ExecuteScript", {
-					script: stateProbeScript, args: [windowId,], newSandbox: false,
-				}).catch(error => { console.log(`[drive] state probe failed: ${error.message}`); return null; });
-				console.log(`[drive] state probe: ${probe && probe.value}`);
-				if (!dump || dump.icons.length < 2) {
-					const diag = dump ?
-						`href=${dump.href} ready=${dump.readyState} tabItems=${dump.allTabItems} rows=${dump.rowsWithTabId} normalChildren=${dump.normalChildren}` :
-						"(no dump)";
-					console.log(`FAIL [driver] shelf icons render in the owner strap ${diag}`);
-					process.exitCode = process.exitCode || 1;
-				} else {
-					console.log(`[drive] row classes: ${JSON.stringify((dump.rows || []).map(row => [row.id, row.classes]))}`);
-					const e = expect.expect;
-					const byId = Object.fromEntries(dump.icons.map(icon => [icon.id, icon]));
-
-					if (dump.rows.find(row => row.id == String(e.owner) && row.classes.includes("tst-shelf-owner"))) {
-						console.log("PASS [driver] owner row carries the tst-shelf-owner class");
-					} else {
-						console.log("FAIL [driver] owner row carries the tst-shelf-owner class");
-						process.exitCode = process.exitCode || 1;
-					}
-
-					// uniform-row law (0.1.4): the strap lives INSIDE the
-					// owner's own row (beside the caption), so the owner row
-					// keeps its DEFAULT height and every rendered row sits
-					// exactly where TST's index arithmetic expects it (the
-					// drop-zone guarantee: 0.1.1 grew owner rows and collapsed
-					// member rows, shifting every computed rect below each
-					// shelf, and drops there always landed as siblings).
-					{
-						const ownerRow = dump.rows.find(row => row.id == String(e.owner));
-						const plainRow = dump.rows.find(row => row.id == String(e.plain));
-						if (ownerRow && plainRow && Math.abs(ownerRow.height - plainRow.height) < 2) {
-							console.log(`PASS [driver] the owner row keeps its normal height (owner=${ownerRow.height.toFixed(1)} plain=${plainRow.height.toFixed(1)})`);
-						} else {
-							console.log(`FAIL [driver] the owner row keeps its normal height (owner=${ownerRow && ownerRow.height} plain=${plainRow && plainRow.height})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-					{
-						const ownerRow = dump.rows.find(row => row.id == String(e.owner));
-						if (ownerRow && ownerRow.strap && ownerRow.classes.includes("tst-shelf-owner")) {
-							console.log("PASS [driver] the strap renders inside the owner's own row");
-						} else {
-							console.log(`FAIL [driver] the strap renders inside the owner's own row (${JSON.stringify(ownerRow)})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-					// no member rows at all: a hidden tab has no row, so the
-					// shelf costs exactly one line (0.1.3's blank member boxes
-					// were the "vertical gaps").  The invariant is about the
-					// SETTLED sidebar — the addon re-applies addon states when a
-					// sidebar appears (TST's initial import carries only its own
-					// safe states), and that pass is debounced — so poll instead
-					// of reading the very first frame that has icons.
-					{
-						let memberRows = [];
-						for (let attempt = 0; attempt < 6; attempt++) {
-							const fresh = await marionette.command("WebDriver:ExecuteScript", {
-								script: sidebarScript, args: [null,], newSandbox: false,
-							}).catch(() => null);
-							const again = fresh && fresh.value ? JSON.parse(fresh.value) : null;
-							if (!again) { break; }
-							memberRows = e.members.filter(id => again.rows.some(row => row.id == String(id)));
-							if (memberRows.length == 0) { break; }
-							await new Promise(resolve => setTimeout(resolve, 500));
-						}
-						if (memberRows.length == 0) {
-							console.log("PASS [driver] members keep no rows — a shelf costs one line");
-						} else {
-							const diag = await marionette.command("WebDriver:ExecuteScript", {
-								script: shelfCallScript, args: [{ type: "test:state", },], newSandbox: false,
-							}).catch(() => null);
-							const diagState = diag && diag.value ? JSON.parse(diag.value) : null;
-							console.log(`[driver] member-row diagnostic: ${JSON.stringify({
-								claimed: diagState && diagState.rowLessByUs,
-								retries: diagState && diagState.rowLessTries,
-								caps: diagState && diagState.capabilities,
-							})}`);
-							console.log(`FAIL [driver] members keep no rows — a shelf costs one line (rows=${JSON.stringify(memberRows)})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-					// the owner's row: title on the left, shelf on the right,
-					// capped at 2/3 of the width, one line, horizontally
-					// scrollable when the icons do not fit, and the row still
-					// does not grow.
-					{
-						const geometry = await marionette.command("WebDriver:ExecuteScript", {
-							script: strapGeometryScript, args: [e.owner, e.plain,], newSandbox: false,
-						}).catch(error => { console.log(`[drive] strap geometry probe failed: ${error.message}`); return null; });
-						const g = geometry && geometry.value ? JSON.parse(geometry.value) : null;
-						// the shelf exactly as it is: the icons must fit — a
-					// shrinkable shelf next to a long title collapsed to
-					// less than one icon and started scrolling (0.1.4 bug)
-					{
-						// the shelf must be as wide as it needs, or exactly as wide as
-						// its cap allows — never narrower (0.1.4 squeezed it to a
-						// scrolling sliver next to a long title)
-						const unit = g && g.expectedIconSize > 0 ? g.expectedIconSize : g && g.iconWidth;
-						const content = g ? g.naturalIcons * (unit + g.gap) - g.gap : 0;
-						const cap = g ? 0.66 * g.uiWidth : 0;
-						const fits = g && unit > 0 && g.naturalIcons > 0
-							&& g.iconWidth >= unit - 1
-							&& g.naturalWidth >= Math.min(content, cap) - 2;
-						console.log(`${fits ? "PASS" : "FAIL"} [driver] the natural shelf fits its icons without scrolling (icons=${g && g.naturalIcons} iconW=${g && g.iconWidth && g.iconWidth.toFixed(1)} unit=${g && g.expectedIconSize} shelfW=${g && g.naturalWidth && g.naturalWidth.toFixed(1)} scrolls=${g && g.naturalScrolls})`);
-						if (!fits) {
-							console.log(`       geometry detail: ${JSON.stringify(g)}`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-					const capped = g && g.ratio > 0 && g.ratio <= 0.68;
-						const scrolls = g && g.overflowX == "auto" && g.scrolls;
-						const truncated = g && g.inflatedLabelTruncated;
-						const noGrowth = g && Math.abs(g.rowHeight - g.plainHeight) < 2;
-						const cleaned = g && g.cleaned >= 2;
-						console.log(`${capped ? "PASS" : "FAIL"} [driver] the shelf never exceeds 2/3 of the owner row (ratio=${g && g.ratio.toFixed(2)})`);
-						console.log(`${scrolls ? "PASS" : "FAIL"} [driver] a shelf that does not fit scrolls horizontally (overflowX=${g && g.overflowX} scrolls=${g && g.scrolls})`);
-						console.log(`${truncated ? "PASS" : "FAIL"} [driver] the owner title truncates to make room (label truncated=${g && g.inflatedLabelTruncated})`);
-						console.log(`${noGrowth ? "PASS" : "FAIL"} [driver] a full shelf still does not grow the owner row (row=${g && g.rowHeight} plain=${g && g.plainHeight})`);
-						if (!(capped && scrolls && truncated && noGrowth && cleaned)) {
-							console.log(`       geometry detail: ${JSON.stringify(g)}`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-					{
-						const probe = await marionette.command("WebDriver:ExecuteScript", {
-							script: lineProbeScript, args: [e.owner,], newSandbox: false,
-						}).catch(error => { console.log(`[drive] line probe failed: ${error.message}`); return null; });
-						console.log(`[drive] line probe: ${probe && probe.value}`);
-					}
-					if (TST_PATCH) {
-						// -- A3: a row can be N whole lines, and the geometry
-						// accounts for it exactly.  The addon declares the count
-						// (`lines` on set-extra-contents); TST makes the row that
-						// tall and computes every position from a sum of pitches.
-						// Measured at 1 line and at 3: the row must be 3 pitches
-						// tall and TST's computed extent must grow by exactly two.
-						const call = async message => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: shelfCallScript, args: [message,], newSandbox: false,
-							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
-							return response && response.value ? JSON.parse(response.value) : null;
-						};
-						const readExtent = async () => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: extentScript, args: [e.owner, e.plain,], newSandbox: false,
-							}).catch(() => null);
-							return response && response.value ? JSON.parse(response.value) : null;
-						};
-						// the extent is only materialized while the tab bar overflows
-						await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 220, }).catch(() => {});
-						await new Promise(resolve => setTimeout(resolve, 1200));
-						await call({ type: "test:lines", owner: e.owner, lines: 1, windowId, });
-						await new Promise(resolve => setTimeout(resolve, 1200));
-						const one = await readExtent();
-						await call({ type: "test:lines", owner: e.owner, lines: 3, windowId, });
-						await new Promise(resolve => setTimeout(resolve, 1200));
-						const three = await readExtent();
-						console.log(`[drive] A3 one line: ${JSON.stringify(one)}`);
-						console.log(`[drive] A3 three lines: ${JSON.stringify(three)}`);
-						const rendered = (one && one.rowList) || [];
-						const pitch = rendered.length
-							? rendered.map(row => row.height).sort((a, b) => a - b)[0]
-							: 0;
-						const rowGrew = one && three && pitch > 0
-							&& Math.abs(one.ownerHeight - pitch) <= 2
-							&& Math.abs(three.ownerHeight - 3 * pitch) <= 2;
-						console.log(`${rowGrew ? "PASS" : "FAIL"} [driver] A3: a row of N declared lines paints N lines (1 line=${one && one.ownerHeight}, 3 lines=${three && three.ownerHeight}, pitch=${pitch})`);
-						if (!rowGrew) { process.exitCode = process.exitCode || 1; }
-						const extentGrew = one && three && pitch > 0 && one.minHeight > 0
-							&& Math.abs((three.minHeight - one.minHeight) - 2 * pitch) <= 2;
-						console.log(`${extentGrew ? "PASS" : "FAIL"} [driver] A3: TST's computed scroll extent grows by exactly the extra lines (${one && one.minHeight} -> ${three && three.minHeight}, pitch=${pitch})`);
-						if (!extentGrew) { process.exitCode = process.exitCode || 1; }
-						// the row that follows the grown one must start exactly where
-						// the grown row ends: painted flow and computed geometry agree
-						const ownerTop = three && (three.rowList.find(row => row.id == String(e.owner)) || {}).top;
-						const follower = three && three.rowList.find(row => row.id != String(e.owner));
-						const contiguous = three && ownerTop != null && follower
-							&& Math.abs(follower.top - (ownerTop + three.ownerHeight)) <= 2;
-						console.log(`${contiguous ? "PASS" : "FAIL"} [driver] A3: the next row starts exactly where the grown row ends (owner=${ownerTop}+${three && three.ownerHeight}, next=${follower && follower.top})`);
-						if (!contiguous) { process.exitCode = process.exitCode || 1; }
-						// restore: the addon's own computation, tall window
-						await call({ type: "test:lines", owner: e.owner, lines: 0, windowId, });
-						await commandTry(marionette, "WebDriver:SetWindowRect", ["Marionette:SetWindowRect"], { width: 480, height: 900, }).catch(() => {});
-						await new Promise(resolve => setTimeout(resolve, 1500));
-					}
-					{
-						// -- B: a row-less tab keeps the tab but loses its row.
-						// This is the capability feature 1 of 0.2.0 needs; a stock
-						// TST ignores the state and keeps the row (that is the
-						// documented fallback).  Read it on a PLAIN tab, so the
-						// answer is not confused with our own hiding of members.
-						const call = async message => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: shelfCallScript, args: [message,], newSandbox: false,
-							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
-							return response && response.value ? JSON.parse(response.value) : null;
-						};
-						const probe = async () => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: rowlessProbeScript, args: [e.plain,], newSandbox: false,
-							}).catch(() => null);
-							return response && response.value ? JSON.parse(response.value) : null;
-						};
-						const before = await probe();
-						await call({ type: "test:tab-state", tabId: e.plain, state: "row-less", windowId, });
-						await new Promise(resolve => setTimeout(resolve, 1500));
-						const during = await probe();
-						await call({ type: "test:tab-state", tabId: e.plain, state: "row-less", add: false, windowId, });
-						await new Promise(resolve => setTimeout(resolve, 1500));
-						const after = await probe();
-						console.log(`[drive] row-less probe: ${JSON.stringify({ before, during, after, patched: !!TST_PATCH })}`);
-						const lostRow = TST_PATCH ? (during && !during.hasRow) : (during && during.hasRow);
-						const stayedVisible = during && during.hidden === false;
-						const restored = after && after.hasRow;
-						console.log(`${lostRow && stayedVisible ? "PASS" : "FAIL"} [driver] ${TST_PATCH ? "B: a row-less tab loses its row while staying visible" : "B fallback: a stock TST ignores row-less and keeps the row"} (hasRow=${during && during.hasRow} hidden=${during && during.hidden})`);
-						if (!(lostRow && stayedVisible)) { process.exitCode = process.exitCode || 1; }
-						console.log(`${restored ? "PASS" : "FAIL"} [driver] clearing row-less brings the row back`);
-						if (!restored) { process.exitCode = process.exitCode || 1; }
-					}
-					{
-						const conformance = await marionette.command("WebDriver:ExecuteScript", {
-							script: conformanceScript, args: [e.plain,], newSandbox: false,
-						}).catch(error => { console.log(`[drive] conformance probe failed: ${error.message}`); return null; });
-						const c = conformance && conformance.value ? JSON.parse(conformance.value) : null;
-						if (c && c.rows >= 2 && c.drift.length == 0 && c.rowH > 20) {
-							console.log(`PASS [driver] every rendered row sits at TST's computed position — drop zones exact (rows=${c.rows} rowH=${c.rowH.toFixed(1)} anchor=${c.anchor.toFixed(1)})`);
-						} else {
-							console.log(`FAIL [driver] every rendered row sits at TST's computed position — drop zones exact ${JSON.stringify(c)}`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-
-					// bug 3: the re-put member (B, the newest put) is the
-					// RIGHTMOST icon; C kept its earlier block slot.
-					{
-						const order = (dump.icons || []).map(icon => icon.id);
-						const expected = [String(e.members[1]), String(e.members[0]), String(e.f)];
-						if (JSON.stringify(order) == JSON.stringify(expected)) {
-							console.log(`PASS [driver] the newest member is the rightmost icon (${order.join(",")})`);
-						} else {
-							console.log(`FAIL [driver] the newest member is the rightmost icon (got ${order.join(",")})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-
-					if (byId[String(e.members[0])] && byId[String(e.members[1])]) {
-						console.log("PASS [driver] both members are icons on the owner strap");
-					} else {
-						console.log(`FAIL [driver] both members are icons on the owner strap ${JSON.stringify(dump.icons)}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					const iconB = byId[String(e.members[0])];
-					const iconC = byId[String(e.members[1])];
-					if (iconB && iconB.title == "shelf tree tab") {
-						console.log("PASS [driver] icons carry title tooltips");
-					} else {
-						console.log(`FAIL [driver] icons carry title tooltips ${iconB && iconB.title}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					if (iconC && iconC.badge) {
-						console.log("PASS [driver] the folded member carries the plus badge");
-					} else {
-						console.log(`FAIL [driver] the folded member carries the plus badge ${JSON.stringify(iconC)}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					if (iconB && iconB.draggable == "true") {
-						console.log("PASS [driver] icons are native drag sources");
-					} else {
-						console.log(`FAIL [driver] icons are native drag sources ${iconB && iconB.draggable}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					if (iconB && iconB.hasBg) {
-						console.log("PASS [driver] favicons ride the style attribute through the sanitizer");
-					} else {
-						console.log(`FAIL [driver] favicons ride the style attribute through the sanitizer ${iconB && JSON.stringify(iconB)}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					if ((dump.rootIcons || []).some(icon => icon.id == String(e.rootMember))) {
-						console.log("PASS [driver] the root shelf strap holds the shelved root tab");
-					} else {
-						console.log(`FAIL [driver] the root shelf strap holds the shelved root tab ${JSON.stringify(dump.rootIcons)}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					// interaction: click C (unfold+activate), then B (one per shelf)
-					console.log("[drive] phase 2: clicking the C icon");
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
-					}).catch(error => console.log(`[drive] click-1 failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 4000));
-
-					let visibleInfo = null;
-					for (let i = 0; i < 10 && !(visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0); i++) {
-						const afterFirst = await marionette.command("WebDriver:ExecuteScript", {
-							script: visibilityScript,
-							args: [e.children[0], e.children[1], e.plain, e.owner,], newSandbox: false,
-						}).catch(error => { console.log(`[drive] visibility probe failed: ${error.message}`); return null; });
-						visibleInfo = afterFirst && afterFirst.value ? JSON.parse(afterFirst.value) : null;
-						if (visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0) { break; }
-						await new Promise(resolve => setTimeout(resolve, 1000));
-					}
-					if (visibleInfo && visibleInfo.c1.height > 0 && visibleInfo.c2.height > 0) {
-						console.log("PASS [driver] the selected shelved tab's children render below the shelf");
-					} else {
-						console.log(`FAIL [driver] the selected shelved tab's children render below the shelf ${JSON.stringify(visibleInfo)}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					// bug 2 (0.1.4): the children dangle from the SHELF — the
-					// shelf is a single line inside the owner's row, so the
-					// children sit directly below that row and above the plain
-					// sibling that follows the member block, not below it.
-					// Rows must EXIST (a missing row would make the top
-					// comparison vacuously true).
-					if (visibleInfo && visibleInfo.c1.exists && visibleInfo.c1.height > 0
-						&& visibleInfo.c2.exists && visibleInfo.c2.height > 0
-						&& visibleInfo.plain && visibleInfo.plain.height > 0
-						&& visibleInfo.c1.top < visibleInfo.plain.top && visibleInfo.c2.top < visibleInfo.plain.top) {
-						console.log("PASS [driver] the selected member's subtree dangles from the shelf, above the following siblings");
-					} else {
-						console.log(`FAIL [driver] the selected member's subtree dangles from the shelf, above the following siblings ${JSON.stringify(visibleInfo && { c1: visibleInfo.c1, c2: visibleInfo.c2, plain: visibleInfo.plain && visibleInfo.plain.top })}`);
-						process.exitCode = process.exitCode || 1;
-					}
-					if (visibleInfo && visibleInfo.owner && visibleInfo.owner.height > 0
-						&& visibleInfo.c1.top >= visibleInfo.owner.top + visibleInfo.owner.height - 1) {
-						console.log("PASS [driver] the selected member's children render directly below the owner row");
-					} else {
-						console.log(`FAIL [driver] the selected member's children render directly below the owner row ${JSON.stringify(visibleInfo && { owner: visibleInfo.owner.top + visibleInfo.owner.height, c1: visibleInfo.c1.top })}`);
-						process.exitCode = process.exitCode || 1;
-					}
-
-					const readSamples = async label => {
-						const read = await marionette.command("WebDriver:ExecuteScript", {
-							script: sampleReadScript, args: [], newSandbox: false,
-						}).catch(error => { console.log(`[drive] sampler read failed: ${error.message}`); return null; });
-						const samples = read && read.value ? JSON.parse(read.value) : [];
-						const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
-						console.log(`[drive] ${label} trail: tops=${JSON.stringify([...new Set(tops)])} frames=${samples.length}`);
-						return samples;
-					};
-
-					// -- 0.1.7: an UNSHELVED sibling takes the row AND the subtree
-					// C is active and unfolded (c1/c2 are rows).  D is a plain
-					// sibling, not on the shelf, so NO shelf-selection event
-					// happens: the member's row is reclaimed by the activation
-					// path alone.  0.1.6 reclaimed the row and left the children
-					// painted under a parent row that no longer existed
-					// (user-reported).  The subtree must fold FIRST, so that no
-					// frame ever shows a child without its parent.
-					const diagC = await marionette.command("WebDriver:ExecuteScript", {
-						script: shelfCallScript, args: [{ type: "test:state", },], newSandbox: false,
-					}).catch(() => null);
-					const diagCState = diagC && diagC.value ? JSON.parse(diagC.value) : null;
-					// the member's row must be back BEFORE the next activation
-					// (0.2.2: it is restored at activation time, not by the
-					// debounced re-derivation) — diagnostic on failure only
-					const memberRowBack = await marionette.command("WebDriver:ExecuteScript", {
-						script: rowPresenceScript, args: [[e.clickFirst,],], newSandbox: false,
-					}).catch(() => null);
-					const memberRowState = memberRowBack && memberRowBack.value ? JSON.parse(memberRowBack.value) : null;
-					if (!(memberRowState && memberRowState[e.clickFirst])) {
-						console.log(`[driver] member row missing after the click: ${JSON.stringify({ row: memberRowState, claimed: diagCState && diagCState.rowLessByUs, trace: diagCState && diagCState.rowLessDebug, diag: diagCState && diagCState.diagLog, })}`);
-						process.exitCode = process.exitCode || 1;
-					}
-					console.log("[drive] phase 2: sampling while the plain sibling D is activated");
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
-					}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 120));
-					const activated = await marionette.command("WebDriver:ExecuteScript", {
-						script: activateScript, args: [e.plain,], newSandbox: false,
-					}).catch(error => { console.log(`[drive] activation failed: ${error.message}`); return null; });
-					console.log(`[drive] activate D: ${JSON.stringify(activated && activated.value)}`);
-					await new Promise(resolve => setTimeout(resolve, 3000));
-					{
-						const samples = await readSamples("plain sibling");
-						const parents = { [e.children[0]]: e.clickFirst, [e.children[1]]: e.clickFirst, };
-						const orphans = samples.filter(sample => {
-							const ids = String(sample.ids || "").split(",").filter(Boolean);
-							return Object.keys(parents).some(child => ids.includes(String(child)) && !ids.includes(String(parents[child])));
-						});
-						const startIds = String((samples[0] || {}).ids || "").split(",").filter(Boolean);
-						const startedWithMember = startIds.includes(String(e.clickFirst));
-						if (!startedWithMember) {
-							console.log(`FAIL [driver] sampling starts with the member's row on screen (start=${JSON.stringify(startIds)})`);
-							process.exitCode = process.exitCode || 1;
-						}
-						if (samples.length >= 30 && orphans.length == 0 && startedWithMember) {
-							console.log("PASS [driver] an unshelved sibling reclaims the member's row without orphaning its subtree");
-						} else {
-							console.log(`FAIL [driver] an unshelved sibling reclaims the member's row without orphaning its subtree (${orphans.length} orphan frames of ${samples.length}: ${JSON.stringify(orphans.slice(0, 3))})`);
-							process.exitCode = process.exitCode || 1;
-						}
-						const presence = await marionette.command("WebDriver:ExecuteScript", {
-							script: rowPresenceScript,
-							args: [[e.clickFirst, e.children[0], e.children[1], e.plain,],],
-							newSandbox: false,
-						}).catch(() => null);
-						const rows = presence && presence.value ? JSON.parse(presence.value) : null;
-						const gone = rows && !rows[e.clickFirst] && !rows[e.children[0]] && !rows[e.children[1]];
-						const siblingShown = rows && rows[e.plain];
-						if (gone && siblingShown) {
-							console.log(`PASS [driver] the member's row and its whole subtree are gone after the switch (${JSON.stringify(rows)})`);
-						} else {
-							console.log(`FAIL [driver] the member's row and its whole subtree are gone after the switch (${JSON.stringify(rows)})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-
-					// -- switching between shelf tabs must not move the tree
-					// C is active and unfolded (its two children are rows);
-					// the plain sibling D is the marker below the shelf.
-					// Two distinct requirements, measured separately:
-					//  (1) a parent's row must never disappear while its
-					//      children are still painted — TST animates a
-					//      collapse for 150 ms before it removes the rows,
-					//      so reclaiming the parent's row mid-way orphans
-					//      them (0.1.4 did exactly that);
-					//  (2) switching between two CHILDLESS members is a pure
-					//      row swap: the tree must not move at all.
-					console.log("[drive] phase 2: clicking the B icon (switch sampling)");
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
-					}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 120));
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
-					}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 2600));
-					{
-						const samples = await readSamples("switch");
-						// (1) orphan check: no frame where a child's row exists
-						// but its parent's row is gone
-						const parentOf = { [e.children[0]]: e.clickFirst, [e.children[1]]: e.clickFirst, };
-						const orphans = samples.filter(sample => {
-							const ids = String(sample.ids || "").split(",").filter(Boolean);
-							return Object.keys(parentOf).some(child => ids.includes(String(child)) && !ids.includes(String(parentOf[child])));
-						});
-						if (samples.length >= 30 && orphans.length == 0) {
-							console.log("PASS [driver] a parent's row never disappears while its children are still painted");
-						} else {
-							console.log(`FAIL [driver] a parent's row never disappears while its children are still painted (${orphans.length} frames of ${samples.length}: ${JSON.stringify(orphans.slice(0, 3))})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-
-					// (2) childless to childless: a pure row swap, no motion
-					console.log("[drive] phase 2: waiting for the childless member F's icon");
-					let sawF = false;
-					for (let attempt = 0; attempt < 20 && !sawF; attempt++) {
-						const response = await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [null,], newSandbox: false,
-						}).catch(() => null);
-						const dump2 = response && response.value ? JSON.parse(response.value) : null;
-						sawF = !!dump2 && (dump2.icons || []).some(icon => icon.id == String(e.f));
-						if (!sawF) { await new Promise(resolve => setTimeout(resolve, 500)); }
-					}
-					if (!sawF) {
-						console.log("FAIL [driver] the childless member's icon appears (pure-swap switch)");
-						process.exitCode = process.exitCode || 1;
-					} else {
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [e.f,], newSandbox: false,
-						}).catch(error => console.log(`[drive] click-F failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 1500));
-						console.log("[drive] phase 2: clicking the B icon (pure swap sampling)");
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: sampleStartScript, args: [e.plain, 150,], newSandbox: false,
-						}).catch(error => console.log(`[drive] sampler start failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 120));
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
-						}).catch(error => console.log(`[drive] click-2 failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 2600));
-						const samples = await readSamples("pure swap");
-						const seenSwap = [];
-						for (const sample of samples) {
-							const key = `${sample.rows}|${sample.ids}`;
-							if (!seenSwap.length || seenSwap[seenSwap.length - 1].key != key) { seenSwap.push({ key, t: sample.t, top: sample.top, }); }
-						}
-						console.log(`[drive] pure swap row sets: ${JSON.stringify(seenSwap.map(entry => [entry.t, entry.top, entry.key]))}`);
-						// the swap cannot be atomic: the incoming member is revealed by
-						// the activation and the outgoing one is hidden by us, two IPC
-						// messages that TST's sidebar paints in separate frames.  The
-						// measurable goal is therefore "one frame, not a visible jump":
-						// the tree returns to its exact position and is never displaced
-						// for more than a single sampled frame.
-						const tops = samples.filter(sample => sample.top >= 0).map(sample => sample.top);
-						const restingTop = tops.length ? tops[tops.length - 1] : null;
-						const displaced = samples.filter(sample => sample.top >= 0 && restingTop != null && Math.abs(sample.top - tops[0]) > 2);
-						const frameBudget = 2;
-						if (samples.length >= 30 && displaced.length <= frameBudget && restingTop != null && Math.abs(restingTop - tops[0]) <= 2) {
-							console.log(`PASS [driver] switching between childless shelf tabs displaces the tree for at most ${displaced.length} frame(s) and returns it (${displaced.length * 17}ms)`);
-						} else {
-							console.log(`FAIL [driver] switching between childless shelf tabs displaces the tree (${displaced.length} frames of ${samples.length}, trail ${JSON.stringify([...new Set(tops)])})`);
-							process.exitCode = process.exitCode || 1;
-						}
-
-					}
-
-					// -- a shelf of shelves: the owner must not vanish while a
-					// tab of ITS shelf is active.  Activate C (a member of A's
-					// shelf that owns a nested shelf), click c1 on that nested
-					// shelf, and check that C keeps its row — with it, the
-					// nested strap stays on screen.
-					console.log("[drive] phase 2: nested shelf check");
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
-					}).catch(error => console.log(`[drive] nested owner click failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 2000));
-					let nestedDump = null;
-					for (let attempt = 0; attempt < 20; attempt++) {
-						const response = await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [null,], newSandbox: false,
-						}).catch(() => null);
-						nestedDump = response && response.value ? JSON.parse(response.value) : null;
-						const row = nestedDump && nestedDump.rows.find(candidate => candidate.id == String(e.nestedOwner));
-						if (row && row.strap) { break; }
-						await new Promise(resolve => setTimeout(resolve, 500));
-					}
-					{
-						const row = nestedDump && nestedDump.rows.find(candidate => candidate.id == String(e.nestedOwner));
-						const icon = nestedDump && (nestedDump.icons || []).find(candidate => candidate.id == String(e.nestedMember));
-						if (row && row.strap && icon) {
-							console.log("PASS [driver] a shelved tab that owns a shelf shows that shelf in its own row");
-						} else {
-							console.log(`FAIL [driver] a shelved tab that owns a shelf shows that shelf in its own row (owner=${JSON.stringify(row)} member=${JSON.stringify(icon)})`);
-							process.exitCode = process.exitCode || 1;
-						}
-					}
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarScript, args: [e.nestedMember,], newSandbox: false,
-					}).catch(error => console.log(`[drive] nested member click failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 2500));
-					{
-						const response = await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [null,], newSandbox: false,
-						}).catch(() => null);
-						const dump3 = response && response.value ? JSON.parse(response.value) : null;
-						const row = dump3 && dump3.rows.find(candidate => candidate.id == String(e.nestedOwner));
-						const activeRow = dump3 && dump3.rows.find(candidate => candidate.id == String(e.nestedMember));
-						// 0.1.5 hid the owner here and the nested shelf vanished
-						// with it; the owner must keep its row instead
-						if (row && row.strap) {
-							console.log("PASS [driver] activating a tab of a nested shelf keeps that shelf's owner visible");
-						} else {
-							console.log(`FAIL [driver] activating a tab of a nested shelf keeps that shelf's owner visible (owner=${JSON.stringify(row)})`);
-							process.exitCode = process.exitCode || 1;
-						}
-						// A CHILDLESS member is row-less on a TST with the B
-						// capability (feature 1): activating it must NOT produce a
-						// row — that is what removes the reveal/row-swap flicker.
-						// On a stock TST the member is hidden by us and Firefox
-						// reveals it, so it does get a row.
-						const expectRow = !TST_PATCH;
-						const asExpected = !!activeRow === expectRow;
-						console.log(`${asExpected ? "PASS" : "FAIL"} [driver] ${expectRow ? "the activated nested member has a row (hidden-tab fallback)" : "a row-less member gets no row even while active"} (hasRow=${!!activeRow})`);
-						if (!asExpected) { process.exitCode = process.exitCode || 1; }
-					}
-					// -- crowded shelf: grow the row in whole lines instead of
-					// scrolling, so every icon stays visible (0.2.0 "extend").
-					// One more member is put on A's shelf while it is ACTIVE —
-					// a childless member is row-less, so its own row must not
-					// appear even though it is the selected tab.
-					if (TST_PATCH) {
-						const call = async message => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: shelfCallScript, args: [message,], newSandbox: false,
-							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
-							return response && response.value ? JSON.parse(response.value) : null;
-						};
-						const stateBefore = await call({ type: "test:state", });
-						const width = stateBefore && stateBefore.widths && (stateBefore.widths.find(([id]) => id == windowId) || [])[1];
-						await call({ type: "test:put", tabId: e.plain, });
-						// the member is childless, so it must be row-less — and it
-						// must STAY row-less while it is the active tab
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: activateScript, args: [e.plain,], newSandbox: false,
-						}).catch(error => console.log(`[drive] activation failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 2500));
-						const grown = await call({ type: "test:state", });
-						const linesOf = state => {
-							const entry = state && state.lines && state.lines.find(([id]) => id == windowId);
-							const map = entry && new Map(entry[1]);
-							return map ? (map.get("root") || null, map.get(String(e.owner)) || map.get(e.owner)) : null;
-						};
-						const expectedLines = linesOf(grown);
-						const fit = await marionette.command("WebDriver:ExecuteScript", {
-							script: shelfFitScript, args: [e.owner,], newSandbox: false,
-						}).catch(() => null);
-						const f = fit && fit.value ? JSON.parse(fit.value) : null;
-						const pitch = f && f.icons > 0 ? 39 : 0;
-						console.log(`[drive] crowded shelf: width=${width} lines=${expectedLines} fit=${JSON.stringify(f)}`);
-						const grewLines = expectedLines > 1;
-						const tallRow = f && pitch > 0 && Math.abs(f.rowHeight - expectedLines * pitch) <= 2;
-						const allVisible = f && !f.scrolls && f.allInside;
-						const stacked = f && f.rows === expectedLines;
-						console.log(`${grewLines ? "PASS" : "FAIL"} [driver] a crowded shelf asks for more than one line (lines=${expectedLines}, width=${width})`);
-						console.log(`${tallRow ? "PASS" : "FAIL"} [driver] the crowded shelf's row is exactly that many lines (row=${f && f.rowHeight} lines=${expectedLines})`);
-						console.log(`${stacked ? "PASS" : "FAIL"} [driver] the icons are laid out in that many rows (rows=${f && f.rows})`);
-						console.log(`${allVisible ? "PASS" : "FAIL"} [driver] every icon is visible without horizontal scrolling (icons=${f && f.icons} scrolls=${f && f.scrolls})`);
-						if (!(grewLines && tallRow && stacked && allVisible)) { process.exitCode = process.exitCode || 1; }
-						// the member we just put on the shelf is ACTIVE and has no
-						// children: it must be row-less, i.e. no row, not hidden
-						const presence = await marionette.command("WebDriver:ExecuteScript", {
-							script: rowPresenceScript, args: [[e.plain,],], newSandbox: false,
-						}).catch(() => null);
-						const rows = presence && presence.value ? JSON.parse(presence.value) : null;
-						const live = await marionette.command("WebDriver:ExecuteScript", {
-							script: rowlessProbeScript, args: [e.plain,], newSandbox: false,
-						}).catch(() => null);
-						const info = live && live.value ? JSON.parse(live.value) : null;
-						if (rows && rows[e.plain] === false && info && info.hidden === false && info.active === true) {
-							console.log("PASS [driver] an ACTIVE childless member has no row and is not hidden");
-						} else {
-							console.log(`FAIL [driver] an ACTIVE childless member has no row and is not hidden (${JSON.stringify({ rows, info })})`);
-							process.exitCode = process.exitCode || 1;
-						}
-						await call({ type: "test:take", tabId: e.plain, });
-						await new Promise(resolve => setTimeout(resolve, 2000));
-						const back = await marionette.command("WebDriver:ExecuteScript", {
-							script: shelfFitScript, args: [e.owner,], newSandbox: false,
-						}).catch(() => null);
-						const b = back && back.value ? JSON.parse(back.value) : null;
-						console.log(`${b && b.rowHeight <= pitch + 2 ? "PASS" : "FAIL"} [driver] taking it off the shelf returns the row to one line (row=${b && b.rowHeight})`);
-						if (!(b && b.rowHeight <= pitch + 2)) { process.exitCode = process.exitCode || 1; }
-					}
-
-					// leave C folded again: phase 3 asserts that TST's native
-					// fold state survives the reinstall
-					await marionette.command("WebDriver:ExecuteScript", {
-						script: sidebarScript, args: [e.clickSecond,], newSandbox: false,
-					}).catch(error => console.log(`[drive] refold click failed: ${error.message}`));
-					await new Promise(resolve => setTimeout(resolve, 1500));
-
-					// -- reveal: from a FOLDED owner's shelf, only the activated
-					// tab's branch may appear (0.2.1).  Before this, TST expanded
-					// the tab AND ALL ITS ANCESTORS (handle-tab-focus.js), so the
-					// owner's whole subtree — the unshelved sibling D included —
-					// popped into view.  Runs on BOTH companions: the suppressed
-					// rows go through `row-less` on a patched TST and through
-					// browser.tabs.hide() on a stock one, so the assertions split
-					// by capability.
-					{
-						const call = async message => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: shelfCallScript, args: [message,], newSandbox: false,
-							}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
-							return response && response.value ? JSON.parse(response.value) : null;
-						};
-						const presence = async ids => {
-							const response = await marionette.command("WebDriver:ExecuteScript", {
-								script: rowPresenceScript, args: [ids,], newSandbox: false,
-							}).catch(() => null);
-							return response && response.value ? JSON.parse(response.value) : {};
-						};
-						const state0 = await call({ type: "test:state", });
-						const rowLess = !!(state0 && state0.capabilities && state0.capabilities.rowLess);
-						console.log(`[drive] reveal on ${rowLess ? "a patched" : "a stock"} companion`);
-						await call({ type: "test:collapse", tabId: e.owner, windowId, collapsed: true, });
-						await new Promise(resolve => setTimeout(resolve, 2000));
-						const folded = await presence([e.owner, e.clickFirst, e.children[0], e.children[1], e.plain]);
-						console.log(`[drive] rows while the owner is folded: ${JSON.stringify(folded)}`);
-						console.log(`${folded[e.clickFirst] === false && folded[e.plain] === false ? "PASS" : "FAIL"} [driver] a folded owner renders no rows for its subtree`);
-						// click C's icon: C's branch comes back, D must not
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [e.clickFirst,], newSandbox: false,
-						}).catch(error => console.log(`[drive] reveal click failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 2500));
-						const revealed = await presence([e.owner, e.clickFirst, e.children[0], e.children[1], e.plain, e.clickSecond, e.f]);
-						console.log(`[drive] rows after the reveal: ${JSON.stringify(revealed)}`);
-						// c1 is a member of C's OWN shelf, so it stays row-less;
-						// the branch that must appear is the owner, C and c2.
-						const branchOk = revealed[e.owner] && revealed[e.clickFirst] && revealed[e.children[1]];
-						console.log(`${branchOk ? "PASS" : "FAIL"} [driver] the activated shelf tab's branch has rows (owner, member, its plain child)`);
-						console.log(`${revealed[e.children[0]] === false ? "PASS" : "FAIL"} [driver] a nested member of the branch stays row-less (c1)`);
-						console.log(`${revealed[e.plain] === false ? "PASS" : "FAIL"} [driver] the unshelved sibling keeps NO row under a reveal`);
-						const state = await call({ type: "test:state", });
-						const revealState = (state && state.reveals && state.reveals[windowId]) || [];
-						const suppressed = (state && state.suppressedByUs) || [];
-						const suppressedHidden = (state && state.suppressedHiddenByUs) || [];
-						console.log(`[driver] reveal state: ${JSON.stringify({ reveal: revealState, suppressed, suppressedHidden, retries: state && state.rowLessTries, debug: state && state.revealDebug, })}`);
-						const revealOk = revealState.some(([owner]) => owner == e.owner) &&
-							(rowLess ? suppressed.includes(e.plain) : suppressedHidden.includes(e.plain));
-						console.log(`${revealOk ? "PASS" : "FAIL"} [driver] the addon keeps the owner expanded and accounts for the suppressed sibling (${rowLess ? "row-less" : "hidden"})`);
-						const hiddenSibling = (state && state.hiddenByUs) || [];
-						console.log(`${hiddenSibling.includes(e.plain) ? "FAIL" : "PASS"} [driver] a suppressed tab is never counted as a member hide`);
-						// capability split: no hiding at all on a patched TST; the
-						// browser reports `hidden` on a stock one
-						const live = await marionette.command("WebDriver:ExecuteScript", {
-							script: rowAndStateScript, args: [[e.plain,],], newSandbox: false,
-						}).catch(() => null);
-						const liveState = live && live.value ? JSON.parse(live.value) : null;
-						const hiddenFlag = !!(liveState && liveState.hidden[e.plain]);
-						const hidingOk = rowLess ? hiddenFlag === false : hiddenFlag === true;
-						console.log(`${hidingOk ? "PASS" : "FAIL"} [driver] the suppressed sibling is ${rowLess ? "not hidden (row-less only)" : "hidden (the stock lever)"}`);
-						if (!(branchOk && revealed[e.plain] === false && revealOk && !hiddenSibling.includes(e.plain) && hidingOk)) {
-							process.exitCode = process.exitCode || 1;
-						}
-						// nested shelf: c1 is a member of C's OWN shelf, whose strap
-						// lives in C's row.  Clicking c1 must keep C's row — the
-						// branch is anchored on the owner's DIRECT child, so the
-						// whole nested shelf stays visible.
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: sidebarScript, args: [e.nestedMember,], newSandbox: false,
-						}).catch(error => console.log(`[drive] nested reveal click failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 2500));
-						const nested = await presence([e.clickFirst, e.nestedMember, e.plain]);
-						console.log(`[driver] rows after the nested click: ${JSON.stringify(nested)}`);
-						const nestedOk = nested[e.clickFirst] === true && nested[e.plain] === false;
-						console.log(`${nestedOk ? "PASS" : "FAIL"} [driver] clicking a nested shelf member keeps the nested owner's row (its strap host)`);
-						if (!nestedOk) { process.exitCode = process.exitCode || 1; }
-						// leaving the owner's subtree ends the reveal and folds it back
-						await marionette.command("WebDriver:ExecuteScript", {
-							script: activateScript, args: [e.rootMember,], newSandbox: false,
-						}).catch(error => console.log(`[drive] root activation failed: ${error.message}`));
-						await new Promise(resolve => setTimeout(resolve, 2500));
-						const afterState = await call({ type: "test:state", });
-						const revealAfter = (afterState && afterState.reveals && afterState.reveals[windowId]) || [];
-						const suppressedAfter = (afterState && afterState.suppressedByUs) || [];
-						const suppressedHiddenAfter = (afterState && afterState.suppressedHiddenByUs) || [];
-						const backRows = await presence([e.owner, e.clickFirst, e.plain]);
-						const backLive = await marionette.command("WebDriver:ExecuteScript", {
-							script: rowAndStateScript, args: [[e.plain,],], newSandbox: false,
-						}).catch(() => null);
-						const backState = backLive && backLive.value ? JSON.parse(backLive.value) : null;
-						console.log(`[driver] after leaving: ${JSON.stringify({ revealAfter, suppressedAfter, suppressedHiddenAfter, backRows, backState, })}`);
-						const ended = revealAfter.length == 0 &&
-							suppressedAfter.length == 0 &&
-							suppressedHiddenAfter.length == 0 &&
-							backRows[e.clickFirst] === false;
-						console.log(`${ended ? "PASS" : "FAIL"} [driver] leaving the owner's subtree ends the reveal and the owner folds back`);
-						// the suppressed sibling must come back to the browser too
-						const siblingBack = !(backState && backState.hidden[e.plain]);
-						console.log(`${siblingBack ? "PASS" : "FAIL"} [driver] ending the reveal restores the suppressed sibling's visibility`);
-						if (!(ended && siblingBack)) { process.exitCode = process.exitCode || 1; }
-					}
-				}
-			}
-		}
 
 		// -- final report of phase 1+2 -------------------------------------
 		const finalReport = await waitForReport(FINAL_REPORT, 90_000);
@@ -1471,8 +1118,7 @@ async function main () {
 		console.log(`[drive] reinstall: ${JSON.stringify(reinstall?.value ?? reinstall)}`);
 		const phase3Report = await waitForReport(FINAL_REPORT, 90_000, reinstallAt - Date.now());
 		if (!phase3Report) {
-			console.log("FAIL [driver] reinstalled smoke page reports again (persistence path)");
-			process.exitCode = process.exitCode || 1;
+			check("reinstalled smoke page reports again (persistence path)", false, "no report after the reinstall");
 		} else {
 			printReport(FINAL_REPORT, "phase 3 (reinstall)");
 		}

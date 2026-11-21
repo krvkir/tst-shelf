@@ -21,8 +21,10 @@ unshelve" a tab. These are the only terms used in menu items
   next to the global pinned-tabs area. Every tab has exactly one shelf
   that can hold it: its parent tab's shelf, or the root shelf when it
   has no parent.
-- **Shelved tab** — a tab on a shelf. It keeps its tree position and
-  its native tab, but has no visible row in the sidebar tree.
+- **Shelved tab** — a tab on a shelf. It keeps its native tab and its
+  place in the tree, but has no visible row in the sidebar tree: it is
+  hidden with `browser.tabs.hide()`, the only lever that removes a row
+  without breaking TST's uniform-row geometry.
 - **Shelf owner** — the tab whose shelf a shelved tab sits on. For the
   root shelf there is no owner tab; the window itself is the owner.
 - **Selected shelf tab** — the shelved tab of a shelf the user last
@@ -67,19 +69,44 @@ Constraints:
 - Requires Tree Style Tab 4.0 or later; without TST the extension
   stays idle and provides no standalone UI.
 - Sidebar-only presentation: shelved tabs remain regular tabs in the
-  native tab bar; the native pinned-tabs feature is out of scope.
-- Tree integrity: shelving never moves, reorders, re-parents, closes,
-  or natively hides a tab beyond what the user's own action (drag,
-  close) does; TST's tree data is untouched by shelf bookkeeping.
-- Delegation: anything Tree Style Tab already does — tree
-  re-attachment on parent closure, the close-multiple-tabs
-  confirmation for collapsed subtrees, drag-and-drop drop semantics —
-  is used as-is, not reimplemented.
-- Permission surface minimal: `tabs`, `storage`, `sessions`. No
-  `tabHide` (this extension performs no native hiding), no `menus`
-  (menu items are created inside TST), no host permissions in v1.
+  native tab bar; the native pinned-tabs feature is out of scope.  A
+  pinned tab cannot be shelved (putting one fails; pinning a shelved
+  tab takes it off the shelf).
+- Tree integrity: shelving never re-parents, closes, or re-orders a tab
+  beyond **the member block it owns**: the members of a shelf are kept
+  contiguous directly under their owner, newest put last, through TST's
+  own `move-before` / `move-after` / `outdent` with `followChildren`.
+  Take-off moves the tab back to its pre-shelve place, planned from the
+  neighbours and index recorded at put time.  TST's tree data is never
+  edited directly.
+- Presentation levers, current and deliberate: the owner row's strap
+  (extra contents), the addon state `tst-shelf-owner`, TST's
+  `collapse-tree` / `expand-tree`, and `browser.tabs.hide()`.
+- Permission surface: `tabs`, `tabHide` (member rows, and the rows a
+  reveal suppresses), `storage` (boot diagnostics only), `sessions` (the
+  sticky per-tab flag), `menus` (the two context-menu items, which TST's
+  own item API cannot make visible for plain tab rows), no host
+  permissions, no content scripts.
 - Interop with tst-workspace goes through the native hidden state of
   tabs only; the two extensions do not message each other.
+
+Superseded decisions (kept as history; do not read them as invariants):
+
+- *0.1.0–0.1.3, "shelving never moves a tab"* — the shelf was rendered
+  inside the owner's row without touching tab order, so members stayed
+  scattered and the selected member's subtree could render rows between
+  the owner and the shelf.  Superseded in 0.1.4 by the contiguous member
+  block described above.
+- *0.1.1, "rows of N whole lines"* was rejected as a stock-TST feature. It
+  returned in 0.2.0 through a companion patch (`lines` on
+  `set-extra-contents`, the `row-less` tab state, a `tabbar-resized`
+  notification), and was rejected again in 0.2.3 — see
+  `openspec/changes/remove-companion-patch`. A crowded shelf keeps one line
+  and scrolls; a member's row is removed by hiding the tab.
+- *0.1.0–0.1.4, "menu items are created inside TST"* — TST's own context
+  menu items stay invisible for plain tab rows, so 0.1.5 creates the two
+  items through `browser.menus` with `contexts: ["tab"]`, which requires
+  the `menus` permission.
 
 Donor sources (implementation reference, do not copy requirements from
 them): `~/repos/firefox/tst-workspace` (TST API client

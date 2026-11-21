@@ -9,7 +9,7 @@ import {
 	derive, indexTree, isFolded, straysToCollapse, ownersAffectedByActivation,
 	subtreeSizes, treePositions, nextPlacementMove, resolveFavicons,
 	mustShowTabs, danglingMembers, ROOT_SHELF,
-	planReveals, isSubtreeFolded,
+	planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf,
 } from "../src/background/logic.esm.js";
 
 /** Light-tree node helper. */
@@ -249,18 +249,42 @@ test("a scattered member is moved before the tab at its expected slot", () => {
 	}), { tabId: 3, kind: "move-before", referenceTabId: 6 });
 });
 
-test("appendTabId is forced to the shelf end regardless of index", () => {
-	// members B (idx 1) and C (idx 3, freshly put): C must go AFTER B
-	const tree = [node(1, [], [node(2), node(6), node(3)])];
+test("a member carrying a put sequence is forced to the shelf end regardless of index", () => {
+	// strip order already holds B (2) at the owner's first slot and C (3)
+	// after it; B was just put again, so it must become the rightmost
+	// icon.  Without `appendOrder` the planner returns null (both in
+	// place) — that difference is what makes this test detect the
+	// behaviour it names.
+	const tree = [node(1, [], [node(2), node(3), node(4)])];
 	const shelves = new Map([[1, [2, 3]]]);
-	assert.deepEqual(nextPlacementMove({
+	const args = {
 		ranks: ranks([
-			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 6, pos: 2 }, { id: 3, pos: 3 },
+			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 3, pos: 2 }, { id: 4, pos: 3 },
 		]),
 		sizes: subtreeSizes(tree),
 		shelves,
-		appendTabId: 3,
-	}), { tabId: 3, kind: "move-before", referenceTabId: 6 });
+	};
+	assert.deepEqual(nextPlacementMove({ ...args, appendOrder: new Map([[2, 1]]) }),
+		{ tabId: 3, kind: "move-before", referenceTabId: 2 },
+		"the older member (3) moves in front of the freshly put one (2)");
+	assert.equal(nextPlacementMove(args), null, "control: no put order, no move");
+});
+
+test("two rapid puts keep their sequence order, newest last", () => {
+	// B (seq 2) and C (seq 1) are both freshly put while the strip still
+	// reads [B, C]: the shelf order is the PUT order, so C goes first.
+	// A single append slot lost one of them (caught by the E2E:
+	// `[B, C, F]` instead of `[C, B, F]`).
+	const tree = [node(1, [], [node(2), node(3), node(4)])];
+	const shelves = new Map([[1, [2, 3]]]);
+	assert.deepEqual(nextPlacementMove({
+		ranks: ranks([
+			{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 3, pos: 2 }, { id: 4, pos: 3 },
+		]),
+		sizes: subtreeSizes(tree),
+		shelves,
+		appendOrder: new Map([[2, 2], [3, 1]]),
+	}), { tabId: 3, kind: "move-before", referenceTabId: 2 });
 });
 
 test("the second member slots after the first one's subtree", () => {
@@ -292,7 +316,7 @@ test("an append past the strip end goes after the previous member, outdenting wh
 		]),
 		sizes: subtreeSizes(tree),
 		shelves,
-		appendTabId: 3,
+		appendOrder: new Map([[3, 1]]),
 	}), { tabId: 3, kind: "move-after", referenceTabId: 2, thenOutdent: true });
 
 	// same, but B childless: plain move-after re-parents to the owner
@@ -301,7 +325,7 @@ test("an append past the strip end goes after the previous member, outdenting wh
 		ranks: ranks([{ id: 1, pos: 0 }, { id: 2, pos: 1 }, { id: 3, pos: 7 }]),
 		sizes: subtreeSizes(tree2),
 		shelves,
-		appendTabId: 3,
+		appendOrder: new Map([[3, 1]]),
 	}), { tabId: 3, kind: "move-after", referenceTabId: 2, thenOutdent: false });
 });
 
@@ -317,7 +341,7 @@ test("root members slot against the first non-pinned tab", () => {
 		]),
 		sizes: subtreeSizes(tree),
 		shelves,
-		appendTabId: 2,
+		appendOrder: new Map([[2, 1]]),
 	}), { tabId: 1, kind: "move-before", referenceTabId: 9 });
 });
 
@@ -336,6 +360,122 @@ test("the first shelf needing a move wins across several shelves", () => {
 		sizes: subtreeSizes(tree),
 		shelves,
 	}), { tabId: 4, kind: "move-before", referenceTabId: 8 });
+});
+
+// ---------------------------------------------------------------------------
+// take-off restoration (the tab returns to its pre-shelve place)
+
+test("restoring a tab that has to move toward a later index references the right tab", () => {
+	// [X, A, B] and X originally sat at index 1: the tab at index 1 is A,
+	// but X must land BETWEEN A and B.  Referencing A would leave the
+	// order unchanged ([X, A, B]) — the off-by-one this planner exists to
+	// prevent.
+	assert.deepEqual(planRestoreMove({ order: [7, 1, 2], tabId: 7, savedIndex: 1 }),
+		{ kind: "move-before", referenceTabId: 2 });
+});
+
+test("restoring a tab that has to move toward an earlier index", () => {
+	assert.deepEqual(planRestoreMove({ order: [1, 2, 7], tabId: 7, savedIndex: 0 }),
+		{ kind: "move-before", referenceTabId: 1 });
+	assert.deepEqual(planRestoreMove({ order: [1, 2, 7], tabId: 7, savedIndex: 1 }),
+		{ kind: "move-before", referenceTabId: 2 });
+});
+
+test("a tab already in its old place does not move", () => {
+	assert.equal(planRestoreMove({ order: [1, 7, 2], tabId: 7, savedIndex: 1 }), null);
+	assert.equal(planRestoreMove({ order: [7, 1, 2], tabId: 7, savedIndex: 0 }), null);
+	assert.equal(planRestoreMove({ order: [1, 2, 7], tabId: 7, savedIndex: 2 }), null);
+});
+
+test("the last position is restored with move-after, the first with move-before", () => {
+	assert.deepEqual(planRestoreMove({ order: [7, 1, 2], tabId: 7, savedIndex: 2 }),
+		{ kind: "move-after", referenceTabId: 2 });
+	assert.deepEqual(planRestoreMove({ order: [1, 7, 2], tabId: 7, savedIndex: 0 }),
+		{ kind: "move-before", referenceTabId: 1 });
+	assert.equal(planRestoreMove({ order: [1, 2, 7], tabId: 7, savedIndex: 99 }), null,
+		"an index past the end clamps to the end — the tab is already there");
+});
+
+test("the tab's subtree never serves as its own landing reference", () => {
+	// 7 owns 8 and 9 (followChildren carries them) and already sits at
+	// its old index 1.  Counting the subtree as ordinary tabs, the slot at
+	// index 1 is the mover's OWN child 8 — the planner would "restore" the
+	// tab before its own descendants.
+	const tree = [node(1), node(7, [], [node(8), node(9)]), node(2)];
+	assert.deepEqual(subtreeIds({ tree, id: 7 }), [8, 9]);
+	assert.deepEqual(planRestoreMove({ order: [1, 7, 8, 9, 2], tabId: 7, subtree: [8, 9], savedIndex: 2 }),
+		{ kind: "move-after", referenceTabId: 2 }, "slot 2 = the end, once the subtree does not count");
+	assert.deepEqual(planRestoreMove({ order: [1, 7, 8, 9, 2], tabId: 7, savedIndex: 2 }),
+		{ kind: "move-before", referenceTabId: 9 },
+		"control: without the subtree list the reference is the tab's own descendant");
+});
+
+test("saved neighbour ids win over an index that unrelated moves shifted", () => {
+	// A tab was opened at the end, then something was closed in front of
+	// it: the bare index no longer means its old place, the neighbours do.
+	assert.deepEqual(planRestoreMove({ order: [1, 2, 7], tabId: 7, savedIndex: 2, beforeId: 1, afterId: 2 }),
+		{ kind: "move-after", referenceTabId: 1 });
+	assert.equal(planRestoreMove({ order: [1, 7, 2], tabId: 7, savedIndex: 1, beforeId: 1, afterId: 2 }), null,
+		"already between the two neighbours");
+	assert.deepEqual(planRestoreMove({ order: [1, 7, 2], tabId: 7, savedIndex: 1, beforeId: 99, afterId: 1 }),
+		{ kind: "move-before", referenceTabId: 1 }, "a closed neighbour falls back to the surviving one");
+});
+
+test("siblingListOf returns the tab's own parent and its ordered siblings", () => {
+	// A <- (B, C <- (c1, c2), D), E: B's siblings are [B, C, D]; c1's are
+	// [c1, c2]; E has no parent.
+	const tree = [node(1, [], [node(2), node(3, [], [node(5), node(6)]), node(4)]), node(7)];
+	assert.deepEqual(siblingListOf({ tree, id: 2 }), { parentId: 1, siblings: [2, 3, 4], slot: 0 });
+	assert.deepEqual(siblingListOf({ tree, id: 5 }), { parentId: 3, siblings: [5, 6], slot: 0 });
+	assert.deepEqual(siblingListOf({ tree, id: 7 }), { parentId: null, siblings: [1, 7], slot: 1 });
+	assert.equal(siblingListOf({ tree, id: 99 }), null, "not in the tree");
+});
+
+test("restoring among a sibling list uses the saved slot", () => {
+	// The caller passes the tab's CURRENT sibling list and drops the
+	// neighbour hints when the parent changed.  Siblings [9, 4, 5], the
+	// tab (9) first, its old slot 1: it must land between 4 and 5.
+	// Referencing a former cousin would re-parent the tab into that
+	// cousin's subtree (move-after a descendant does exactly that).
+	assert.deepEqual(planRestoreMove({ order: [9, 4, 5], tabId: 9, savedIndex: 1 }),
+		{ kind: "move-before", referenceTabId: 5 });
+	assert.equal(planRestoreMove({ order: [4, 9, 5], tabId: 9, savedIndex: 1 }), null,
+		"already between them");
+	assert.deepEqual(planRestoreMove({ order: [4, 9, 5], tabId: 9, savedIndex: 0 }),
+		{ kind: "move-before", referenceTabId: 4 });
+	assert.deepEqual(planRestoreMove({ order: [4, 9, 5], tabId: 9, savedIndex: 2 }),
+		{ kind: "move-after", referenceTabId: 5 });
+});
+
+test("a tab missing from the order plans no move", () => {
+	assert.equal(planRestoreMove({ order: [1, 2], tabId: 7, savedIndex: 0 }), null);
+	assert.equal(planRestoreMove({ order: [7], tabId: 7, savedIndex: 0 }), null, "nowhere to land");
+});
+
+// ---------------------------------------------------------------------------
+// placement fallbacks
+
+test("no tab exists at the expected slot and there is no previous member: no move", () => {
+	// a sparse rank set (a race or a foreign re-parent left a gap): owner
+	// at 0, member at 5, nothing at 1 — and the member is the FIRST of the
+	// shelf, so there is no previous member to append after.
+	const tree = [node(1, [], [node(3)])];
+	assert.equal(nextPlacementMove({
+		ranks: ranks([{ id: 1, pos: 0 }, { id: 3, pos: 5 }]),
+		sizes: subtreeSizes(tree),
+		shelves: new Map([[1, [3]]]),
+	}), null);
+});
+
+test("an all-pinned shelf member is left alone", () => {
+	// pinned tabs live outside the tree: they are filtered out of the
+	// plan and the planner reports nothing to do
+	const tree = [node(1), node(2)];
+	assert.equal(nextPlacementMove({
+		ranks: ranks([{ id: 1, pos: 0 }, { id: 2, pos: 1, pinned: true }]),
+		sizes: subtreeSizes(tree),
+		shelves: new Map([[1, [2]]]),
+	}), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -463,7 +603,7 @@ test("a member already collapsing is not dangling again", () => {
 // reveals: a folded shelf owner shows only the active tab's branch
 
 /** A <- (B, C <- (c1, c2), D), E — the tree the user reported the bug on:
- *  B and C sit on A's shelf (row-less), D is an ordinary unshelved child.
+ *  B and C sit on A's shelf (row-less: hidden), D is an ordinary unshelved child.
  *  A is FOLDED: the state at the moment the reveal is created.  Measured
  *  marker placement: the fold point carries `subtree-collapsed`, every tab
  *  inside the fold carries `collapsed`. */

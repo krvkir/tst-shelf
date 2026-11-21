@@ -10,53 +10,37 @@ Put two tabs of a project on their parent's shelf and the parent's row
 grows a 28-px strap with their favicons; the shelved rows disappear;
 their children fold. Click an icon — its tab activates and its subtree
 unfolds below the strap; clicking another icon of the same shelf folds
-the previous one. Shelved state survives restarts. Take a tab off the
-shelf and it returns to the exact place it had — the tree was never
-moved.
+the previous one. Shelved state survives restarts.
 
-Full behavior contract: `openspec/` (changes `add-shelf-foundation` and
-`add-discrete-row-geometry`, capabilities `shelf-pinning`,
-`shelf-presentation`, `shelf-nesting`, `shelf-interaction`,
-`companion-capabilities`).
+While shelved, a shelf's members are kept contiguous directly under
+their owner (the newest put is the rightmost icon), moved with TST's own
+`move-before`/`move-after`/`outdent`. Take a tab off the shelf and it
+moves back to its pre-shelve place, planned from the neighbours and the
+index recorded when it was put.
 
-## Two capabilities it can use, and does without
+Full behavior contract: `openspec/` (changes `add-shelf-foundation`,
+`remove-companion-patch`, `reveal-folded-owner-branch`; capabilities
+`shelf-pinning`, `shelf-presentation`, `shelf-nesting`,
+`shelf-interaction`).
 
-Two things the shelf really wants are impossible from an addon on a stock
-Tree Style Tab, so they live in a companion patch to TST itself
-(`docs/tst-row-geometry-patch.md`, applied in a local clone of TST; the
-addon never requires it):
+## Why it is a stock-only addon
 
-| capability | what it enables | without it |
-|---|---|---|
-| **row-less tabs** (`row-less` state) | a shelved tab has no row while staying visible to the browser — no `hidden`, no reveal on activation, no `tabHide` | members are hidden with `browser.tabs.hide()`, and Firefox reveals the one you activate |
-| **rows of N whole lines** (`lines` on `set-extra-contents`) | a crowded shelf grows its owner row in whole lines, so every icon stays visible | the shelf stays on one line and scrolls horizontally |
+Tree Style Tab offers no way for an addon to remove a tab's row while keeping
+the tab on screen, nor to make a row more than one line tall. 0.2.0 solved
+both with a companion patch to TST (`row-less` as a tab state, `lines` on
+`set-extra-contents`, a `tabbar-resized` notification). It was tested and
+rejected in 0.2.3: it doubled every row-removal path in the addon, pinned the
+E2E to a locally built TST, and cannot ship while TST is installed from AMO.
 
-The patch is detected from TST's version (`>= 4.5`); the test build marks
-itself, the upstreamable diff carries no version bump. `tests/patch-tst.sh`
-builds it from the AMO release plus the patch, and the E2E runs the whole
-suite against **both** builds — that is what keeps the fallbacks honest.
+What that leaves:
 
-### What changes with the patch
-
-- A childless shelved tab has **no row at all**, even while it is the
-  active tab. Its icon is its presentation: right-click it for the tab's own
-  menu, middle-click to close, hover for the title. Nothing in the tree
-  moves when you select it.
-- A shelved tab **with children keeps its row while it is active** (that row
-  is what its subtree hangs from) and loses it when you select something
-  else — after its subtree has folded, so no frame shows a child without a
-  parent.
-- A shelf that does not fit into 2/3 of the tab bar grows: 2 lines, 3 lines,
-  and so on, with the icons laid out in exactly that many rows. Icons are
-  never hidden behind a scroll.
-- **No tab is hidden** while the capability exists: the `tabHide` permission
-  is declared for the fallback only.
-
-### The one setting
-
-`shelf-layout` in the extension's storage: `auto` (default) extends the row
-when the capability exists and scrolls otherwise, `extend` always prefers
-extending, `scroll` always keeps one line and scrolls.
+- A member's row is removed by hiding the tab with `browser.tabs.hide()`, the
+  only lever that takes a tab out of TST's renderable set without breaking its
+  uniform-row arithmetic. A shelf therefore costs exactly one line, and the
+  tree is exactly as tall as the same tree with those tabs deleted.
+- A crowded shelf keeps one line and scrolls horizontally. `shelf-layout` and
+  the multi-line layout are gone; `shelf-layout` in `storage.local` is ignored
+  and left untouched.
 
 ## What it does
 
@@ -76,13 +60,11 @@ extending, `scroll` always keeps one line and scrolls.
   the below-pinned placement needs an upstream TST slot; recorded in
   the openspec design). A newly shelved tab becomes the rightmost
   icon.
-- **Shelved tabs have no rows at all** (0.1.4): on a stock TST they are
-  hidden with `browser.tabs.hide()`, the only lever that removes a tab
-  from TST's renderable set without breaking its uniform-row
-  arithmetic; on a TST with the `row-less` capability they are marked
-  instead, which needs no hiding at all (0.2.0). A shelf therefore
-  costs exactly one line, and the tree is exactly as tall as the same
-  tree with those tabs deleted.
+- **Shelved tabs have no rows at all** (0.1.4): they are hidden with
+  `browser.tabs.hide()`, the only lever that removes a tab from TST's
+  renderable set without breaking its uniform-row arithmetic. A shelf
+  therefore costs exactly one line, and the tree is exactly as tall as
+  the same tree with those tabs deleted.
 - **Members stay contiguous directly under their owner**, so the
   selected member's children appear right below the owner's row.
   Placement uses TST's own subtree-preserving move API
@@ -101,7 +83,7 @@ extending, `scroll` always keeps one line and scrolls.
   unfolded subtree survives unrelated tab activations (a narrow
   `try-collapse-tree-from-other-expansion` cancellation protects only
   shelved victims).
-- **A folded owner reveals one branch only** (0.2.1, both companions since 0.2.2): activating a tab
+- **A folded owner reveals one branch only** (0.2.1): activating a tab
   from the shelf of a folded owner expands that owner — TST renders a
   child row only if every ancestor is expanded — but every descendant
   outside the activated tab's branch keeps no row, so an unshelved
@@ -110,25 +92,21 @@ extending, `scroll` always keeps one line and scrolls.
   row its strap lives in. TST's own over-expansion (it expands the tab
   *and all its ancestors*) is cancelled only when a reveal takes over.
   Leaving the owner's subtree folds it back.
-  - *With the `row-less` capability* the other descendants keep their
-    browser state: only the row goes, nothing is hidden.
-  - *On a stock TST* (0.2.2) the only lever is `browser.tabs.hide()`, so
-    the other descendants are hidden while the reveal lives. That state
-    is tracked separately from shelved tabs, restored when the reveal
-    ends, and released at boot if the browser stopped mid-reveal — a
-    reveal never leaves a tab invisible.
-  - Known limitation on both paths: a suppressed tab that owns its own
-    shelf loses that shelf's strap while it is suppressed (a strap lives
-    in its owner's row).
-- **A member's row comes back the moment it is activated** (0.2.2): the
-  row-less state lives in TST's model, so the row appears only when the
-  state is removed — waiting for the debounced re-derivation left the
-  children hanging under nothing for that window. Childless members keep
-  no row at all.
+  - The other descendants are hidden with `browser.tabs.hide()` while the
+    reveal lives. That state is tracked separately from shelved tabs,
+    restored when the reveal ends, and released at boot if the browser
+    stopped mid-reveal — a reveal never leaves a tab invisible.
+  - Known limitation: a suppressed tab that owns its own shelf loses that
+    shelf's strap while it is suppressed (a strap lives in its owner's
+    row).
+- **A member's row comes back the moment it is activated**: Firefox reveals
+  a hidden tab when it becomes the active tab, so the row appears without
+  the extension doing anything. It is hidden again — `rehideMembersNow`,
+  measured at ~30 ms — the moment another tab takes the focus.
 - **A failed tree export is retried** (0.2.2): TST's tree export failing
   once used to end a re-derivation silently, leaving the previous
-  decision in force (a member could keep a stale row-less claim). The
-  pass now retries up to five times.
+  decision in force (a member could keep a stale decision). The pass now
+  retries up to five times.
 - **Workspace parity**: icons of tabs hidden by container-workspace
   extensions (e.g. tst-workspace) are not rendered; an empty shelf
   reserves no space. No messages are exchanged with them.
@@ -141,11 +119,10 @@ extending, `scroll` always keeps one line and scrolls.
 
 - `tabs` — reading tab metadata (titles, URLs, favicons) for icons
   and tooltips.
-- `tabHide` — on a stock TST, shelved tabs are hidden so they take no
-  row; TST itself requests this permission for its own hidden-tab
-  support. Taking a tab off the shelf shows it again. On a TST with the
-  `row-less` capability the extension never calls it: members are marked
-  instead of hidden, and no tab leaves the screen.
+- `tabHide` — shelved tabs are hidden so they take no row, and a reveal
+  hides the siblings it suppresses; TST itself requests this permission
+  for its own hidden-tab support. Taking a tab off the shelf shows it
+  again.
 - `menus` — the two tab-context-menu items are the extension's OWN
   `browser.menus` items (see implementation notes); they appear in
   the TST sidebar's tab menu and in the native tab bar's menu.
@@ -205,7 +182,9 @@ extending, `scroll` always keeps one line and scrolls.
   `--tab-size`; owner rows that grew and CSS-hidden member rows drifted
   the pixel stack. 0.1.4 conforms — every rendered row keeps the
   uniform height — and the E2E asserts the arithmetic row by row.
-  Open task 7.2 is the 350-tab performance pass.
+  Open task 7.2 is the 350-tab performance pass. The multi-line row
+  height of 0.2.0 (a companion patch) is gone for the same reason: it
+  required TST to paint and to compute positions from line counts.
 - **Private windows are untouched.** TST refuses external messages
   about private tabs unless the user enables both "Allow in private
   windows" and TST's own permission checkbox.
@@ -217,24 +196,34 @@ extending, `scroll` always keeps one line and scrolls.
 
 ```
 make deps    # npm install (esbuild + web-ext)
-make build   # bundle background, copy assets -> dist/
-make test    # unit tests for the derivation logic (node --test)
+make build   # bundle background, copy assets -> dist/   (production)
+make test    # unit tests: logic, renderer, markup (node --test)
+make perf    # 350-tab pure-derivation gate (tests/perf.mjs)
 make watch   # rebuild dist/ on source changes; pair with make run
 make run     # dev Firefox with auto-reload, clean throwaway profile
 make lint    # web-ext lint over dist/
+make verify-dist # assert dist/ is a production tree, not the E2E flavor
 make xpi     # web-ext-artifacts/tst_shelf-<version>.zip
 
 make fixture # clean profile + TST only (tests/fixture.sh, idempotent)
 make iso-tst # throwaway GUI Firefox on that profile + this extension
-make e2e     # full headless E2E against the TST fixture (see below)
-make release # build, lint, unit, e2e, xpi
+make e2e     # the headless E2E run against the stock TST fixture
+make release # unit tests, the E2E run, then a CLEAN build + lint + xpi
 ```
+
+Two build flavors, two directories: `dist/` is production and the only
+tree `web-ext` ever packs; `dist-e2e/` is the test build (smoke page,
+`-e2e` version, `downloads` permission) that `make e2e` installs.  A
+release re-builds `dist/` from scratch after the E2E runs and refuses to
+pack it unless `scripts/verify-dist.mjs` confirms it carries no test
+files, no `-e2e` version and no `downloads` permission.
 
 ### The E2E harness (Marionette, headless)
 
-`make e2e` launches an isolated headless Firefox on a copy of the
-fixture profile (Tree Style Tab only), temporary-installs `dist/` via
-Marionette's `Addon:Install`, and runs three phases:
+`make e2e` runs the driver against the stock Tree Style Tab of the fixture
+profile (`tests/fixture.sh` sideloads the signed AMO release).  It launches
+an isolated headless Firefox on a copy of that profile, temporary-installs
+`dist-e2e/` via Marionette's `Addon:Install`, and runs three phases:
 
 1. **Setup** — the smoke page (`tests.html?auto=1`, only shipped in
    `-e2e` builds) builds a tree A ← (B, C, D), C ← (c1, c2), plus a
@@ -257,8 +246,10 @@ Marionette's `Addon:Install`, and runs three phases:
    derivation: the restart-persistence proxy (temporary installs
    never survive a real restart; the boot path is identical).
 
-Exit code 0 means every assertion passed (currently 55 across the
-three phases; two consecutive clean runs required before merging).
+Exit code 0 means every assertion passed.  Every assertion in the driver
+goes through one `check(name, ok, detail)` function, which prints, records
+and sets the exit status; a check cannot print FAIL and leave the run
+green.  Two consecutive clean runs are required before merging.
 `node tests/probe-mexec.mjs` is a standalone probe for Marionette
 `ExecuteScript` semantics on the current Firefox build.
 

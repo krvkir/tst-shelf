@@ -224,13 +224,12 @@ export function mustShowTabs ({ tree, activeId, animationStates = ["collapsing",
  * unfolded only while that tab's own row is on screen".
  *
  * A member keeps its row only while it is the active tab or an ancestor
- * of it (mustShowTabs): the rest of the time the tab is hidden, and a
- * hidden tab's children are still rendered by TST — the row of the
- * parent is simply not there, so its children appear dangling under the
- * shelf owner's row, attached to nothing (0.1.6 bug: activating an
- * UNSHELVED sibling reclaimed the member's row without collapsing its
- * subtree, because the collapse was only requested when another tab of
- * the same shelf was selected).
+ * of it (mustShowTabs): the rest of the time the member is hidden, so it
+ * has no row.  A hidden tab's descendants are not rendered either, which
+ * is why the subtree must be folded before the row goes (0.1.6 bug:
+ * activating an UNSHELVED sibling reclaimed the member's row without
+ * collapsing its subtree, because the collapse was only requested when
+ * another tab of the same shelf was selected).
  *
  * So the invariant is checked globally, not per selection event: every
  * shelved tab with children that is unfolded and not in `mustShow` is a
@@ -295,7 +294,7 @@ function forEachInSubtree (childrenById, id, fn) {
  * view into a wall of rows.  So the owner is expanded mechanically (its
  * children must be renderable at all) and every descendant of it that is
  * not on the active tab's branch — ancestors-or-self plus descendants —
- * gets no row (row-less: the tab stays visible to the browser).
+ * loses its row (by hiding the tab: see `reconcileSuppressed`).
  *
  * The branch follows the ACTIVE TAB, not the reveal's creation time: a
  * reveal outlives the activation that created it, so switching between
@@ -509,4 +508,84 @@ function firstNormalPos (sortedRanks) {
 		if (!rank.pinned) { return rank.pos; }
 	}
 	return 0;
+}
+
+/** The tab's parent and its ordered sibling list (the tab included), from
+ *  the light tree.  Root tabs have parentId null.  `null` when the tab is
+ *  not in the tree at all.
+ *  @returns {null|{parentId: number|null, siblings: number[], slot: number}}
+ */
+export function siblingListOf ({ tree, id, }) {
+	const { parentIdOf, childrenById, } = indexTree(tree);
+	if (!parentIdOf.has(id)) { return null; }
+	const parentId = parentIdOf.get(id);
+	const siblings = parentId == null
+		? (tree || []).map(node => node.id)
+		: (childrenById.get(parentId) || []).map(node => node.id);
+	return { parentId, siblings, slot: siblings.indexOf(id), };
+}
+
+/** Every id in `id`'s subtree, the tab itself excluded (followChildren
+ *  carries exactly this set with a move). */
+export function subtreeIds ({ tree, id, }) {
+	const { childrenById, } = indexTree(tree);
+	const ids = [];
+	forEachInSubtree(childrenById, id, child => ids.push(child));
+	return ids;
+}
+
+/**
+ * Where a taken-off tab must move to return to its pre-shelve place.
+ *
+ * TST's move-before/move-after take a REFERENCE tab and re-derive the
+ * mover's parent from the landing position, so the plan is a single
+ * reference id.  Selecting that reference by index alone is off by one
+ * whenever the tab sits BEFORE its old place (removing it from the
+ * current order shifts every later index left): with the order
+ * [X, A, B] and a saved index of 1, the tab at index 1 is A, and
+ * `move-before A` leaves X exactly where it was.  Therefore the target
+ * is resolved in the order WITHOUT the tab (and without its subtree,
+ * which travels with it): the tab at the target index there is the tab
+ * that must end up immediately after it.
+ *
+ * Neighbour ids win over the bare index when they are still alive: a
+ * saved neighbour survives unrelated moves that shift the index, and it
+ * is the only reference that can express "between these two tabs".
+ *
+ * @param {{
+ *   order: number[],            // the mover's sibling list (or the global
+ *                               // pre-order as a fallback when no parent)
+ *   tabId: number,
+ *   subtree?: number[],         // ids that move with tabId (followChildren)
+ *   savedIndex: number,         // the tab's index before it was shelved
+ *   beforeId?: number|null,     // id that preceded it back then
+ *   afterId?: number|null,      // id that followed it back then
+ * }} args
+ * @returns {null|{kind: "move-before"|"move-after", referenceTabId: number}}
+ *          null when the tab already occupies its old place or no
+ *          reference exists
+ */
+export function planRestoreMove ({ order = [], tabId, subtree = [], savedIndex = 0, beforeId = null, afterId = null, }) {
+	// Drop the subtree (it travels with the tab) but keep the tab itself,
+	// so `here` is its current slot and `base` the slots it can land in.
+	const carried = new Set(subtree);
+	const heads = order.filter(id => !carried.has(id));
+	const here = heads.indexOf(tabId);
+	if (here < 0) { return null; }
+	const base = heads.filter(id => id !== tabId);
+	if (!base.length) { return null; }
+	const at = ref => base.indexOf(ref);
+	const planOf = (kind, referenceTabId) => ({ kind, referenceTabId, });
+	if (beforeId != null && at(beforeId) >= 0) {
+		if (here === at(beforeId) + 1) { return null; } // already after it
+		return planOf("move-after", beforeId);
+	}
+	if (afterId != null && at(afterId) >= 0) {
+		if (here === at(afterId)) { return null; } // already before it
+		return planOf("move-before", afterId);
+	}
+	const index = Math.max(0, Math.min(Number.isFinite(savedIndex) ? savedIndex : base.length, base.length));
+	if (here === index) { return null; }
+	if (index >= base.length) { return planOf("move-after", base[base.length - 1]); }
+	return planOf("move-before", base[index]);
 }

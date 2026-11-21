@@ -82,19 +82,41 @@ export function strapHtml ({ members, tabsById, highlightIds, badgeIds, }) {
 }
 
 /**
- * Diffing renderer.  Tracks what it last sent per strap and clears the
- * targets that vanished (an empty shelf, a closed owner).
+ * Diffing renderer.  Tracks what TST ACKNOWLEDGED per strap — the markup —
+ * and clears the targets that vanished (an empty shelf, a closed owner).  A
+ * request that rejects is not recorded, so the next derivation retries it.
  * `send(type, params)` is TST's message route; the caller injects it.
  */
-export function createRenderer ({ send, log, linesOf = () => 1, }) {
-	const renderedStraps = new Map; // `${windowId}:${owner}` -> { owner, contents } (null = cleared)
-	const tabStates = new Map;      // tabId -> Set of applied tst-shelf-* states
+export function createRenderer ({ send, log, }) {
+	const renderedStraps = new Map; // `${windowId}:${owner}` -> { owner, contents } | null (cleared)
+	const tabStates = new Map;      // tabId -> Set of ACKNOWLEDGED tst-shelf-* states
 	/** Re-send every wanted state even if the ledger says it is applied: a
 	 *  sidebar that attaches late never saw the earlier broadcasts (TST
 	 *  exports only its own safe states to a newly opened sidebar, see
 	 *  exportTab in common/TreeItem.js), so its model is missing ours. */
 	let forceStateSync = false;
 	const strapKey = (windowId, owner) => `${windowId}:${owner ?? "root"}`;
+
+	/** Send one strap and record it only when TST ACKNOWLEDGED it.  The
+	 *  ledger is a record of what the sidebar holds, never of what we
+	 *  wanted: a rejected request must stay unacknowledged so the next
+	 *  derivation sends it again (a ledger written before the reply left
+	 *  failed writes marked as applied forever — measured with an injected
+	 *  rejection: no second request, the strap simply never appeared). */
+	async function writeStrap ({ key, owner, contents, windowId, }) {
+		const params = owner === ROOT_SHELF
+			? { place: "tabbar-top", windowId, contents, }
+			: { place: "tab-below", tab: owner, windowId, contents, };
+		try {
+			await send("set-extra-contents", params);
+			renderedStraps.set(key, contents == null ? null : { owner, contents, });
+			return true;
+		}
+		catch (error) {
+			log("strap-send-fail", `${key} ${error && error.message || error}`);
+			return false;
+		}
+	}
 
 	/** Apply one window's derivation: straps first, then state classes. */
 	async function applyDerivation ({ windowId, derivation, tabsById, }) {
@@ -112,42 +134,25 @@ export function createRenderer ({ send, log, linesOf = () => 1, }) {
 			});
 		}
 
-		const sends = [];
-		// `lines` is the TST capability (A3): the row is rendered as N whole
-		// lines tall and TST's scroll geometry accounts for it.  A TST
-		// without the capability ignores the parameter and the strap simply
-		// scrolls (the stylesheet keeps a single line there).
-		const strapSend = ({ owner, contents, }) => {
-			const lines = linesOf(owner, windowId);
-			return send("set-extra-contents",
-				owner === ROOT_SHELF
-					? { place: "tabbar-top", windowId, contents, lines, }
-					: { place: "tab-below", tab: owner, windowId, contents, lines, });
-		};
-
+		const writes = [];
 		for (const [key, strap] of desired) {
 			const current = renderedStraps.get(key);
 			if (current && current.contents === strap.contents) { continue; }
-			renderedStraps.set(key, strap);
-			sends.push(strapSend(strap));
+			writes.push(writeStrap({ key, ...strap, windowId, }));
 		}
 		// straps that vanished entirely (owner left the tree, members gone)
 		for (const [key, current] of [...renderedStraps.entries()]) {
-			if (key.startsWith(`${windowId}:`) && !desired.has(key) && current && current.contents != null) {
-				renderedStraps.set(key, null);
-				sends.push(strapSend({
-					owner: key.endsWith(":root") ? ROOT_SHELF : Number(key.slice(String(windowId).length + 1)),
-					contents: null,
-				}));
+			if (key.startsWith(`${windowId}:`) && !desired.has(key) && current) {
+				writes.push(writeStrap({ key, owner: current.owner, contents: null, windowId, }));
 			}
 		}
-		await Promise.all(sends);
+		await Promise.all(writes);
 
 		await applyTabStates({ windowId, derivation, tabsById, });
 	}
 
 	/**
-	 * Diff the tst-shelf-* state classes against what we last applied.
+	 * Diff the tst-shelf-* state classes against what TST acknowledged.
 	 * Only owners carry a state now: members have no rows at all (hidden
 	 * tabs), so there is nothing to style on them — the strap icon IS
 	 * their presentation (0.1.4).
@@ -156,28 +161,29 @@ export function createRenderer ({ send, log, linesOf = () => 1, }) {
 		const wanted = new Map; // tabId -> Set of states
 		for (const owner of derivation.ownerIds) {
 			if (owner === ROOT_SHELF) { continue; }
-			const states = new Set(["tst-shelf-owner"]);
-			if (linesOf(owner, windowId) > 1) { states.add("tst-shelf-lines"); }
-			wanted.set(owner, states);
+			wanted.set(owner, new Set(["tst-shelf-owner"]));
 		}
 
-		const sends = [];
 		const force = forceStateSync;
 		forceStateSync = false;
+		// id -> states TST is known to hold; carried forward one
+		// acknowledged request at a time (same rule as the strap ledger).
+		const planned = new Map;
+		const jobs = [];
 		for (const [id, states] of wanted) {
 			const current = tabStates.get(id) || new Set;
+			planned.set(id, new Set(current));
 			for (const state of states) {
 				// windowId is load-bearing: TST's getTargetTabs falls back
 				// to the LAST FOCUSED WINDOW without it, and in a headless
 				// (or unfocused) session that resolves to a window whose
 				// active tab is null => the request silently processes
 				// ZERO tabs while still answering `true`.
-				if (force || !current.has(state)) { sends.push(send("add-tab-state", { tab: id, state, windowId, })); }
+				if (force || !current.has(state)) { jobs.push({ id, state, op: "add", }); }
 			}
 			for (const state of current) {
-				if (!states.has(state)) { sends.push(send("remove-tab-state", { tab: id, state, windowId, })); }
+				if (!states.has(state)) { jobs.push({ id, state, op: "remove", }); }
 			}
-			tabStates.set(id, states);
 		}
 		// tabs that dropped out of our world entirely (unshelved, closed…).
 		// ONLY tabs of THIS window: in a multi-window session another
@@ -185,14 +191,28 @@ export function createRenderer ({ send, log, linesOf = () => 1, }) {
 		// (they are "not in this tree" by definition — a global cleanup
 		// here nuked the other window's shelf states; caught in E2E).
 		for (const [id, current] of [...tabStates.entries()]) {
-			if (!wanted.has(id) && tabsById.has(id)) {
-				for (const state of current) {
-					sends.push(send("remove-tab-state", { tab: id, state, windowId, }));
-				}
-				tabStates.delete(id);
-			}
+			if (wanted.has(id) || !tabsById.has(id)) { continue; }
+			planned.set(id, new Set(current));
+			for (const state of current) { jobs.push({ id, state, op: "remove", }); }
 		}
-		await Promise.all(sends);
+
+		const outcomes = await Promise.all(jobs.map(job =>
+			send(job.op === "add" ? "add-tab-state" : "remove-tab-state",
+				{ tab: job.id, state: job.state, windowId, })
+				.then(() => true, error => {
+					log(`${job.op}-state-fail`, `${job.id} ${job.state} ${error && error.message || error}`);
+					return false;
+				})));
+		jobs.forEach((job, index) => {
+			if (!outcomes[index]) { return; }
+			const states = planned.get(job.id);
+			if (!states) { return; }
+			if (job.op === "add") { states.add(job.state); } else { states.delete(job.state); }
+		});
+		for (const [id, states] of planned) {
+			if (wanted.has(id) || states.size) { tabStates.set(id, states); }
+			else { tabStates.delete(id); }
+		}
 	}
 
 	/**
@@ -205,23 +225,22 @@ export function createRenderer ({ send, log, linesOf = () => 1, }) {
 	async function restoreStraps ({ windowId, derivation, tabsById, }) {
 		if (!derivation) { return; }
 		log("restore", `window ${windowId} shelves=${derivation.shelves.size}`);
-		const sends = [];
+		const writes = [];
 		for (const [owner, members] of derivation.shelves) {
 			if (!members.length) { continue; }
-			const contents = strapHtml({
-				members,
-				tabsById,
-				highlightIds: derivation.highlightIds,
-				badgeIds: derivation.badgeIds,
-			});
-			const lines = linesOf(owner, windowId);
-			const params = owner === ROOT_SHELF
-				? { place: "tabbar-top", windowId, contents, lines, }
-				: { place: "tab-below", tab: owner, windowId, contents, lines, };
-			sends.push(send("set-extra-contents", params)
-				.catch(error => log("restore-send-fail", `${owner} ${error && error.message || error}`)));
+			writes.push(writeStrap({
+				key: strapKey(windowId, owner),
+				owner,
+				contents: strapHtml({
+					members,
+					tabsById,
+					highlightIds: derivation.highlightIds,
+					badgeIds: derivation.badgeIds,
+				}),
+				windowId,
+			}));
 		}
-		await Promise.all(sends);
+		await Promise.all(writes);
 	}
 
 	/**
@@ -245,15 +264,6 @@ export function createRenderer ({ send, log, linesOf = () => 1, }) {
 		forceStateSync = true;
 	}
 
-	/** Drop the remembered straps so the next derivation re-sends them
-	 *  (used when something outside the contents changed, e.g. the row's
-	 *  line count). */
-	function invalidate (windowId) {
-		for (const key of [...renderedStraps.keys()]) {
-			if (key.startsWith(`${windowId}:`)) { renderedStraps.delete(key); }
-		}
-	}
-
 	/** Forget a window (closed): stop tracking its keys and states. */
 	function forgetWindow (windowId, liveTabIds) {
 		for (const key of [...renderedStraps.keys()]) {
@@ -264,5 +274,5 @@ export function createRenderer ({ send, log, linesOf = () => 1, }) {
 		}
 	}
 
-	return { applyDerivation, restoreStraps, clearLegacyStraps, forgetWindow, invalidate, forceStateResync };
+	return { applyDerivation, restoreStraps, clearLegacyStraps, forgetWindow, forceStateResync };
 }

@@ -32,14 +32,15 @@
  *    truncates the title, and TST's tab preview tooltip shows the full
  *    one on hover;
  *  - the strap takes at most 2/3 of the row; when the icons do not fit it
- *    either scrolls horizontally (one line) or — on a TST with the A3
- *    capability — the row grows in whole lines and the strap lays the icons
- *    out in that many rows (rule 3b), so every icon stays visible;
+ *    scrolls horizontally, so the row keeps its one-line height;
  *  - members keep NO row at all: they are hidden through
  *    `browser.tabs.hide()` (the only lever that removes a tab from
  *    TST's renderable set without breaking the law — a member row that
  *    paints 0 while TST counts it is exactly the 0.1.1 drift).
  */
+
+/** The gap between shelf cells, in px. */
+const SHELF_GAP_PX = 3;
 
 export const SHELF_STYLE = `
 /* 1. The dummy tab must not mirror our straps, or every row inflates:
@@ -97,27 +98,12 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
   flex-direction: row;
   flex-wrap: nowrap;
   align-items: center;
-  gap: 3px;
+  gap: ${SHELF_GAP_PX}px;
   max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: none;
   pointer-events: auto;
-}
-
-/* 3b. The crowded shelf, "extend" layout (TST 4.5): the row was made N whole
-     lines tall by TST, so the strap lays its icons out in exactly N rows and
-     every icon stays visible — no horizontal scrolling, no hidden icons.
-     The row's line count is set BY TST as --tab-lines on the owner row
-     (sidebar/size.js) and inherits into the shadow root; the tst-shelf-lines
-     class is the owner's own state, applied only above one line. */
-tab-item.tst-shelf-owner.tst-shelf-lines .extra-items-container.below::part(%EXTRA_CONTENTS_PART% shelf-strap) {
-  display: grid;
-  grid-auto-flow: column;
-  grid-template-rows: repeat(var(--tab-lines, 1), var(--faviconized-tab-size));
-  grid-auto-columns: var(--faviconized-tab-size);
-  align-content: center;
-  justify-content: start;
 }
 
 /* 4. The root shelf strap: #tabbar-top renders above all tabs —

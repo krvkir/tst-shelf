@@ -8,3 +8,4 @@ tests/e2e-console.log
 tests/*.log
 tests/e2e-console.lock
 *~
+dist-e2e/
