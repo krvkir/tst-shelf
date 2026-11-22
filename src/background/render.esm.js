@@ -53,10 +53,39 @@ export function faviconStyleOf (tab) {
 	return ` style="background-image: url(&quot;${escapeAttributeValue(tab.favIconUrl)}&quot;)"`;
 }
 
+/** Cookie stores that are NOT containers: the default container and the
+ *  private-window pseudo-identity.  TST's palette declares no
+ *  --contextual-identity-color-<id> for either, and their rows carry no
+ *  marker, so the icon must not paint one either. */
+const NON_CONTAINER_COOKIE_STORES = new Set(["firefox-default", "firefox-private"]);
+
+/**
+ * The container line of one shelf icon (0.6.4): the thin color line
+ * Firefox and TST paint on every rendered ROW of a container tab
+ * (`ensureContextualIdentityMarker` appends the span whenever the row's
+ * states gain `contextual-identity-<cookieStoreId>`).  A shelved member
+ * has no row — its marker site is this passive child of its own icon
+ * cell instead.  The color is a live REFERENCE to TST's palette, never
+ * a snapshot: TST's updateContextualIdentitiesStyle declares
+ * `--contextual-identity-color-<cookieStoreId>` on the sidebar root and
+ * rebuilds it on every containers change, so a recolor repaints the
+ * icon with no re-derivation.  The transparent fallback degrades any
+ * unknown cookieStoreId to "no line", never to a wrong color.
+ */
+function markerSpanOf (tab) {
+	const cookieStoreId = tab.cookieStoreId;
+	return cookieStoreId && !NON_CONTAINER_COOKIE_STORES.has(cookieStoreId)
+		? `<span part="shelf-marker" style="--shelf-marker: var(--contextual-identity-color-${escapeAttributeValue(cookieStoreId)}, transparent)"></span>`
+		: "";
+}
+
 /**
  * One shelf icon (a favicon cell).
  *
- * The fold badge shows whenever the shelved tab has descendants (the
+ * The container line (`shelf-marker`, see markerSpanOf) leads the
+ * cell's children: it is painted UNDER the other decorations, where
+ * they overlap.  The fold badge shows whenever the shelved tab has
+ * descendants (the
  * count is TST's own subtree-counter number: the descendants, the tab
  * itself excluded) — the mode picks the plus or the number.  The audio
  * indicator (`shelf-sound`) takes the other bottom corner; it carries
@@ -81,13 +110,14 @@ export function iconHtml ({ tab, active, badgeMode = "plus", badgeCount = 0, hin
 	const hintSpan = hint
 		? `<span part="shelf-hint" data-hint="${escapeAttributeValue(hint)}">${escapeHtml(hint)}</span>`
 		: "";
+	const markerSpan = markerSpanOf(tab);
 	const title = `${tab.title || tab.url || ""}\n${tab.url || ""}`;
 	return `<div part="${parts.join(" ")}" data-tab-id="${tab.id}"`
 		+ ` draggable="true"`
 		+ ` data-drag-data='{"type":"tab","data":{"id":${tab.id},"asTree":true}}'`
 		+ ` title="${escapeAttributeValue(title)}"`
 		+ faviconStyleOf(tab)
-		+ `>${hintSpan}${soundSpan}${badgeSpan}</div>`;
+		+ `>${markerSpan}${hintSpan}${soundSpan}${badgeSpan}</div>`;
 }
 
 /** The invisible, zero-size key catcher: the mode's focus target.  TST's

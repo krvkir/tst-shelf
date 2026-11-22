@@ -261,6 +261,62 @@ test("a silent unmuted tab shows no audio glyph", () => {
 });
 
 // ---------------------------------------------------------------------------
+// container line (0.6.4): the row marker adopted on shelf icons
+
+test("a container member's icon carries the marker span with its own palette var", () => {
+	const html = iconHtml({
+		tab: { id: 2, title: "a", url: "https://a.example", cookieStoreId: "container-42", },
+		active: false, badgeCount: 0,
+	});
+	assert.match(html,
+		/<span part="shelf-marker" style="--shelf-marker: var\(--contextual-identity-color-container-42, transparent\)"><\/span>/,
+		() => html);
+	// the marker is the FIRST child of the cell: the badge and the audio
+	// indicator paint over it where they overlap
+	const markerAt = html.indexOf('part="shelf-marker"');
+	const soundAt = html.indexOf("shelf-sound");
+	const badgeAt = html.indexOf("shelf-badge");
+	assert.ok(markerAt > -1, () => html);
+	assert.ok(badgeAt == -1 && soundAt == -1 || markerAt < badgeAt && markerAt < soundAt, () => html);
+});
+
+test("a default-container or private member's icon carries no marker span", () => {
+	const plain = iconHtml({ tab: { id: 2, title: "a", cookieStoreId: "firefox-default", }, active: false, badgeCount: 0, });
+	assert.ok(!plain.includes("shelf-marker"), () => plain);
+	const priv = iconHtml({ tab: { id: 2, title: "a", cookieStoreId: "firefox-private", }, active: false, badgeCount: 0, });
+	assert.ok(!priv.includes("shelf-marker"), () => priv);
+	const legacy = iconHtml({ tab: { id: 2, title: "a", }, active: false, badgeCount: 0, });
+	assert.ok(!legacy.includes("shelf-marker"), "a snapshot without cookieStoreId carries no marker either");
+});
+
+test("a mixed shelf colors each icon's line from its own container, not the owner's", () => {
+	const mixedTabsById = new Map([
+		[1, { id: 1, title: "owner", url: "https://e", cookieStoreId: "owner-container", },],
+		[2, { id: 2, title: "a", url: "https://a.example", cookieStoreId: "alpha-container", },],
+		[3, { id: 3, title: "b", url: "https://b.example", cookieStoreId: "beta-container", },],
+	]);
+	const html = strapHtml({ members: [2, 3], tabsById: mixedTabsById, highlightIds: new Set, });
+	assert.match(html, /--shelf-marker: var\(--contextual-identity-color-alpha-container, transparent\)/);
+	assert.match(html, /--shelf-marker: var\(--contextual-identity-color-beta-container, transparent\)/);
+	assert.ok(!html.includes("owner-container"), "the owner's cookieStoreId never leaks into a member icon", );
+});
+
+test("the icon's behavior attributes are untouched by the marker span", () => {
+	const tab = { id: 2, title: "a", url: "https://a.example", cookieStoreId: "container-42", };
+	const html = iconHtml({ tab, active: false, badgeCount: 0, });
+	assert.match(html, /<div part="shelf-icon" data-tab-id="2" draggable="true" data-drag-data='{"type":"tab","data":{"id":2,"asTree":true}}' title="a\nhttps:\/\/a\.example">/, () => html);
+});
+
+test("a marker span's cookieStoreId is escaped like any attribute", () => {
+	const html = iconHtml({
+		tab: { id: 2, title: "x", cookieStoreId: `"><b>x</b>`, },
+		active: false, badgeCount: 0,
+	});
+	assert.equal(html.includes('"><b>x</b>'), false);
+	assert.ok(html.includes("&quot;"), () => html);
+});
+
+// ---------------------------------------------------------------------------
 // hint chips (tab-hints)
 
 test("a hinted icon carries the code chip; an unhinted one does not", () => {

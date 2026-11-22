@@ -33,6 +33,34 @@ test("buildShelfStyle returns the whole stylesheet as one string", () => {
 	}
 });
 
+test("the container-line rules ship: the base bar and both theme branches (0.6.4)", () => {
+	const style = buildShelfStyle();
+	// the base bar: geometry from TST's own row marker
+	assert.ok(style.includes("::part(%EXTRA_CONTENTS_PART% shelf-marker)"),
+		"the base ::part(shelf-marker) rule is missing");
+	assert.ok(style.includes("--shelf-marker-cross: calc(var(--favicon-size) / 8);"),
+		"the cross-section is not TST's --contextual-identity-marker-size formula");
+	assert.ok(style.includes("background-color: var(--shelf-marker);"),
+		"the paint color does not ride the markup's --shelf-marker var");
+	assert.ok(style.includes("inset-block: min(calc((var(--faviconized-tab-size) - var(--favicon-size)) / 2), calc(var(--faviconized-tab-size) * 0.15));"),
+		"the block insets are not the row-marker margin formula bounded by the cell");
+	// the theme branches, keyed on TST's sidebar-root dataset (sidebar.js:380)
+	assert.ok(style.includes(':root[data-style="proton"].regular ::part(%EXTRA_CONTENTS_PART% shelf-marker)'),
+		"the proton regular branch (marker shifted inward) is missing");
+	assert.ok(style.includes(':root[data-style="proton"].inverted ::part(%EXTRA_CONTENTS_PART% shelf-marker)'),
+		"the proton inverted branch is missing");
+	assert.ok(style.includes('--tab-highlighter-size'),
+		"the proton branch does not shift by --tab-highlighter-size");
+	assert.ok(style.includes(':root[data-style="nova"] ::part(%EXTRA_CONTENTS_PART% shelf-marker)'),
+		"the nova branch (horizontal accent) is missing");
+	assert.ok(style.includes("height: var(--shelf-marker-cross);"),
+		"the nova branch does not flip the bar to a horizontal accent");
+	// the marker is passive: no pointer-events of its own
+	const baseAt = style.indexOf("::part(%EXTRA_CONTENTS_PART% shelf-marker) {");
+	const baseBlock = style.slice(baseAt, style.indexOf("}", baseAt));
+	assert.ok(baseBlock.includes("pointer-events: none"), () => baseBlock);
+});
+
 test("the builder throws nothing and the stylesheet keeps its tail", () => {
 	assert.doesNotThrow(() => buildShelfStyle(10));
 	assert.doesNotThrow(() => buildShelfStyle(18));

@@ -178,6 +178,58 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
   box-shadow: inset 0 0 0 1px var(--tab-border-color, currentColor);
 }
 
+/* 5c. The container line (0.6.4): the thin color bar Firefox and TST
+     paint on every rendered ROW of a container tab, adopted for shelf
+     icons (a member has no row — its icon cell is the marker's site;
+     the owner row paints its own native marker untouched).  The COLOR
+     is TST's live palette, referenced never copied: the markup carries
+     --shelf-marker: var(--contextual-identity-color-<id>, transparent)
+     and TST's updateContextualIdentitiesStyle (sidebar/sidebar.js)
+     declares that variable per container on the sidebar root, rebuilding
+     it on every containers change — a recolor repaints the icons without
+     any re-derivation.  The paint color below:
+     background-color: var(--shelf-marker).
+     GEOMETRY is TST's own row marker, bounded by the icon cell the way
+     TST bounds it by the row.  Cross-section calc(var(--favicon-size) /
+     8) is TST's very --contextual-identity-marker-size (base.css).  The
+     block insets are TST's row formula --contextual-identity-marker-
+     margin = min((current - favicon) / 2, current * 0.15) with the row's
+     current size replaced by the cell's (--faviconized-tab-size): the
+     line spans the favicon's height exactly the way the row's marker
+     does on a faviconized (pinned) row — a favicon cell IS a faviconized
+     geometry.  Nova replaces the bar with a horizontal accent (nova.css),
+     keyed below on the sidebar root's data-style (sidebar.js); proton
+     shifts the bar inward by --tab-highlighter-size (proton.css), under
+     .regular/.inverted, the same sides TST uses.  Themes with no marker
+     override of their own (photon, sidebar, highcontrast) fall through
+     to the base bar, as they do on rows.  pointer-events: none: the
+     icon cell keeps every behavior (click, drag, context menu). */
+::part(%EXTRA_CONTENTS_PART% shelf-marker) {
+  --shelf-marker-cross: calc(var(--favicon-size) / 8);
+  position: absolute;
+  inset-inline-end: 0;
+  inset-block: min(calc((var(--faviconized-tab-size) - var(--favicon-size)) / 2), calc(var(--faviconized-tab-size) * 0.15));
+  width: var(--shelf-marker-cross);
+  height: auto;
+  background-color: var(--shelf-marker);
+  z-index: var(--tab-ui-z-index);
+  pointer-events: none;
+}
+:root[data-style="proton"].regular ::part(%EXTRA_CONTENTS_PART% shelf-marker) {
+  inset-inline-end: var(--tab-highlighter-size);
+}
+:root[data-style="proton"].inverted ::part(%EXTRA_CONTENTS_PART% shelf-marker) {
+  inset-inline-start: var(--tab-highlighter-size);
+}
+:root[data-style="nova"] ::part(%EXTRA_CONTENTS_PART% shelf-marker) {
+  inset-inline: calc(var(--toolbarbutton-border-radius, 4px) * 0.65 / 2);
+  inset-block-start: calc((var(--faviconized-tab-size) - var(--favicon-size) - var(--shelf-marker-cross) * 2) / 4);
+  inset-block-end: auto;
+  height: var(--shelf-marker-cross);
+  width: auto;
+  border-radius: var(--border-radius-xsmall, 1px);
+}
+
 /* 6. The fold badge: shown whenever the shelved tab has descendants,
      whether the subtree is folded or unfolded (it carries the same
      descendant count TST writes on its own rows).  The markup emits it

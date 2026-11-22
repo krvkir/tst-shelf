@@ -65,6 +65,13 @@ function applyE2EPatch () {
 	const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
 	manifest.version += "-e2e";
 	manifest.permissions.push("downloads");
+	// the container-line fixture (0.6.4): the smoke page creates real
+	// containers (contextualIdentities.create) and opens tabs in them
+	// (tabs.create({cookieStoreId})) — both need `contextualIdentities`
+	// and `cookies` (MDN).  Production never carries either —
+	// verify-dist rejects any non-API permission outright.
+	manifest.permissions.push("contextualIdentities");
+	manifest.permissions.push("cookies");
 	// the hint-fixture pages (tests/e2e-drive.mjs): the E2E enters hint
 	// mode through the test hook, so no commands-API activeTab grant
 	// exists, and arming the page catcher in a real http page REQUIRES

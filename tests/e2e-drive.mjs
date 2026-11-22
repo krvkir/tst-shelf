@@ -200,6 +200,7 @@ const sidebarScript = String.raw`
 			info.strap = true;
 			for (const icon of strap.querySelectorAll('[part~="shelf-icon"]')) {
 				const glyph = icon.querySelector('[part~="shelf-sound"]');
+				const marker = icon.querySelector('[part~="shelf-marker"]');
 				const record = {
 					id: icon.dataset.tabId,
 					title: (icon.getAttribute("title") || "").split("\n")[0],
@@ -210,6 +211,9 @@ const sidebarScript = String.raw`
 					sound: !glyph ? null :
 						(glyph.getAttribute("part") || "").includes("tst-shelf-sound-muted") ? "muted" : "playing",
 					active: (icon.getAttribute("part") || "").includes("tst-shelf-icon-active"),
+					// 0.6.4 container line: the marker span's own inline
+					// style (live palette reference), or null when absent
+					marker: marker ? (marker.getAttribute("style") || "") : null,
 				};
 				icons.push(record);
 				if (clickId != null && record.id == String(clickId)) {
@@ -232,13 +236,21 @@ const sidebarScript = String.raw`
 	const rootIcons = [];
 	if (topStrap) {
 		for (const icon of topStrap.querySelectorAll('[part~="shelf-icon"]')) {
+			const marker = icon.querySelector('[part~="shelf-marker"]');
 			rootIcons.push({
 				id: icon.dataset.tabId,
 				title: (icon.getAttribute("title") || "").split("\n")[0],
 				hasBg: /background-image/.test(icon.getAttribute("style") || ""),
+				marker: marker ? (marker.getAttribute("style") || "") : null,
 			});
 		}
 	}
+	// the registered style string (installStyle stores it in a
+	// <style type="text/css"> element in the sidebar head): does the
+	// container-line block survive %EXPANSION% and TST's install?
+	const styleText = [...document.querySelectorAll("style[type='text/css']")]
+		.map(style => style.textContent || "")
+		.join("\n");
 	const normal = document.querySelector("#normal-tabs-container .tabs");
 	return JSON.stringify({
 		href: location.href,
@@ -246,6 +258,10 @@ const sidebarScript = String.raw`
 		allTabItems: document.querySelectorAll("tab-item").length,
 		rowsWithTabId: flat.length,
 		rows: flat, icons, rootIcons, clicked: !!clickId,
+		themeStyle: document.documentElement.dataset.style || null,
+		hasMarkerRule: styleText.includes("shelf-marker"),
+		hasMarkerProton: styleText.includes(":root[data-style=\"proton\"].regular ::part"),
+		hasMarkerNova: styleText.includes(":root[data-style=\"nova\"] ::part"),
 		normalChildren: normal ? normal.children.length : -1,
 	});
 `;
@@ -1092,6 +1108,33 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 				check("favicons ride the style attribute through the sanitizer", iconB && iconB.hasBg, () => `favicons ride the style attribute through the sanitizer ${iconB && JSON.stringify(iconB)}`);
 
 				check("the root shelf strap holds the shelved root tab", (dump.rootIcons || []).some(icon => icon.id == String(e.rootMember)), () => `the root shelf strap holds the shelved root tab ${JSON.stringify(dump.rootIcons)}`);
+
+				// -- the container line (0.6.4): the row marker adopted on
+				// the icons of shelved container tabs.  The setup phase
+				// flipped the member through both containers (the UI's
+				// own reopen-in-container path), so the line must carry
+				// the SECOND container's id — live, at the strap's next
+				// re-render, with no extension restart.
+				{
+					const icon = (dump.rootIcons || []).find(entry => entry.id == String(e.containerMember));
+					const control = (dump.icons || []).find(entry => entry.id == String(e.controlMember))
+						|| (dump.rootIcons || []).find(entry => entry.id == String(e.controlMember));
+					check("a shelved container member's icon carries the container line", !!(icon && icon.marker && icon.marker.includes("var(--contextual-identity-color-")),
+						() => `line=${JSON.stringify(icon && icon.marker)}`);
+					check("the line paints from the live palette reference, not a copied value", !!(icon && icon.marker && /^[ ]*--shelf-marker: var\(/.test(icon.marker)),
+						() => `line=${JSON.stringify(icon && icon.marker)}`);
+					check("the line follows the container change (second container, not the first)",
+						!!(icon && icon.marker && icon.marker.includes(`--contextual-identity-color-${e.containerStore},`)
+							&& !icon.marker.includes(`--contextual-identity-color-${e.priorContainerStore},`)),
+						() => `line=${JSON.stringify(icon && icon.marker)} prior=${e.priorContainerStore}`);
+					check("a default-container member's icon shows no line", !!(control && control.marker == null),
+						() => `control=${JSON.stringify(control && control.marker)}`);
+					check("the registered stylesheet carries the marker rules", dump.hasMarkerRule === true,
+						() => JSON.stringify({ themeStyle: dump.themeStyle, hasMarkerRule: dump.hasMarkerRule, }));
+					check("the active theme's marker branch is registered",
+						dump.themeStyle === "nova" ? dump.hasMarkerNova === true : dump.hasMarkerProton === true,
+						() => JSON.stringify({ themeStyle: dump.themeStyle, proton: dump.hasMarkerProton, nova: dump.hasMarkerNova, }));
+				}
 
 				// interaction: click C (unfold+activate), then B (one per shelf)
 				console.log("[drive] phase 2: clicking the C icon");

@@ -284,6 +284,52 @@ async function phaseOneAndTwo () {
 		return shelf && shelf[1].length == 3 ? s : null;
 	}, 8000);
 
+	// -- the container line (0.6.4): markers on container members -------
+	// The smoke page creates real containers (the E2E flavor carries the
+	// `contextualIdentities` + `cookies` permissions); a clean profile
+	// has none.  The container member is a ROOT member: the root strap's
+	// icon order carries no E2E expectation, while A's shelf order is
+	// asserted EXACTLY by the driver (the newest member is the rightmost).
+	{
+		const TREE_URL = browser.runtime.getURL("tree-tab.html");
+		const containerX = await browser.contextualIdentities.create({ name: "e2e-shelf-line", color: "blue", icon: "fence", });
+		const containerY = await browser.contextualIdentities.create({ name: "e2e-shelf-line-two", color: "red", icon: "fence", });
+		const opened = await browser.tabs.create({ windowId: ids.windowId, url: TREE_URL, cookieStoreId: containerX.cookieStoreId, });
+		const putOk = await send({ type: "test:put", tabId: opened.id });
+		await eventually("the container member lands on the root shelf", async () => {
+			const s = await send({ type: "test:state" });
+			const root = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == "root");
+			return root && root[1].includes(opened.id) ? s : null;
+		}, 8000);
+		record("a shelved container tab exists with its container",
+			putOk && putOk.ok === true
+				&& (await browser.tabs.get(opened.id)).cookieStoreId === containerX.cookieStoreId,
+			JSON.stringify({ put: putOk, container: containerX.cookieStoreId, }));
+		// the LIVE flip (the "follows a container change" scenario):
+		// Firefox cannot retag a live tab, and the UI's own path —
+		// "Reopen in Container" — recreates the tab in the other
+		// container and closes the old one.  Same observable: the
+		// shelved set keeps a member in the slot and the next strap
+		// re-render carries the new container's marker.  No restart.
+		const takeOk = await send({ type: "test:take", tabId: opened.id });
+		const reopened = await browser.tabs.create({ windowId: ids.windowId, url: TREE_URL, cookieStoreId: containerY.cookieStoreId, });
+		await browser.tabs.remove(opened.id).catch(() => {});
+		const putBack = await send({ type: "test:put", tabId: reopened.id });
+		await eventually("the reopened member is shelved in the second container", async () => {
+			const s = await send({ type: "test:state" });
+			const root = s.shelves[ids.windowId] && s.shelves[ids.windowId].shelves.find(([owner]) => owner == "root");
+			return root && root[1].includes(reopened.id) ? s : null;
+		}, 8000);
+		ids.containerMember = reopened.id;
+		ids.containerStore = containerY.cookieStoreId;
+		ids.priorContainerStore = containerX.cookieStoreId;
+		ids.controlMember = ids.F;
+		await browser.storage.local.set({ "e2e-ids": ids, });
+		record("the shelved container member follows a container change without a restart",
+			!!(takeOk && takeOk.ok) && !!(putBack && putBack.ok),
+			JSON.stringify({ take: takeOk, putBack, store: containerY.cookieStoreId, }));
+	}
+
 	// External add-tab-state probe: the smoke page sends it through the
 	// same external channel the background uses; the driver later checks
 	// whether it landed in TST's background model.
@@ -375,6 +421,8 @@ async function phaseOneAndTwo () {
 			clickFirst: ids.C, clickSecond: ids.B,
 			plain: ids.D, f: ids.F,
 			nestedOwner: ids.C, nestedMember: ids.c1,
+			containerMember: ids.containerMember, containerStore: ids.containerStore,
+			priorContainerStore: ids.priorContainerStore, controlMember: ids.controlMember,
 		},
 		results,
 	}, "tst-shelf-e2e-setup.json");

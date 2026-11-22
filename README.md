@@ -79,6 +79,10 @@ What that leaves:
   descendants is active. A member that plays audio shows a sound glyph
   in its icon; a muted member shows the muted glyph, and clicking the
   glyph (not the icon) mutes or unmutes the tab without activating it.
+  A member of a Firefox container shows the thin container color line
+  on its icon (0.6.4) — the same notation regular tab rows carry, with
+  the color tracked live: recoloring the container repaints the icons
+  with no restart. Default-container and private tabs draw no line.
   Right-click opens the tab's own native context menu (TST routes
   `data-tab-id`), including the "Shelf" submenu with "Place leftmost"
   and "Place rightmost" for shelved tabs, and "Take off the shelf".
@@ -427,6 +431,47 @@ green.  Two consecutive clean runs are required before merging.
   250 ms debounce (tabs-move.js `syncToNativeTabs`). Shelf placement
   plans and derives in the walk order — planning against physical
   indices spun 40 moves into the guard on every put.
+- **Shelf icons adopt TST's container marker (0.6.4)** — the thin
+  vertical color line Firefox and TST paint on rendered rows of
+  container (contextual identity) tabs. A shelved member has no row,
+  so its icon cell carries the equivalent instead: a passive, zero-
+  behavior `shelf-marker` span, first among the cell's children so the
+  badge, the sound glyph and hint chips paint over it where they
+  overlap. Three TST internals, verified in 4.4.10, carry the feature:
+  - *The palette* — `updateContextualIdentitiesStyle`
+    (sidebar/sidebar.js:496-510) declares
+    `--contextual-identity-color-<cookieStoreId>` on the sidebar root
+    for every real container and rebuilds it on every containers
+    change (onUpdated), so the icons' color is a live CSS reference,
+    never a value copied at render time. `firefox-default` and
+    `firefox-private` are not containers: no variable exists for
+    either, the markup emits no span for them, and the
+    `transparent` fallback inside the var reference degrades any
+    unknown cookieStoreId to *no line* rather than a wrong color.
+  - *The palette var name prefix* `--contextual-identity-color-` is
+    TST-internal and pinned to the 4.4.10 reading above; a future TST
+    rename degrades to no line, never to a crash.
+  - *The geometry* — the base bar is TST's own
+    `.contextual-identity-marker` (sidebar/styles/base.css:1252-1261):
+    cross-section `calc(var(--favicon-size) / 8)`, the row's
+    marker-margin formula `min((current - favicon) / 2, current *
+    0.15)` with `current` replaced by the icon cell's
+    `--faviconized-tab-size`, so the line spans the favicon's height
+    the way it does on a pinned row. The proton branch shifts the bar
+    inward by `--tab-highlighter-size` under
+    `:root[data-style="proton"].regular/.inverted` (proton.css:457);
+    the nova branch replaces the bar with a horizontal accent
+    (nova.css:466-500). The active theme key is read from TST's own
+    `document.documentElement.dataset.style` (sidebar.js:380).
+    *Caveat:* Nova's row marker uses CSS anchor positioning against
+    the row's pill; the icon accent approximates its offsets (the
+    faviconized margins), so under Nova the icon line is an
+    approximation of the row marker's position — same color, same
+    cross-section — while Proton-family themes get the exact
+    geometry. The headless E2E asserts both branches ship in the
+    registered style and that the branch of the active theme is
+    present; the visual parity per theme is a GUI check (`make
+    iso-tst`).
 - **Shelf icons keep the last known favicon while their tab reloads**
   (Firefox reports no `favIconUrl` for a navigating tab; TST's rows
   are sticky the same way — the background only propagates explicit
