@@ -27,7 +27,7 @@
 - [x] 4.2 E2E: typing a shelved member's code runs the icon-click choreography (assertions reuse the existing selection block); a row tab's code activates it
 - [x] 4.3 E2E: prefix narrowing hides non-matching labels; Backspace restores them; Escape exits with every label cleared
 - [x] 4.4 E2E: the uniform-row conformance gate stays green while labels render, and an empty root shelf still reserves no space with the catcher present
-- [ ] 4.5 native command delivery verified once on a GUI `make iso-tst` run (documented like native menu delivery)
+- [x] 4.5 native command delivery verified once on a GUI `make iso-tst` run (documented like native menu delivery) — user-run GUI verification 2026-11-22: hotkey opens hint mode, typed codes activate tabs
 - [x] 4.6 two consecutive clean `make e2e` runs
 
 ## 5. Documentation
@@ -45,7 +45,7 @@
 - [x] 6.4 entry plans codes for EVERY surface-bearing tab of the window and writes row labels unconditionally (the stale-ledger defect); a known-closed sidebar (sidebar-hide, openCount 0, no rendered rows) declines at entry
 - [x] 6.5 E2E: arm-failure asserted as the graceful path (extension pages reject executeScript, MDN); the smoke page relays `hint-catcher-key` through its internal connection to exercise the real handler headlessly; the registration asserts read the smoke page's `commands` report
 - [x] 6.6 design/spec amendments: page-capture scenarios, scroll-stable codes, the measured facts section (MDN activeTab, injection exclusions, sidebar-hide openCount)
-- [ ] 6.7 native command delivery and a REAL page-catcher typing verified on a GUI `make iso-tst` run (headless cannot inject into its own extension pages)
+- [x] 6.7 native command delivery and a REAL page-catcher typing verified on a GUI `make iso-tst` run (headless cannot inject into its own extension pages) — user-run GUI verification 2026-11-22 on the installed extension: hint mode arms on a real page and typing activates the tab
 
 ## 7. 0.5.0 round: special pages, the Vimium conflict, the narrowing defect
 
