@@ -124,6 +124,7 @@ Each of these cost an E2E run or a user bug report; the README and =openspec/= d
 - =make release=, on a tree where =git status= holds only intended changes.
 - Confirm the final =verify-dist= line names =dist/= and the expected version, and that =web-ext-artifacts/= holds the production package.
 - Bump =version= in =src/manifest.json= and =package.json= together; E2E appends =-e2e= to the manifest version, so nothing else may.
+- A bug fix bumps only the THIRD version number (=0.6.0 -> 0.6.1=), never the second: =0.7.0= is for feature releases.
 - Update the README caveats when an E2E measurement changes a claim.
 - *NEVER delete previous versions from =web-ext-artifacts/=.* Every built zip is a fall-back tool for the user, who runs the addon daily: when a new version glitches, the previous zip is the downgrade path. Consequences: (a) =make clean= must not touch the folder (it did, =rm -rf … web-ext-artifacts= — fixed 2026-11-21; =web-ext build --overwrite-dest= replaces only the same-version zip, so releases need no purge); (b) after a release, =ls web-ext-artifacts/= must list the new zip /and/ every older one. Rebuilding a lost version: ~git worktree add /tmp/src <commit>~, symlink this repo's =node_modules=, run its =build.mjs=, its =verify-dist=, and =web-ext build= with =-a= pointing here (this is how =tst_shelf-0.2.3.zip= was restored).
 

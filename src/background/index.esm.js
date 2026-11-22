@@ -399,11 +399,23 @@ async function fetchLightTree (windowId, tabsById) {
 	if (!missing.length) { return roots; }
 	for (const id of missing) {
 		const subtree = await TST.methods.getLightTree({ windowId, tab: id, }).catch(() => null);
-		if (subtree && subtree.id == id) { roots.push(subtree); }
+		// Only a ROOT member may be re-rooted.  A shelved tab cut out of
+		// the export because its OWNER was hidden by another addon
+		// (container-workspace filtering) still reports its ancestors —
+		// re-rooting it would repaint it on the root-shelf strap at
+		// #tabbar-top, send the placement loop chasing "the first normal
+		// root" (physically MOVING the tab to the top of the strip) and
+		// leave no way back to its owner once the workspace is switched
+		// off.  Such a member stays out of the walk instead: no icon, no
+		// placement, its shelf dormant with its invisible owner.
+		if (subtree && subtree.id == id && !(subtree.ancestorTabIds || []).length) {
+			roots.push(subtree);
+		}
 	}
 	const indexOf = id => tabsById.get(id)?.index ?? Number.MAX_SAFE_INTEGER;
 	roots.sort((a, b) => indexOf(a.id) - indexOf(b.id));
-	logBoot("tree-splice", `window ${windowId} hidden roots=${missing.length}`);
+	const spliced = roots.length - (Array.isArray(tree) ? tree.length : 1);
+	logBoot("tree-splice", `window ${windowId} wanted=${missing.length} spliced=${spliced}`);
 	return roots;
 }
 

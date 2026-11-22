@@ -116,7 +116,14 @@ What that leaves:
   retries up to five times.
 - **Workspace parity**: icons of tabs hidden by container-workspace
   extensions (e.g. tst-workspace) are not rendered; an empty shelf
-  reserves no space. No messages are exchanged with them.
+  reserves no space. No messages are exchanged with them. A workspace
+  filter that hides a shelf OWNER hides the whole shelf with it
+  (0.6.1, lab-measured): the strap lives in the owner's row, so owner
+  and strap vanish together, every member keeps its icons off and its
+  tree position, and the shelf re-derives unchanged when the filter
+  lifts. Re-rooting a member whose owner merely dropped out of TST's
+  export once painted all foreign shelves onto the root shelf at the
+  top of the sidebar and moved the members there — 0.6.0's bug.
 - **Pinning ends shelving** (and "Put on shelf" is not offered for
   pinned tabs): Firefox pinning and shelving are mutually exclusive
   states — a pinned tab lives in the global pinned box, outside the
