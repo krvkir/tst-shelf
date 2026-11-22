@@ -10,7 +10,7 @@ import {
 	subtreeSizes, treePositions, nextPlacementMove, planExtremePlacementMove, resolveFavicons,
 	mustShowTabs, danglingMembers, ROOT_SHELF,
 	planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf,
-	assignHints, hintMatches, HINT_CHARSET, normalizeHintCharset, isSpecialPageUrl, planHintTargets,
+	assignHints, hintMatches, HINT_CHARSET, normalizeHintCharset, normalizeHintFontSize, isSpecialPageUrl, planHintTargets,
 } from "../src/background/logic.esm.js";
 
 /** Light-tree node helper. */
@@ -902,6 +902,18 @@ test("normalizeHintCharset dedupes, lower-cases, and rejects too-short input", (
 	assert.equal(normalizeHintCharset(""), "");
 	assert.equal(normalizeHintCharset(null), "");
 	assert.equal(normalizeHintCharset("a1 2b"), "a12b", "digits are allowed in a custom charset");
+});
+
+test("normalizeHintFontSize clamps to the chip band and falls back on junk", () => {
+	assert.equal(normalizeHintFontSize(12), 12);
+	assert.equal(normalizeHintFontSize("13"), 13, "the options field stores a string");
+	assert.equal(normalizeHintFontSize(14.9), 15, "rounded into the band");
+	assert.equal(normalizeHintFontSize(9), 12, "below the band falls back to the default");
+	assert.equal(normalizeHintFontSize(19), 12, "above the band falls back to the default");
+	assert.equal(normalizeHintFontSize("nine"), 12);
+	assert.equal(normalizeHintFontSize(null), 12);
+	assert.equal(normalizeHintFontSize(undefined), 12);
+	assert.equal(normalizeHintFontSize("9", 11), 11, "the fallback is the caller's");
 });
 
 test("isSpecialPageUrl marks exactly the uninjectable schemes", () => {

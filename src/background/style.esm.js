@@ -7,6 +7,17 @@
  * the only shadow roots in a tab row (tab-item-substance and its
  * children are plain light DOM, verified in TST 4.4.10 base.css).
  *
+ * THE TEMPLATE TRAP (0.6.3, paid for with an E2E run): this whole
+ * stylesheet is ONE template literal.  A RAW backtick inside it (CSS
+ * comments quoting selectors, e.g. \`.above\` in rule 8a) does not end
+ * the file — it ends THE TEMPLATE, the rest parses as a tagged-
+ * template call on the string's (missing) property, esbuild bundles
+ * it without any diagnostics, and the bundle then throws
+ * \`... is not a function\` at every boot, silently killing
+ * register-self.  Every backtick here MUST be escaped (\\\`).  The
+ * guard is tests/style.test.mjs, which CALLS buildShelfStyle and
+ * asserts the tail rules survive; keep it green before committing.
+ *
  * THE UNIFORM-ROW LAW (TST 4.4.10, verified the hard way):
  *  TST never measures painted rows.  Sidebar geometry — drag-and-drop
  *  zones (drag-and-drop.js: quarters of `Scroll.getItemRect`), the
@@ -42,7 +53,25 @@
 /** The gap between shelf cells, in px. */
 const SHELF_GAP_PX = 3;
 
-export const SHELF_STYLE = `
+/** The default hint chip font size, in px: the user option
+ *  storage.local.hintFontSize.  0.6.2 painted 11px; the option default
+ *  is a notch larger (12px) because the chips are dense two-to-four
+ *  letter labels the user reads whole. */
+export const DEFAULT_HINT_FONT_SIZE_PX = 12;
+
+/** The stylesheet with the hint chip size baked in.  The chips paint
+ *  from TST's own shadow parts, so there is no element of ours in a
+ *  row that could carry a CSS custom property down to them — the size
+ *  must live in the registered style string itself.  An option change
+ *  therefore re-runs register-self: TST's installStyle REPLACES the
+ *  addon's <style> text in every live sidebar (measured in TST 4.4.10,
+ *  tst-api-frontend.js installStyle), and the chips restyle at once,
+ *  mid-mode included. */
+export function buildShelfStyle (hintFontSize = DEFAULT_HINT_FONT_SIZE_PX) {
+	const value = Number(hintFontSize);
+	const fontPx = Number.isFinite(value) && value >= 10 && value <= 18
+		? Math.round(value) : DEFAULT_HINT_FONT_SIZE_PX;
+	return `
 /* 1. The dummy tab must not mirror our straps, or every row inflates:
      TST sizes ALL rows from #dummy-tab, which mirrors every addon's
      tab-below contents (sidebar/size.js, base.css:183). */
@@ -189,30 +218,49 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
 }
 
 /* 8. The hint mode (tab-hints).  The code chips paint OUT OF FLOW —
-     the per-row tab-above extra-contents container is a column flex
-     in .ui's flow (base.css), so an in-flow label would add exactly the
-     height the uniform-row law forbids; an absolutely positioned chip
-     contributes zero height and the container stays empty.
+     an in-flow label inside an extra-contents container would add
+     exactly the height the uniform-row law forbids (an in-flow chip
+     in a STRAP is the one exception: the strap is a bounded flex item
+     inside the owner's one-line row, so an extra flex item just
+     widens it).
 
-     TWO chips, two rules: "shelf-hint" is the ICON chip (inside our own
-     .shelf-icon), "shelf-rowhint" the ROW chip (inside TST's .above
-     container).  The row chip sits at the row's TOP INLINE-END corner:
-     TST's z-order table (base.css) gives .above the
-     --tab-extra-contents-beside-z-index (150) — ABOVE the caption's
-     --tab-base-z-index (100), BELOW the favicon's
-     --tab-favicon-z-index (200) — so wherever the chip overlaps the
-     favicon it loses (the 0.4.0 rule anchored it at the favicon's
-     corner: "below favicons, not always visible").  At the inline-end
-     corner nothing above 150 ever paints, and the chip wins over
-     label, counter and close box. */
+     THREE chips, three homes.  "shelf-hint", the ICON chip, lives
+     inside our own .shelf-icon cells.  "shelf-owner-hint", an OWNER
+     row's chip (the user call: "on the same line the shelved
+     children's chips are located, to the left from the leftmost one,
+     at the same distance as the shelf's other chips are apart"), is a
+     plain flex item at the START of its own strap (strapHtml
+     prepends it from the same narrowed hints map the icon chips ride)
+     — same line by the strap's align-items: center, one strap-gap
+     (3px) left of the leftmost icon, and NEVER paintable-over by the
+     strap because it IS strap content.  (History, measured: 0.6.2
+     carried owner chips in the tab-above overlay at the row's
+     inline-end corner — TST's tab-above/tab-below containers share
+     --tab-extra-contents-beside-z-index 150 and the strap's content
+     comes later in the row DOM, so the rightmost member's icon chip
+     painted over the owner's chip on exactly the rows that have a
+     shelf; an unreleased experiment moved owner chips to tab-front —
+     the caption's label-area overlay, z 6000 — and they became visible
+     but MISALIGNED: the front container's insets are the GLOBAL
+     --tab-label-start/end-offsets computed from the DUMMY tab
+     (size.js:177-178), which measured 33px off the row's end on a
+     plain row — visually fine — but on a starved owner caption the
+     chip's row-insetEnd measured 122px: "the hints are not aligned,
+     visual mess".  0.6.3: owners ride the strap; plain rows return
+     to the 0.6.2 corner.)  "shelf-rowhint", the ROW chip of rows
+     WITHOUT a strap, stays in the tab-above overlay (8a) anchored at
+     the row's inline-end top corner — the 0.6.2 geometry the user
+     explicitly blessed ("for the shelfless tabs, their chips'
+     locations were perfect, aligning vertically with the rightmost
+     shelved tabs' chips"). */
 ::part(%EXTRA_CONTENTS_PART% shelf-hint) {
   position: absolute;
   inset-inline-start: 8px;
   inset-block-start: 0;
   z-index: var(--tab-extra-contents-beside-z-index, 1);
   font: message-box;
-  font-size: 11px;
-  line-height: 14px;
+  font-size: ${fontPx}px;
+  line-height: 1.25;
   font-weight: 600;
   padding: 0 3px;
   color: #0b2a30;
@@ -226,8 +274,21 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
   inset-inline-end: 2px;
   inset-block-start: 0;
   font: message-box;
-  font-size: 11px;
-  line-height: 14px;
+  font-size: ${fontPx}px;
+  line-height: 1.25;
+  font-weight: 600;
+  padding: 0 3px;
+  color: #0b2a30;
+  background-color: #00c8d9;
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(2, 42, 48, 0.55);
+  pointer-events: none;
+}
+::part(%EXTRA_CONTENTS_PART% shelf-owner-hint) {
+  flex: 0 0 auto;
+  font: message-box;
+  font-size: ${fontPx}px;
+  line-height: 1.25;
   font-weight: 600;
   padding: 0 3px;
   color: #0b2a30;
@@ -238,7 +299,8 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
 }
 @media (prefers-color-scheme: dark) {
   ::part(%EXTRA_CONTENTS_PART% shelf-hint),
-  ::part(%EXTRA_CONTENTS_PART% shelf-rowhint) {
+  ::part(%EXTRA_CONTENTS_PART% shelf-rowhint),
+  ::part(%EXTRA_CONTENTS_PART% shelf-owner-hint) {
     color: #ffffff;
     background-color: #005f6e;
     box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.35);
@@ -252,16 +314,17 @@ tab-item.tst-shelf-owner .extra-items-container.below::part(%EXTRA_CONTENTS_PART
   display: none !important;
 }
 
-/* 8a. The row chip's ANCHOR: TST's .above container sits in .ui's
-     column flow, and its box varies by row kind — on the OWNER row
+/* 8a. The ROW chip's ANCHOR: the row chip hosts in TST's \`.above\`
+     container, whose own box varies by row kind — on the OWNER row
      (whose .below carries the strap) the measured container lands
      ~20px below the row's top and falls short of the row's inline-end
      edge (the E2E caught the owner's chip misplaced by 156px).  The
      container is therefore overlaid on the whole row: the chip's
      corner coordinates become the ROW's, for every row kind alike.
-     The overlay keeps TST's own z-index (150, below the favicon's
-     200 — nothing above 150 paints at the inline-end corner) and
-     TST's pointer-events: none, and leaves the flow untouched (it was
+     Owner rows carry NO row chip anymore (their codes ride the strap,
+     rule 8), so the 0.6.2 collision the overlay enabled (equal z with
+     the strap) is gone; the overlay keeps TST's z-index 150 and its
+     pointer-events: none, and leaves the flow untouched (it was
      zero-height): the uniform-row law holds.  No other addon in this
      setup writes tab-above contents (checked: tst-workspace has
      none). */
@@ -295,3 +358,4 @@ tab-item .extra-items-container.above {
   overflow: visible;
 }
 `;
+}

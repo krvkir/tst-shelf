@@ -724,6 +724,17 @@ export function normalizeHintCharset (input) {
 	return out.length > 1 ? out : "";
 }
 
+
+/** The hint chip's font size (the user option hintFontSize), in px.
+ *  Anything unreadable or outside the 10-18px band falls back to the
+ *  default (style.esm.js DEFAULT_HINT_FONT_SIZE_PX); the caller logs the
+ *  rejected value so a fat-fingered setting is visible in the bootlog.
+ *  Pure. */
+export function normalizeHintFontSize (input, fallback = 12) {
+	const value = typeof input === "number" ? input : parseFloat(String(input ?? ""));
+	return Number.isFinite(value) && Math.round(value) >= 10
+		&& Math.round(value) <= 18 ? Math.round(value) : fallback;
+}
 /** Pages `tabs.executeScript` can never inject into (MDN,
  *  tabs.executeScript): the injectable schemes are those expressible as
  *  a match pattern (http, https, file), but top-level about: frames and

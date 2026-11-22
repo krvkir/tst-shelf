@@ -132,8 +132,12 @@ What that leaves:
   earlier `Alt+Shift+H` default collided with the Help menu accelerator
   on Linux; rebind freely in about:addons' extension-shortcuts page) —
   labels the tabs that are actually on screen with a short code
-  (`aa`, `ab`, …): shelf members' codes sit on their icons, rendered
-  rows' codes on the row above its caption. Type the code to activate
+  (`aa`, `ab`, …): shelf members' codes sit on their icons, shelf
+  owners' codes sit on their shelf's strap — the same line as the
+  member chips, one strap-gap left of the leftmost member icon — and
+  rendered rows' codes at the row's inline-end top corner, vertically
+  aligned with the shelves' rightmost icon chips. Type the code to
+  activate
   the tab; unique prefixes narrow the labels — rows and icon chips
   together — Backspace un-types, Escape exits, and a few seconds of
   not typing ends the mode. Codes cover exactly the painted surfaces
@@ -152,7 +156,10 @@ What that leaves:
   tabs carry no code either, so the keyboard can never navigate onto
   a page it would be stranded on. The code alphabet is configurable
   (options page); the default (`acqsew`) uses exactly the letters no
-  default Vimium mapping starts with.
+  default Vimium mapping starts with. The chip font size is
+  configurable too (options page, 10-18px, default 12); a change
+  applies live — chips already painted restyle at once, mid-mode
+  included.
 - **The hint command comes from the manifest's `commands` block.**
   Firefox registers it when the extension starts (XUL `key` elements in
   a per-window keyset; Firefox's ExtensionShortcuts.sys.mjs) and lists
@@ -186,7 +193,8 @@ What that leaves:
   (`browser.sessions.setTabValue`); it survives restarts under
   session restore and travels with the tab across window moves.
 - `storage` — a rolling diagnostics log (the last 80 boot events) and
-  the one user option (`badgeMode`, the fold badge mode), nothing
+  the user options (`badgeMode`, the fold badge mode; the hint
+  options: alphabet, special-page exclusion, chip font size), nothing
   else.
 - `commands` — the hint-mode hotkey. A single user-triggerable
   shortcut; it starts the label overlay for the focused window and is

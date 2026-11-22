@@ -6,6 +6,9 @@
 const BADGE_MODE_KEY = "badgeMode";
 const HINT_CHARSET_KEY = "hintCharset";
 const HINT_EXCLUDE_SPECIAL_KEY = "hintExcludeSpecialPages";
+/** The default the background falls back to (style.esm.js
+ *  DEFAULT_HINT_FONT_SIZE_PX). */
+const DEFAULT_HINT_FONT_SIZE = 12;
 /** The default the background falls back to (logic.esm.js HINT_CHARSET):
  *  the lowercase letters no default Vimium mapping starts with. */
 const DEFAULT_HINT_CHARSET = "acqsew";
@@ -22,12 +25,16 @@ function renderHintOptions (stored) {
 		? stored[HINT_CHARSET_KEY] : "";
 	const exclude = document.querySelector(`input[name="hintExcludeSpecialPages"]`);
 	exclude.checked = stored[HINT_EXCLUDE_SPECIAL_KEY] !== false;
+	const font = document.querySelector(`input[name="hintFontSize"]`);
+	const size = Number(stored[HINT_FONT_SIZE_KEY]);
+	font.value = Number.isFinite(size) && size >= 10 && size <= 18 ? size : DEFAULT_HINT_FONT_SIZE;
 }
 
 const DEFAULTS = {
 	[BADGE_MODE_KEY]: "plus",
 	[HINT_CHARSET_KEY]: "",
 	[HINT_EXCLUDE_SPECIAL_KEY]: true,
+	[HINT_FONT_SIZE_KEY]: DEFAULT_HINT_FONT_SIZE,
 };
 
 browser.storage.local.get(DEFAULTS).then(stored => {
@@ -45,4 +52,11 @@ document.querySelector(`input[name="hintCharset"]`).addEventListener("change", e
 });
 document.querySelector(`input[name="hintExcludeSpecialPages"]`).addEventListener("change", event => {
 	browser.storage.local.set({ [HINT_EXCLUDE_SPECIAL_KEY]: event.target.checked, });
+});
+document.querySelector(`input[name="hintFontSize"]`).addEventListener("change", event => {
+	// the background normalizes (10-18px, rounded) and falls back to the
+	// default below the band — the field keeps what the user typed so
+	// they can see and fix it; the applied value re-registers the style
+	// (chips restyle immediately, mid-mode included)
+	browser.storage.local.set({ [HINT_FONT_SIZE_KEY]: event.target.value, });
 });

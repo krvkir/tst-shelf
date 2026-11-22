@@ -622,8 +622,9 @@ const treeStateScript = String.raw`
 `;
 
 /** The hint-mode DOM dump: catcher presence, the code chip on every
- *  strap icon, the code label in every rendered row's tab-above
- *  container, and the idle wrapper's presence in the root container. */
+ *  strap icon, the owner chip leading every strap, the code label in
+ *  every rendered row's tab-above overlay, and the idle wrapper's
+ *  presence in the root container. */
 const hintDumpScript = String.raw`
 	const chips = [];
 	for (const strapHost of document.querySelectorAll("#tabbar-top .extra-items-container, tab-item[data-tab-id] .extra-items-container.below")) {
@@ -631,8 +632,43 @@ const hintDumpScript = String.raw`
 		if (!root) { continue; }
 		for (const icon of root.querySelectorAll('[part~="shelf-icon"]')) {
 			const chip = icon.querySelector('[part~="shelf-hint"]');
-			chips.push({ id: icon.dataset.tabId, code: chip ? chip.textContent : null });
+			chips.push({ id: icon.dataset.tabId, code: chip ? chip.textContent : null,
+				chipFont: chip ? getComputedStyle(chip).fontSize : null });
 		}
+	}
+	const ownerChips = [];
+	for (const row of document.querySelectorAll("tab-item[data-tab-id]")) {
+		if (row.id == "dummy-tab" || row.classList.contains("dummy-tab")) { continue; }
+		const strapHost = row.querySelector(".extra-items-container.below");
+		const strapRoot = strapHost && strapHost.shadowRoot;
+		const strapPart = strapRoot && strapRoot.querySelector('[part~="shelf-strap"]');
+		const chip = strapPart && strapPart.querySelector('[part~="shelf-owner-hint"]');
+		if (!chip) { continue; }
+		const chipRect = chip.getBoundingClientRect();
+		const firstIcon = strapPart.querySelector('[part~="shelf-icon"]');
+		const firstIconRect = firstIcon && firstIcon.getBoundingClientRect();
+		const rowRect = row.getBoundingClientRect();
+		ownerChips.push({
+			id: row.dataset.tabId,
+			code: chip.getAttribute("data-hint"),
+			text: chip.textContent,
+			// 0.6.3: the chip is the strap's first flex item — one strap-gap
+			// left of the leftmost member ICON, vertically on the strap's
+			// own line, inside the row
+			leftOfLeftmost: firstIconRect ? chipRect.right <= firstIconRect.left + 1 : null,
+			// chip's right edge to the DOM-FIRST member icon's left edge.
+			// The strap SCROLLS (a focus action shifts its content), so the
+			// container's box rect is not a usable datum — two content
+			// rects ride the same scroll and their distance is invariant.
+			cellGap: firstIconRect ? Math.round(firstIconRect.left - chipRect.right) : null,
+			// same LINE = the two centers agree: the owner chip is a
+			// flex-centered strap item, the icon chip is a corner badge
+			// INSIDE its icon cell — their tops differ by construction
+			lineCenter: firstIcon ? Math.round((chipRect.top + chipRect.bottom) / 2
+				- (firstIconRect.top + firstIconRect.bottom) / 2) : null,
+			inRow: chipRect.top >= rowRect.top - 2 && chipRect.bottom <= rowRect.bottom + 2,
+			chipFont: getComputedStyle(chip).fontSize,
+		});
 	}
 	const labels = [];
 	for (const row of document.querySelectorAll("tab-item[data-tab-id]")) {
@@ -640,12 +676,11 @@ const hintDumpScript = String.raw`
 		// row and its mirrored label belongs to the mirrored icon, not to
 		// any row
 		if (row.id == "dummy-tab" || row.classList.contains("dummy-tab")) { continue; }
+		// 0.6.3: an owner row's code rides ITS STRAP (ownerChips above);
+		// only rows WITHOUT a strap take the tab-above row label
 		const host = row.querySelector(".extra-items-container.above");
 		const root = host && host.shadowRoot;
 		const chip = root ? root.querySelector('[part~="shelf-rowhint"]') : null;
-		// the chip's geometry against its row: the 0.5.0 corner placement
-		// (top inline-end — the favicon paints at z-index 200 over the
-		// .above container's 150, so the favicon's corner always loses)
 		let geometry = null;
 		if (chip) {
 			const chipRect = chip.getBoundingClientRect();
@@ -654,6 +689,7 @@ const hintDumpScript = String.raw`
 				insetEnd: Math.round(rowRect.right - chipRect.right),
 				insetTop: Math.round(chipRect.top - rowRect.top),
 				inside: chipRect.top >= rowRect.top - 2 && chipRect.bottom <= rowRect.bottom + 2,
+				chipFont: getComputedStyle(chip).fontSize,
 			};
 		}
 		labels.push({
@@ -692,7 +728,7 @@ const hintDumpScript = String.raw`
 		topHostCss: hostCss,
 		catcherFocused: !!(topRoot && topRoot.activeElement &&
 			(topRoot.activeElement.getAttribute("part") || "").includes("shelf-keycatcher")),
-		chips, labels,
+		chips, labels, ownerChips,
 	});
 `;
 
@@ -1545,11 +1581,18 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 							let labelDiag = null;
 							let badRows = [];
 							for (let attempt = 0; attempt < 10; attempt++) {
+								// an OWNER row's code rides ITS STRAP (0.6.3), so
+								// the row's agreed text comes from the owner chip
+								// when one exists, else from the tab-above label
+								const ownerBy = new Map((labelDump && labelDump.ownerChips || [])
+									.map(chip => [Number(chip.id), chip]));
 								badRows = (labelDump && labelDump.labels || [])
 									.filter(entry => !entry.invisible && !shelvedIds.has(Number(entry.id)))
 									.map(entry => {
 										const code = codes.get(Number(entry.id)) || "";
-										return (entry.text || "") !== code ? [entry.id, entry.text, code] : null;
+										const ownerChip = ownerBy.get(Number(entry.id));
+										const text = ownerChip ? (ownerChip.text || "") : (entry.text || "");
+										return text !== code ? [entry.id, text, code] : null;
 									})
 									.filter(Boolean);
 								if (!badRows.length) { break; }
@@ -1558,7 +1601,7 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 								labelDiag = await readState();
 							}
 							check("every rendered row carries its code label (DOM agrees with the wanted codes)", badRows.length === 0,
-								() => `mismatched=${JSON.stringify(badRows.slice(0, 6))} first4=${JSON.stringify((labelDump && labelDump.labels || []).slice(0, 4))} diag=${JSON.stringify(labelDiag && labelDiag.diagLog && labelDiag.diagLog.slice(-10))}`);
+								() => `mismatched=${JSON.stringify(badRows.slice(0, 6))} first4=${JSON.stringify((labelDump && labelDump.labels || []).slice(0, 4))} owners=${JSON.stringify(labelDump && labelDump.ownerChips)} diag=${JSON.stringify(labelDiag && labelDiag.diagLog && labelDiag.diagLog.slice(-10))}`);
 						}
 						// the 0.6.0 coverage contract: codes exist ONLY for
 						// painted surfaces — every coded ROW id must be one
@@ -1657,28 +1700,42 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 							// the STRAP CHIPS narrow with the rows (the 0.4.0
 							// defect: the icon chips kept every code while the
 							// row labels narrowed, and the two surfaces
-							// disagreed mid-mode — "hints disappear at random")
+							// disagreed mid-mode — "hints disappear at random");
+							// the OWNER chips narrow with the same diff (0.6.3)
 							{
 								const paintedChips = (narrowed && narrowed.chips || []).filter(chip => chip.code);
+								const paintedOwners = (narrowed && narrowed.ownerChips || []).filter(chip => chip.code);
 								const offPrefix = paintedChips.filter(chip => !(chip.code || "").startsWith(letter));
-								check("the icon chips narrow with the typed prefix too",
-									paintedChips.length > 0 && offPrefix.length === 0,
-									() => `chips=${JSON.stringify(paintedChips.slice(0, 8))} letter=${letter} off=${JSON.stringify(offPrefix.slice(0, 4))}`);
+								const offPrefixOwners = paintedOwners.filter(chip => !(chip.code || "").startsWith(letter));
+								check("the icon chips (and the owner chips with them) narrow with the typed prefix",
+									paintedChips.length > 0 && offPrefix.length === 0 && offPrefixOwners.length === 0,
+									() => `chips=${JSON.stringify(paintedChips.slice(0, 8))} owners=${JSON.stringify(paintedOwners.slice(0, 4))} letter=${letter} off=${JSON.stringify(offPrefix.slice(0, 4))} offOwners=${JSON.stringify(offPrefixOwners.slice(0, 4))}`);
 							}
-							// the row chip's corner placement (0.5.0): top
-							// inline-end, inside the row — the favicon's
-							// z-index 200 paints over the .above container's
-							// 150, so the old favicon-corner chip was
-							// invisible ("below favicons")
+							// the row chip's 0.6.3 geometry: plain rows' chips at
+							// the row's inline-end corner (the 0.5.0/0.6.2
+							// placement, vertically aligned with the shelves'
+							// rightmost icon chips); owner rows' chips — part
+							// shelf-owner-hint — ride their straps: same line as
+							// the member chips, one strap-gap left of the
+							// leftmost icon, inside the row
 							{
 								const withGeometry = (narrowed && narrowed.labels || [])
 									.filter(entry => entry.geometry);
 								const misplaced = withGeometry.filter(entry =>
-									entry.geometry.insetEnd < 0 || entry.geometry.insetEnd > 12
-									|| !entry.geometry.inside);
-								check("row chips sit at the row's inline-end top corner, inside the row",
+									entry.geometry.insetEnd < 0 || !entry.geometry.inside);
+								const fonts = [...new Set(withGeometry.map(entry => entry.geometry.chipFont))];
+								check(`plain-row chips sit at the row's inline-end corner (fonts=${JSON.stringify(fonts)} insetEnd=${JSON.stringify(withGeometry.map(entry => entry.geometry.insetEnd))})`,
 									withGeometry.length > 0 && misplaced.length === 0,
 									() => `misplaced=${JSON.stringify(misplaced.slice(0, 5).map(entry => [entry.id, entry.geometry]))}`);
+								const ownerChips = (narrowed && narrowed.ownerChips || []).filter(chip => chip.code);
+								const badOwners = ownerChips.filter(chip =>
+									chip.leftOfLeftmost !== true || !chip.inRow
+									|| chip.lineCenter == null || Math.abs(chip.lineCenter) > 2
+									|| chip.cellGap == null || chip.cellGap < 1 || chip.cellGap > 6
+									|| chip.chipFont !== fonts[0]);
+								check(`an owner's chip rides its strap: same line as the member cells, left of the leftmost icon, one strap-gap away (${ownerChips.length} owner chip(s): ${JSON.stringify(ownerChips.map(chip => [chip.id, chip.cellGap, chip.lineCenter, chip.chipFont]))})`,
+									ownerChips.length > 0 && badOwners.length === 0,
+									() => `bad=${JSON.stringify(badOwners.slice(0, 4))}`);
 							}
 							// the uniform-row law holds while labels paint
 							{
@@ -1706,13 +1763,17 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 								await new Promise(resolve => setTimeout(resolve, 800));
 								restored = await dumpHints();
 								const stable = await readState();
+								const ownerBy2 = new Map((restored && restored.ownerChips || [])
+									.map(chip => [Number(chip.id), chip]));
 								const mismatches = [];
 								for (const entry of (restored && restored.labels) || []) {
 									if (entry.invisible || shelvedSet.has(Number(entry.id))) { continue; }
 									const code = stable && stable.hints
 										? (stable.hints.codes || []).find(([tabId]) => tabId == Number(entry.id))
 										: null;
-									if ((entry.text || "") !== ((code || [])[1] || "")) { mismatches.push(Number(entry.id)); }
+									const ownerChip = ownerBy2.get(Number(entry.id));
+									const text = ownerChip ? (ownerChip.text || "") : (entry.text || "");
+									if (text !== ((code || [])[1] || "")) { mismatches.push(Number(entry.id)); }
 								}
 								if (!mismatches.length) { break; }
 								if (attempt == 11) {
@@ -1752,7 +1813,8 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 							for (let attempt = 0; attempt < 10; attempt++) {
 								afterEscape = await dumpHints();
 								const dirty = (afterEscape && afterEscape.chips || []).some(chip => chip.code)
-									|| (afterEscape && afterEscape.labels || []).some(entry => entry.text);
+									|| (afterEscape && afterEscape.labels || []).some(entry => entry.text)
+									|| (afterEscape && afterEscape.ownerChips || []).some(chip => chip.code);
 								if (!dirty) { break; }
 								await new Promise(resolve => setTimeout(resolve, 1100));
 							}
@@ -1761,10 +1823,12 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 							check("Escape exits the mode and leaves no label behind",
 								afterEscape && !(afterEscape.chips || []).some(chip => chip.code)
 									&& !(afterEscape.labels || []).some(entry => entry.text)
+									&& !(afterEscape.ownerChips || []).some(chip => chip.code)
 									&& afterState && !afterState.hints && afterState.rowLedger === 0,
 								() => `afterEscape=${JSON.stringify(afterEscape && {
 									chips: (afterEscape.chips || []).filter(chip => chip.code).length,
 									labels: (afterEscape.labels || []).filter(entry => entry.text).length,
+									owners: (afterEscape.ownerChips || []).filter(chip => chip.code).length,
 								})} ledger=${afterState && afterState.rowLedger} inFlight=${afterState && afterState.rowInFlight} rowTrace=${JSON.stringify(escDiag && escDiag.rowTrace && escDiag.rowTrace.slice(-40))} keys=${JSON.stringify(escDiag && escDiag.rowKeys)} hintLog=${JSON.stringify(escDiag && escDiag.hintLog && escDiag.hintLog.slice(-14))} diag=${JSON.stringify(escDiag && escDiag.diagLog && escDiag.diagLog.slice(-25))}`);
 						}
 						// typing a ROW tab's full code activates it
@@ -1924,6 +1988,73 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 									&& restored.hintOptions.excludeSpecialPages === true) { break; }
 								await new Promise(resolve => setTimeout(resolve, 600));
 							}
+						}
+						// the CONFIGURED chip size: the option
+						// (storage.hintFontSize) applies LIVE.  The size stays
+						// inside the registered style string (no element of
+						// ours inside the rows could carry it into TST's
+						// shadow parts), so the background re-runs
+						// register-self and TST's installStyle REPLACES the
+						// style text in the live sidebar — the labels already
+						// on screen restyle mid-mode, no re-entry needed.
+						{
+							// the charset round exited onto a mode whose anchor
+							// may be a special page: hand the anchor back first
+							await marionette.command("WebDriver:ExecuteScript", {
+								script: activateTabScript, args: [hintTabs.a,], newSandbox: false,
+							}).catch(error => console.log(`[drive] anchor activation failed: ${error.message}`));
+							await new Promise(resolve => setTimeout(resolve, 1200));
+							await call({ type: "test:set-hint-options", fontSize: 16, });
+							let applied = null;
+							for (let attempt = 0; attempt < 10; attempt++) {
+								applied = await readState();
+								if (applied && applied.hintOptions && applied.hintOptions.fontSize === 16) { break; }
+								await new Promise(resolve => setTimeout(resolve, 600));
+							}
+							const { state: sizeState, } = await enterConfirmed();
+							let sized = null;
+							let lastDump = null;
+							for (let attempt = 0; attempt < 10; attempt++) {
+								const fresh = await dumpHints();
+								lastDump = fresh;
+								const labeled = (fresh && fresh.labels || []).filter(entry => entry.text);
+								const chipFonts = (fresh && fresh.chips || []).filter(chip => chip.code).map(chip => chip.chipFont);
+								const ownerFonts = (fresh && fresh.ownerChips || []).filter(chip => chip.code).map(chip => chip.chipFont);
+								// the icon-chip and owner-chip clauses are
+								// conditional: this late in the run the fixture's
+								// coded set can be rows only (the about:blank
+								// members and the about:blank owner are excluded
+								// with the production options), so zero icon or
+								// owner chips is fine
+								if (labeled.length
+									&& labeled.every(entry => entry.geometry && entry.geometry.chipFont === "16px")
+									&& (chipFonts.length === 0 || chipFonts.every(font => font === "16px"))
+									&& (ownerFonts.length === 0 || ownerFonts.every(font => font === "16px"))) { sized = fresh; break; }
+								await new Promise(resolve => setTimeout(resolve, 700));
+							}
+							check("a configured chip size (16px) reaches row chips AND icon chips",
+								!!(applied && applied.hintOptions && applied.hintOptions.fontSize === 16) && !!sized,
+								() => `applied=${JSON.stringify(applied && { hintOptions: applied.hintOptions, bootlog: applied.bootlog, })} lastFonts=${JSON.stringify(lastDump && lastDump.labels.filter(entry => entry.text).slice(0, 4).map(entry => entry.geometry && entry.geometry.chipFont))}`);
+							// mid-mode flip: the chips already painted must
+							// restyle at once (the re-register swaps the live
+							// style text; no re-entry, no rewrite)
+							await call({ type: "test:set-hint-options", fontSize: 12, });
+							let flipped = null;
+							for (let attempt = 0; attempt < 12; attempt++) {
+								await new Promise(resolve => setTimeout(resolve, 800));
+								const fresh = await dumpHints();
+								const labeled = (fresh && fresh.labels || []).filter(entry => entry.text);
+								const ownerFonts = (fresh && fresh.ownerChips || []).filter(chip => chip.code).map(chip => chip.chipFont);
+								if (labeled.length
+									&& labeled.every(entry => entry.geometry && entry.geometry.chipFont === "12px")
+									&& (fresh.chips || []).filter(chip => chip.code).every(chip => chip.chipFont === "12px")
+									&& (ownerFonts.length === 0 || ownerFonts.every(font => font === "12px"))) { flipped = fresh; break; }
+							}
+							const midState = await readState();
+							check("flipping the size mid-mode restyles the painted chips without re-entry",
+								!!flipped && !!(midState && midState.hints),
+								() => `mid=${JSON.stringify(midState && midState.hints)} fonts=${JSON.stringify(flipped && (flipped.labels || []).filter(entry => entry.text).slice(0, 3).map(entry => entry.geometry && entry.geometry.chipFont))}`);
+							await call({ type: "test:exit-hints", reason: "fontsize-done", });
 						}
 					}
 				}

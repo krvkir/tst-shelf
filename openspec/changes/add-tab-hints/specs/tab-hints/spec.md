@@ -28,7 +28,7 @@ The extension SHALL register a browser keyboard command that starts hint mode fo
 - **THEN** nothing happens, no labels appear, and no hint mode is left running
 
 ### Requirement: Every painted tab surface carries a unique short code
-The extension SHALL assign, while hint mode is active, a unique code of the shortest practical length to exactly the tabs whose surfaces are painted when the mode starts: a rendered row's tab has its code label its row, and a shelved tab whose shelf icon is painted has its code label that icon. No other tab SHALL carry a code — hidden tabs, tabs inside folded subtrees, and rows outside the sidebar's rendered range have none, so a typed code can never activate a tab the user cannot see. Codes SHALL follow the rendered order of the tree, SHALL stay unchanged for the mode's lifetime, and SHALL be built from the user-configured code alphabet. While the special-page exclusion option is on (the default), a tab whose page the key catcher can never be injected into SHALL carry no code either, so the keyboard can never navigate onto a page it would be stranded on.
+The extension SHALL assign, while hint mode is active, a unique code of the shortest practical length to exactly the tabs whose surfaces are painted when the mode starts: a rendered row without a strap has its code label the row at its inline-end top corner; a rendered shelf owner has its code lead its own strap, on the same line as the member chips and to the left of the leftmost member icon, spaced by the strap's chip rhythm; and a shelved tab whose shelf icon is painted has its code label that icon. No other tab SHALL carry a code — hidden tabs, tabs inside folded subtrees, and rows outside the sidebar's rendered range have none, so a typed code can never activate a tab the user cannot see. The chips SHALL align so the labels read as one column: on shelfless rows at the corner of the row, on shelf owners on the shelf's line. Codes SHALL follow the rendered order of the tree, SHALL stay unchanged for the mode's lifetime, and SHALL be built from the user-configured code alphabet. While the special-page exclusion option is on (the default), a tab whose page the key catcher can never be injected into SHALL carry no code either, so the keyboard can never navigate onto a page it would be stranded on.
 
 #### Scenario: Codes are unique and ordered
 - **WHEN** hint mode is active over a tree of ten painted tabs
@@ -37,6 +37,10 @@ The extension SHALL assign, while hint mode is active, a unique code of the shor
 #### Scenario: A shelved tab's code sits on its icon
 - **WHEN** a shelf's members are hidden rows visible only as icons
 - **THEN** their codes label the icons on the strap, and no code labels the hidden rows themselves
+
+#### Scenario: A shelf owner's code rides the strap's line
+- **WHEN** hint mode is active and a tab that paints a shelf strap carries its row code
+- **THEN** the owner's code leads the strap itself — on the same line as the member chips, to the left of the leftmost member icon, spaced by the strap's chip rhythm — and stays legible at every strap width
 
 #### Scenario: A row scrolled out of view keeps its code
 - **WHEN** a labeled row leaves the visible range of the virtual scroll and comes back
@@ -67,7 +71,7 @@ The extension SHALL assign, while hint mode is active, a unique code of the shor
 - **THEN** the codes cover every tab whose row is not folded away — labels painting wherever rows exist — so a reload of the extension with an open sidebar never blanks the mode
 
 ### Requirement: Hint options apply live
-The extension SHALL offer, on its options page, the code alphabet (two or more distinct letters or digits, defaulting to letters that no default Vimium mapping starts with) and the special-page exclusion (default on), and SHALL apply a change to either without a restart or a reload.
+The extension SHALL offer, on its options page, the code alphabet (two or more distinct letters or digits, defaulting to letters that no default Vimium mapping starts with), the special-page exclusion (default on), and the hint chip font size in px (10-18, default 12), and SHALL apply a change to any of them without a restart or a reload.
 
 #### Scenario: Changing the alphabet changes the next codes
 - **WHEN** the user changes the code alphabet while no hint mode is running and starts one afterwards
@@ -76,6 +80,10 @@ The extension SHALL offer, on its options page, the code alphabet (two or more d
 #### Scenario: Turning the exclusion off codes special pages
 - **WHEN** the user turns the special-page exclusion off and starts hint mode over a window with an about: tab
 - **THEN** that tab carries a code as any other visible tab
+
+#### Scenario: Changing the chip size restyles the chips already painted
+- **WHEN** the user changes the hint chip font size while hint mode is active and chips are painted
+- **THEN** the already-painted chips restyle to the new size at once, without re-entering the mode; values outside the band keep the size the mode is running with
 
 ### Requirement: Hint labels do not change the tree's geometry
 The extension SHALL render hint labels as overlays — on the shelf icon or on the tab's row — that change no row's size, position, or spacing, and SHALL leave the tab bar's own layout untouched while the mode is not active.

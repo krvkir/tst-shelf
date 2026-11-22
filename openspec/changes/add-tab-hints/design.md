@@ -350,3 +350,125 @@ feature:
   the mode's own queried set (hints.rendered in the state export).
 - The fixture measures the win and keeps the coverage honest:
   0.6.2's converse check codes the hint fixture's nested rendered tab.
+
+## Measured in the caption-anchor round (an unreleased 0.7.0 build; the chip size ships in 0.6.3)
+
+- The user's defect report: with a shelf, "it overlaps the hint, and
+  the parent tab's hint is not visible".  Mechanism measured on TST
+  4.4.10 sources: inside tab-item-substance (position: relative,
+  z-index 100 base.css), TST's `tab-item &.above, tab-item &.below`
+  rule gives tab-above and tab-below containers the SAME
+  --tab-extra-contents-beside-z-index (150); on owner rows the below
+  host is position: static (our 0.1.4 rule 2b), so the strap's icon
+  chips (--part shelf-hint, absolute, z-index 150) join the substance
+  context at the same level as the .above overlay that carried the
+  row chip — and the strap's DOM content comes LAST in the row, so
+  the rightmost member's icon chip painted over the owner's corner
+  chip, exactly where the strap sits.  The 0.5.0 assumption "nothing
+  above 150 ever paints at the inline-end corner" ignored the icon
+  chips, which are ours and live exactly there.
+- The fix moves the row chip to TST's tab-front container — the
+  caption's own overlay: base.css positions it absolutely over the
+  label area (insets --tab-label-start/end-offset, computed by
+  size.js:177-178 from the dummy tab's label box; containing block =
+  tab-item-substance, since span.caption is position: static), with
+  z-index --tab-extra-contents-front-z-index (6000).  Its inline end
+  is the LABEL's end: before the strap on owner rows, before the
+  close box (z --tab-ui-z-index = 9000) on plain rows.  The chip can
+  therefore overlap nothing that would cover it at either row kind,
+  and painting-levels no longer matter.  TST's set-extra-contents
+  accepts tab-front as a place (tst-api-frontend.js collectExtraContentsRoots);
+  the container roots attach per row (unsafe/safeExtraItemsContainer-
+  FrontRoot, TreeItemSubstanceElement.js:727-739); cached contents
+  reinsert on row-element reuse (onReuseTreeItemElement); writes to
+  tab-front trigger NO dummy-tab mirror and NO Size.updateTabs pass —
+  only tab-above/tab-below do (onExtraContentsAboveChanged/BelowChanged),
+  so the uniform-row law is untouched by construction.
+- base.css's generic extra-contents rule sets overflow: hidden on
+  every tab-item container; the front containers get overflow:
+  visible from us, because on a starving caption the label can be
+  narrower than the chip and the chip's left side would clip.  No
+  other addon in this setup writes tab-front contents (checked:
+  tst-workspace has none).
+- The chip font size lives IN the registered style string: no element
+  of ours exists inside a row that could carry a CSS custom property
+  into TST's shadow parts, so option changes RE-RUN register-self.
+  Verified against TST 4.4.10: onRegistered.dispatch(addon) runs on
+  EVERY register (common/tst-api.js registerAddon), and each sidebar
+  answers by installStyle(id, style), which REPLACES the addon's
+  <style> text in the live sidebar (tst-api-frontend.js installStyle).
+  The option's E2E asserts the mid-mode flip: enter at 16px, write 12
+  while the mode is up, and the painted chips restyle without
+  re-entry.
+- The default chip size moves 11px → 12px (DEFAULT_HINT_FONT_SIZE_PX;
+  normalizeHintFontSize clamps 10-18px, integer-rounded, junk falls
+  back).  The 0.6.2 chips were 11px at a 14px line; the new default
+  is a notch larger by popular report, and the option exists for the
+  rest.
+
+## Measured in the strap-line round (0.6.3, by user review)
+
+- The user reviewed the unreleased caption-anchor build: the owner chips were no longer COVERED, but
+  the layout read wrong — "the parent's chip to the left from the
+  leftmost shelved tab, on the same line the shelved children's chips
+  are located, at the same distance as the shelf's chips are from
+  each other"; plain rows "were perfect" as the 0.5.0/0.6.2 inline-end
+  corner ("aligning vertically with the rightmost shelved tabs'
+  chips"); the caption anchor measured insetEnd 122 on the
+  owner row vs 33 on plain rows — "the hints are not aligned, which
+  creates visual mess".
+- The final geometry, measured in the E2E: the owner chip is the
+  strap's first flex item (part shelf-owner-hint, leading the
+  strapHtml markup, driven by the same narrowed setHints map as the
+  icon chips): cellGap (first icon.left - chip.right) 3-4px, lineCenter
+  (chip mid-line - icon cell mid-line) 0px: the owner chip centers on the strap line while the icon chip is a corner badge INSET into its cell, so the datum is the CELL, left of the leftmost
+  ICON (not of its chip: the icon chip is inset 8px into the cell, so
+  the two chips read as part of one regular row without touching).
+  Plain-row chips return to the tab-above overlay's inline-end 2px
+  corner (the 0.6.2 geometry, measured insetEnd 2-4 again).
+- The three-chip ledger: owners are EXCLUDED from the tab-above
+  row-label map (index.esm.js redrawHintLabels filters
+  derivation.ownerIds), so the 0.6.2 collision (equal z 150, the
+  overlay vs the later-DOM strap) cannot recur — at an owner row the
+  overlay only ever carried... nothing: the chip moved INTO the
+  content that was doing the covering.  writeRowHint keeps
+  place: tab-above for the remaining (strapless) rows; the
+  tab-front rules are gone from the style.
+- Edge semantics pinned: the ROOT shelf carries no owner chip (no
+  owner tab; its idle wrapper ignores ownerHint); a NESTED shelf's
+  owner is a hidden member (its strap rides a revealed row and it is
+  coded as a member icon only) — its own shelf still paints with no
+  owner chip, exactly as in 0.6.x.  A strap at the 66% width cap
+  scrolls horizontally and the owner chip scrolls with the content:
+  visible at the default scroll position, possibly out of view while
+  the user scrolls the icons — accepted (the alternatives measured
+  worse: 0.6.2 kept the chip but the strap covered it; the tab-front detour moved it
+  off the shelf's line).
+
+
+## The register outage (0.6.3)
+
+- Two E2E runs failed at ONE check, "registration lands with TST >= 4",
+  and the bootlog spelled out why once the register-fail logging carried
+  the stack: `buildShelfStyle` threw `TypeError ... .above is not a
+  function` at the 8a-rule comment — a RAW backtick inside the template
+  literal (the \`.above\` quoting in a CSS comment).  The template ended
+  at the first raw tick, the remainder of the stylesheet parsed as a
+  tagged-template call on the string's missing `.above` property, and
+  esbuild bundled it with no diagnostics (the member-access tag form is
+  legal JS).  Every register-self retry then failed; TST never learned
+  about the addon; the E2E gate held.
+- Reproduced in Node: `node --input-type=module -e "import
+  {buildShelfStyle} from './src/background/style.esm.js'; buildShelfStyle(12)"`
+  throws at style.esm.js:306 — a check that needs no browser.
+- Guards now in place: every backtick in the template escaped; the file
+  header carries the trap; tests/style.test.mjs CALLS buildShelfStyle
+  (previously no test imported it — the outage slipped past 115 green
+  unit tests) and asserts the whole stylesheet, the tail rules,
+  balanced braces, the %EXTRA_CONTENTS_PART% placeholders and the
+  font-size fallback.
+- The register diagnostics upgraded: register failures log constructor
+  kind, the message delimited (JSON-quoted so its own escaping stays
+  visible) and the stack head (describeError in index.esm.js); the
+  silently-swallowed ready-path register error now logs
+  test-ready-register-fail instead of disappearing.

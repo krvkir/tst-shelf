@@ -21,9 +21,9 @@
  * tab or touches TST's tree data, so it has no boot-release path.
  */
 import tstApi from "./tst-api.esm.js";
-import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, planExtremePlacementMove, resolveFavicons, mustShowTabs, danglingMembers, planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf, ROOT_SHELF, assignHints, hintMatches, normalizeHintCharset, isSpecialPageUrl, planHintTargets, HINT_CHARSET, } from "./logic.esm.js";
+import { derive, indexTree, straysToCollapse, subtreeSizes, treePositions, nextPlacementMove, planExtremePlacementMove, resolveFavicons, mustShowTabs, danglingMembers, planReveals, isSubtreeFolded, planRestoreMove, subtreeIds, siblingListOf, ROOT_SHELF, assignHints, hintMatches, normalizeHintCharset, normalizeHintFontSize, isSpecialPageUrl, planHintTargets, HINT_CHARSET, } from "./logic.esm.js";
 import { createRenderer } from "./render.esm.js";
-import { SHELF_STYLE } from "./style.esm.js";
+import { buildShelfStyle, DEFAULT_HINT_FONT_SIZE_PX, } from "./style.esm.js";
 
 const RECOMPUTE_DELAY_MS = 120;
 /** The badge mode: "plus" (default) | "count" (the descendant number). */
@@ -35,6 +35,12 @@ const HINT_CHARSET_KEY = "hintCharset";
  *  extension pages — the TST group tabs among them), so one can never
  *  be navigated INTO and strand the keyboard.  Default ON. */
 const HINT_EXCLUDE_SPECIAL_KEY = "hintExcludeSpecialPages";
+/** The hint chip font size in px (options page); normalized on read,
+ *  out-of-band values fall back to DEFAULT_HINT_FONT_SIZE_PX.  An
+ *  applied change re-runs register-self: the chip size lives in the
+ *  registered style string (style.esm.js buildShelfStyle), which TST
+ *  re-installs into every live sidebar. */
+const HINT_FONT_SIZE_KEY = "hintFontSize";
 
 /** The smoke page and the E2E driver only exist in `make e2e` builds. */
 const E2E_BUILD = String(browser.runtime.getManifest().version).endsWith("-e2e");
@@ -89,6 +95,7 @@ let badgeMode = "plus";
  *  reads the live values). */
 let hintCharset = HINT_CHARSET;
 let hintExcludeSpecial = true;
+let hintFontSize = DEFAULT_HINT_FONT_SIZE_PX;
 /** @type {Map<number, Map<number, {openedSeen: boolean}>>} windowId -> shelf
  *  owner -> reveal.  A reveal keeps ONE folded owner expanded while a
  *  descendant of it is active, and suppresses every other descendant's row
@@ -160,6 +167,15 @@ async function logBoot (kind, detail) {
 	}).catch(() => { /* diagnostics must never break the caller */ });
 }
 
+/** The bootlog must spell a rejected register out: constructor-kind, the
+ *  message delimited so its own escaping stays visible, the stack head.
+ *  A bare 120-char message slice once hid exactly this behind the
+ *  engine's tag-call rendering of a template-literal accident (0.6.3's
+ *  register outage: `...`.above was parsed as a tagged template). */
+function describeError (error) {
+	return `kind=${error instanceof Error ? error.name : typeof error} msg=${JSON.stringify(String(error && error.message || error)).slice(0, 280)} stack=${String(error && error.stack || "").slice(0, 280)}`;
+}
+
 /** The user options live in storage.local; the options page writes them
  *  and this listener applies them live (a mode flip changes the badge
  *  text in every strap's markup, so the diffing renderer re-sends
@@ -170,6 +186,7 @@ async function loadOptions () {
 		[BADGE_MODE_KEY]: "plus",
 		[HINT_CHARSET_KEY]: "",
 		[HINT_EXCLUDE_SPECIAL_KEY]: true,
+		[HINT_FONT_SIZE_KEY]: DEFAULT_HINT_FONT_SIZE_PX,
 	};
 	const stored = await browser.storage.local.get(defaults).catch(() => null);
 	badgeMode = stored?.[BADGE_MODE_KEY] === "count" ? "count" : "plus";
@@ -179,6 +196,10 @@ async function loadOptions () {
 	}
 	hintCharset = charset || HINT_CHARSET;
 	hintExcludeSpecial = stored?.[HINT_EXCLUDE_SPECIAL_KEY] !== false;
+	hintFontSize = normalizeHintFontSize(stored?.[HINT_FONT_SIZE_KEY], DEFAULT_HINT_FONT_SIZE_PX);
+	if (stored?.[HINT_FONT_SIZE_KEY] != null && hintFontSize !== Number(stored[HINT_FONT_SIZE_KEY])) {
+		logBoot("hint-font-size-invalid", String(stored[HINT_FONT_SIZE_KEY]).slice(0, 40));
+	}
 }
 browser.storage.onChanged.addListener((changes, areaName) => {
 	if (areaName !== "local") { return; }
@@ -198,6 +219,23 @@ browser.storage.onChanged.addListener((changes, areaName) => {
 	if (HINT_EXCLUDE_SPECIAL_KEY in changes) {
 		hintExcludeSpecial = changes[HINT_EXCLUDE_SPECIAL_KEY]?.newValue !== false;
 		logBoot("hint-exclude-special", String(hintExcludeSpecial));
+	}
+	if (HINT_FONT_SIZE_KEY in changes) {
+		const size = normalizeHintFontSize(changes[HINT_FONT_SIZE_KEY]?.newValue, DEFAULT_HINT_FONT_SIZE_PX);
+		if (changes[HINT_FONT_SIZE_KEY]?.newValue != null
+				&& size !== Number(changes[HINT_FONT_SIZE_KEY].newValue)) {
+			logBoot("hint-font-size-invalid", String(changes[HINT_FONT_SIZE_KEY].newValue).slice(0, 40));
+		}
+		if (size === hintFontSize) { return; }
+		hintFontSize = size;
+		logBoot("hint-font-size", String(hintFontSize));
+		// the chip size lives in the REGISTERED style string (no element
+		// of ours inside a row could carry it down into TST's shadow
+		// parts), so the only honest application is a re-register: TST
+		// re-installs the style text into every live sidebar (measured in
+		// tst-api-frontend.js installStyle; onRegistered dispatches on
+		// EVERY register).  The chips, mid-mode included, restyle at once.
+		TST.register().catch(error => logBoot("tst-register-fail", `font-size ${describeError(error)}`));
 	}
 });
 
@@ -247,7 +285,11 @@ const TST = tstApi({
 			// style MUST be a string (never an array: TST's style-install
 			// listener calls style.replace() — an array aborts its whole
 			// frontend init; lesson recorded by tst-workspace session 5).
-			style: SHELF_STYLE,
+			// The chip font size (the hintFontSize option) is baked in:
+			// no element of ours inside a row could carry it down into
+			// TST's shadow parts, so the registered string carries it and
+			// option changes re-register (storage.onChanged → TST.register).
+			style: buildShelfStyle(hintFontSize),
 			// lightTree shrinks every notification payload to structure +
 			// states — we take metadata from browser.tabs ourselves.
 			lightTree: true,
@@ -267,7 +309,8 @@ const TST = tstApi({
 	events: {
 		ready: () => {
 			logBoot("tst-ready");
-			register().then(() => scheduleRederiveAll()).catch(() => {});
+			register().then(() => scheduleRederiveAll())
+				.catch(error => logBoot("tst-ready-register-fail", describeError(error)));
 		},
 		"tree-attached": message => onTreeMutated(message?.tab?.windowId),
 		"tree-detached": message => {
@@ -332,7 +375,7 @@ async function register () {
 		} catch (error) {
 			attempt++;
 			if (attempt >= 6) {
-				logBoot("tst-register-fail", `${attempt} ${String(error && error.message || error).slice(0, 120)}`);
+				logBoot("tst-register-fail", `${attempt} ${describeError(error)}`);
 				return;
 			}
 			await new Promise(resolve => setTimeout(resolve, attempt * 1000));
@@ -1876,8 +1919,14 @@ async function redrawHintLabels () {
 	if (!hint) { return; }
 	const windowId = hint.windowId;
 	diag(`hints-redraw w=${windowId} buffer=${hint.buffer}`);
+	// owner rows carry their codes ON THEIR STRAPS (render.esm.js
+	// strapFor: "shelf-owner-hint", the leading flex item) — they take
+	// no tab-above row label (0.6.3)
+	const cachedEarly = windows.get(windowId);
+	const owners = new Set(cachedEarly?.derivation?.ownerIds || []);
 	const labels = new Map;
 	for (const id of hint.rowIds) {
+		if (owners.has(id)) { continue; }
 		const code = hint.codes.get(id);
 		labels.set(id, code && code.startsWith(hint.buffer) ? code : "");
 	}
@@ -2073,7 +2122,7 @@ function onTestMessage (message) {
 				shelves, favicons,
 				renderedTabs: renderedState,
 				hints: hintState,
-				hintOptions: { charset: hintCharset, excludeSpecialPages: hintExcludeSpecial, },
+				hintOptions: { charset: hintCharset, excludeSpecialPages: hintExcludeSpecial, fontSize: hintFontSize, },
 				hintLog: [...hintLog],
 				rowLedger: renderer.rowLedgerCount(),
 				rowKeys: renderer.rowLedgerKeys(),
@@ -2105,6 +2154,7 @@ function onTestMessage (message) {
 			const write = {};
 			if (typeof message.charset === "string") { write[HINT_CHARSET_KEY] = message.charset; }
 			if (typeof message.excludeSpecialPages === "boolean") { write[HINT_EXCLUDE_SPECIAL_KEY] = message.excludeSpecialPages; }
+			if (message.fontSize != null) { write[HINT_FONT_SIZE_KEY] = message.fontSize; }
 			if (Object.keys(write).length) { await browser.storage.local.set(write); }
 			return { ok: true, };
 		}

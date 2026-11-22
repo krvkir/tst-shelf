@@ -109,8 +109,17 @@ const KEY_CATCHER_HTML = `<span part="shelf-keycatcher" tabindex="0"></span>`;
  *
  * `hints` (hint mode): a Map tabId -> code; the chip renders on the
  * icons whose ids sit in the map — narrowed labels are simply absent.
+ *
+ * `ownerHint` (hint mode): the OWNER tab's own code, rendered as a
+ * leading flex item of the strap (part "shelf-owner-hint") — on the
+ * strap's line, left of the leftmost icon, one strap-gap away (0.6.3:
+ * the user's alignment call; see style.esm.js §8).  A code that no
+ * longer matches the buffer narrows out through the same diff.
  */
-export function strapHtml ({ members, tabsById, highlightIds, badgeCounts = new Map, badgeMode = "plus", hints = null, keyCatcher = false, }) {
+export function strapHtml ({ members, tabsById, highlightIds, badgeCounts = new Map, badgeMode = "plus", hints = null, ownerHint = null, keyCatcher = false, }) {
+	const ownerChip = ownerHint
+		? `<span part="shelf-owner-hint" data-hint="${escapeAttributeValue(ownerHint)}">${escapeHtml(ownerHint)}</span>`
+		: "";
 	const icons = members
 		.map(id => tabsById.get(id))
 		.filter(Boolean)
@@ -123,10 +132,12 @@ export function strapHtml ({ members, tabsById, highlightIds, badgeCounts = new 
 		}))
 		.join("");
 	if (keyCatcher && !icons.length) {
+		// the idle wrapper is only ever the ROOT strap's: no owner chip
+		// there either (the root shelf has no owner tab)
 		return `<div class="shelf-strap-idle">${KEY_CATCHER_HTML}</div>`;
 	}
 	const catcher = keyCatcher ? KEY_CATCHER_HTML : "";
-	return `<div part="shelf-strap">${catcher}${icons}</div>`;
+	return `<div part="shelf-strap">${catcher}${ownerChip}${icons}</div>`;
 }
 
 /**
@@ -144,7 +155,9 @@ export function createRenderer ({ send, log, badgeModeOf = () => "plus", }) {
 	 *  chips together with everything else. */
 	let activeHints = null;
 	/** Row hint ledger: `${windowId}:${tabId}` -> last ACKNOWLEDGED
-	 *  contents of the tab's `tab-above` extra contents.  Same rule as
+	 *  contents of the tab's `tab-above` extra contents (rows WITHOUT a
+	 *  strap only — an owner's code rides its strap, see strapFor).
+	 *  Same rule as
 	 *  the strap ledger: a rejected write is not recorded, so the next
 	 *  request retries it. */
 	const rowHints = new Map;
@@ -235,7 +248,8 @@ export function createRenderer ({ send, log, badgeModeOf = () => "plus", }) {
 
 	/** Build one shelf's strap markup from the current derivation state.
 	 *  The ROOT shelf carries the key catcher in every derivation and
-	 *  every restore (tab-hints); the active hint codes ride the icons. */
+	 *  every restore (tab-hints); the active hint codes ride the icons,
+	 *  and the OWNER tab's code rides the strap as its leading item. */
 	function strapFor ({ owner, members, tabsById, highlightIds, badgeCounts, }) {
 		return strapHtml({
 			members,
@@ -244,6 +258,8 @@ export function createRenderer ({ send, log, badgeModeOf = () => "plus", }) {
 			badgeCounts,
 			badgeMode: badgeModeOf(),
 			hints: activeHints,
+			ownerHint: owner != null && activeHints
+				? (activeHints.get(owner) || null) : null,
 			keyCatcher: owner === ROOT_SHELF,
 		});
 	}
@@ -426,7 +442,8 @@ export function createRenderer ({ send, log, badgeModeOf = () => "plus", }) {
 	}
 
 	/**
-	 * Row hint ledger: one `tab-above` extra contents per labeled row.
+	 * Row hint ledger: one `tab-above` extra contents per labeled row
+	 * (rows WITHOUT a strap; owners ride their strap markup instead).
 	 * TST clears a row's extra contents when the row leaves the viewport
 	 * and re-inserts its cached markup only when the element is reused,
 	 * so the mode re-sends the labels on every `tabs-rendered` too (see
@@ -434,9 +451,10 @@ export function createRenderer ({ send, log, badgeModeOf = () => "plus", }) {
 	 * acknowledged, and only a differing label goes over the wire.
 	 */
 	function rowHintMarkup (code) {
-		// part "shelf-rowhint" (NOT the icon chip's "shelf-hint"): the row
-		// chip anchors to TST's .above container, the icon chip to our own
-		// .shelf-icon — two geometries, two rules (style.esm.js)
+		// part "shelf-rowhint" (NOT the icon chip's "shelf-hint", NOT the
+		// owner chip's "shelf-owner-hint"): this chip anchors to the
+		// row-overlay'd tab-above container of a row WITHOUT a strap —
+		// three chips, three homes (style.esm.js §8)
 		return code
 			? `<span part="shelf-rowhint" data-hint="${escapeAttributeValue(code)}">${escapeHtml(code)}</span>`
 			: "";

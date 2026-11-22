@@ -344,3 +344,40 @@ test("hint chips ride restoreStraps while the mode is on, and vanish after setHi
 	ownerStrap = strapCalls(calls).filter(call => call.params.place === "tab-below").at(-1);
 	assert.equal(ownerStrap.params.contents.includes("shelf-hint"), false, "exit removes every chip");
 });
+
+test("an owner's code chip rides its own strap as the leading item, narrowing and exiting with the mode", async () => {
+	const { calls, send, } = recorder();
+	const renderer = createRenderer({ send, log: () => {}, });
+	const derivation = derivationOf({ owner: 1, members: [2, 3], });
+
+	// entry: the full code map (the owner's own code included) — the
+	// owner chip leads the strap, the ROOT strap (tabbar-top) carries none
+	renderer.setHints(new Map([[1, "aq"], [2, "aa"], [3, "ac"],]));
+	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
+	const ownerStrap = strapCalls(calls).find(call => call.params.place === "tab-below");
+	const contents = ownerStrap.params.contents;
+	// the chip is IN the strap markup, before the first icon
+	const ownerChipAt = contents.indexOf('part="shelf-owner-hint"');
+	const firstIconAt = contents.indexOf('part="shelf-icon"');
+	assert.ok(ownerChipAt > -1 && firstIconAt > ownerChipAt, () => contents);
+	assert.ok(contents.includes('data-hint="aq"'), () => contents);
+	const rootStrap = strapCalls(calls).find(call => call.params.place === "tabbar-top");
+	assert.equal(rootStrap.params.contents.includes("shelf-owner-hint"), false,
+		"the root shelf has no owner tab, so no owner chip");
+
+	// narrowing: the owner's code filtered out drops the chip through the
+	// normal strap diff
+	renderer.setHints(new Map([[2, "aa"],]));
+	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
+	const narrowedOwner = strapCalls(calls).filter(call => call.params.place === "tab-below").at(-1);
+	assert.equal(narrowedOwner.params.contents.includes("shelf-owner-hint"), false, () => narrowedOwner.params.contents);
+	assert.ok(narrowedOwner.params.contents.includes('part="shelf-icon"'), "the icons stay");
+
+	// outside the mode an owner strap carries no chip at all
+	const callsBefore = strapCalls(calls).length;
+	assert.ok(callsBefore > 0);
+	renderer.setHints(null);
+	await renderer.applyDerivation({ windowId: 7, derivation, tabsById, });
+	const plainOwner = strapCalls(calls).filter(call => call.params.place === "tab-below").at(-1);
+	assert.equal(plainOwner.params.contents.includes("shelf-owner-hint"), false, () => plainOwner.params.contents);
+});
