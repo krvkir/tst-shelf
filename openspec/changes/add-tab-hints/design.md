@@ -311,14 +311,25 @@ feature:
   still pure: `subtree-collapsed` on owners is exported (the badge
   feature depends on it), and the planner walks the fold down.
 - The RENDER truth is TST's own live viewport filter: get-tree and
-  get-light-tree accept `rendered: true` (background/handle-misc.js
-  ~694/~719 → getTargetRenderedTabs), which asks the SIDEBAR's
-  scroll.js (the internal kCOMMAND_GET_RENDERED_TAB_IDS) for its
-  live rendered ids.  The response is one top-level entry PER
-  RENDERED TAB (the export walks real children, so each entry carries
-  its full light subtree) — the top-level ids ARE the rendered set.
-  Pinned tabs are prepended by the query (scroll.js) — the planner
-  ignores pinned anyway.
+  get-light-tree accept `rendered: true` (handle-misc.js ~694/~719 →
+  getTargetRenderedTabs), which asks the SIDEBAR's scroll.js (the
+  internal kCOMMAND_GET_RENDERED_TAB_IDS) for its live rendered ids
+  (scroll.js:1321-1328: pinned + every rendered row of ANY depth).
+  `tab: '*'` is LOAD-BEARING: without a tab selector TST's
+  getTargetTabs returns ROOT tabs only (common/tst-api.js — tabQuery =
+  message.tabs || tabIds || tab || tabId; none → Tab.getRootTabs, the
+  documented piroor#2763 behaviour), so the filter kept only rendered
+  roots and the harvest yielded a root-only set — 0.6.0 shipped that
+  and nested visible tabs carried no codes (the user hit it on the
+  first 0.6.0 build).  With tab:'*' every rendered row becomes one
+  top-level entry (each may re-nest its full subtree under rendered
+  ancestors — only the top-level ids are read).  Pinned tabs are in
+  the set; the planner ignores pinned anyway.  The E2E's CONVERSE
+  check (the hint fixture's NESTED http tab — the second tab, opened
+  as the first tab's opener child — is rendered, coded and labeled)
+  is the regression guard for the tab:'*' semantics; the fixture's
+  own plain row D cannot witness (the 0.2.1 reveal checks leave its
+  owner folded, so D is unrendered at that point by design).
 - The tabs-rendered/-unrendered EVENT stream failed as a render
   ledger, measured in the E2E: the notifications carry NO top-level
   windowId (every payload measured w=undefined; the light tab
@@ -337,5 +348,5 @@ feature:
   routes set-extra-contents by tab id — the 0.3.3 stale-ledger trap
   stays shut).  The E2E asserts the painted-subset contract against
   the mode's own queried set (hints.rendered in the state export).
-- The fixture measures the win: 9 codes at 2 letters (was 4+), and
-  typing can no longer leave the screen.
+- The fixture measures the win and keeps the coverage honest:
+  0.6.2's converse check codes the hint fixture's nested rendered tab.

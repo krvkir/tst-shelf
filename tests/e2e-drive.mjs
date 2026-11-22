@@ -488,16 +488,23 @@ const mkHintTabsScript = String.raw`
 		const windowId = arguments[0];
 		const origin = arguments[1];
 		const a = await browser.tabs.create({ windowId, url: origin + "/a.html", active: false, });
-		await browser.tabs.create({ windowId, url: origin + "/b.html", active: false, });
+		// the second tab opens as the FIRST tab's opener-child: a NESTED
+		// rendered row — the witness the 0.6.2 converse check needs
+		// (TST's rendered query without tab:'*' drops nested tabs from
+		// its top level; a root-row witness could never catch that).
+		// The fixture's own D is folded away at this point (the 0.2.1
+		// reveal checks leave A folded), so it cannot witness anything.
+		const child = await browser.tabs.create({ windowId, url: origin + "/child.html", active: false, openerTabId: a.id, });
+		const b = await browser.tabs.create({ windowId, url: origin + "/b.html", active: false, });
 		await browser.tabs.update(a.id, { active: true, });
 		const settled = [];
 		for (let attempt = 0; attempt < 20; attempt++) {
 			const tabs = await browser.tabs.query({ windowId, url: "http://127.0.0.1/*", });
-			const ready = tabs.length >= 2 && tabs.every(tab => tab.status === "complete");
+			const ready = tabs.length >= 3 && tabs.every(tab => tab.status === "complete");
 			if (ready) { settled.push(...tabs.map(tab => tab.id)); break; }
 			await new Promise(resolve => setTimeout(resolve, 500));
 		}
-		return JSON.stringify({ a: a.id, all: settled, });
+		return JSON.stringify({ a: a.id, child: child.id, all: settled, });
 	})();
 `;
 
@@ -1574,6 +1581,39 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 								unseen.length === 0,
 								() => `unseen=${JSON.stringify(unseen)} rendered=${JSON.stringify(renderedNow)} codedRows=${JSON.stringify(codedRowIds)}`);
 						}
+						// the 0.6.2 CONVERSE (the check 0.6.0 lacked): every
+						// rendered row must be coded too — TST's rendered
+						// query without tab:'*' returned ROOT tabs only, so
+						// nested rows silently dropped out of the coded set
+						// while every other gate stayed green (superset
+						// checks pass vacuously when rows go missing).  The
+						// witness is the hint fixture's NESTED http tab (the
+						// second tab, created as the first tab's opener
+						// child): a rendered row at depth 1.  (The fixture's
+						// own plain row D cannot witness this — the 0.2.1
+						// reveal checks leave its owner folded, so D is
+						// unrendered at this point by design.)  The mode
+						// must report the child in its rendered set, code
+						// it, and paint its label.
+						{
+							const codesHere2 = new Map(confirmedState.hints.codes);
+							const nestedId = hintTabs && hintTabs.child;
+							const nestedRendered = !!(nestedId != null
+								&& confirmedState.hints.rendered
+								&& confirmedState.hints.rendered.includes(Number(nestedId)));
+							const nestedCode = nestedId != null ? codesHere2.get(Number(nestedId)) : null;
+							let nestedLabel = null;
+							for (let attempt = 0; attempt < 8; attempt++) {
+								const fresh = await dumpHints();
+								nestedLabel = (fresh && fresh.labels || [])
+									.find(entry => Number(entry.id) === Number(nestedId) && !entry.invisible);
+								if (nestedLabel && nestedLabel.text == nestedCode) { break; }
+								await new Promise(resolve => setTimeout(resolve, 700));
+							}
+							check("every rendered row carries a code: the NESTED rendered http tab is reported, coded and labeled",
+								!!nestedCode && nestedRendered && !!nestedLabel && nestedLabel.text == nestedCode,
+								() => `nested=${nestedId} code=${nestedCode} rendered=${JSON.stringify(confirmedState.hints.rendered)} label=${JSON.stringify(nestedLabel)} firstCodes=${JSON.stringify([...codesHere2.entries()].slice(0, 12))}`);
+						}
 						// narrowing: a letter that begins several codes keeps
 						// only those labels — deterministic, because the
 						// visible set outnumbers the alphabet
@@ -1737,9 +1777,11 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 								await new Promise(resolve => setTimeout(resolve, 800));
 							}
 							const codeOf = id => (String(ready.hints.codes).length && (ready.hints.codes || []).find(([tabId]) => tabId == id) || [])[1];
-							// the fixture's D row may sit outside the hint window's
-							// rendered viewport (the 30 blank tabs pushed it up);
-							// any coded NON-shelved row tab proves the same thing
+							// D is folded away at this point (the 0.2.1 reveal
+							// checks leave A folded), so a coded NON-shelved
+							// row tab — one of the http fixture tabs — proves
+							// the same thing; the converse check above covers
+							// the nested-row coverage separately
 							const codedPlain = codeOf(e.plain)
 								|| ((ready.hints.codes || []).find(([tabId]) =>
 										!(ready.shelved || []).includes(String(tabId)) && !(ready.shelved || []).includes(tabId)) || [])[1];

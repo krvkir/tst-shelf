@@ -420,20 +420,26 @@ async function fetchLightTree (windowId, tabsById) {
 }
 
 /** The live rendered set of a window's sidebar — TST's OWN viewport
- *  filter (get-light-tree with rendered:true → getTargetRenderedTabs →
- *  the sidebar virtual scroll's rendered ids, scroll.js).  The response
- *  is one top-level entry PER RENDERED TAB (each carrying its full
- *  light subtree — the export walks real children), so the top-level
- *  ids are exactly the rendered set of the answering sidebar copy.
- *  No copy answering (no sidebar, a failed query) rejects/returns null —
- *  the caller falls back to the fold cut alone.  Pinned tabs are in the
- *  set (getTargetRenderedTabs prepends them); the planner ignores them
- *  anyway.  One copy answers when several exist — whichever replies
- *  first (production has one panel; the tab-hosted copies of E2E/user
- *  setups race, and a wrong window's answer simply fails the tree's
- *  tab filter and yields an empty set → the same fallback). */
+ *  filter (get-light-tree with rendered:true + tab:'*' →
+ *  getTargetRenderedTabs → the sidebar virtual scroll's rendered ids,
+ *  scroll.js:1321-1328: pinned + every rendered row of ANY depth).
+ *  The tab:'*' selector is LOAD-BEARING: a windowId-ONLY message makes
+ *  TST's getTargetTabs return ROOT tabs (common/tst-api.js: tabQuery =
+ *  message.tabs || tabIds || tab || tabId; none → Tab.getRootTabs —
+ *  the documented piroor#2763 behaviour), so rendered DESCENDANTS were
+ *  filtered away and the harvest yielded a root-only set (bug shipped
+ *  in 0.6.0: nested visible tabs got no hint codes).  With tab:'*'
+ *  every rendered row becomes one top-level entry; the export may nest
+ *  the same tab again under a rendered ancestor — only the top-level
+ *  ids are read.  No copy answering (no sidebar, a failed query)
+ *  rejects/returns null — the caller falls back to the fold cut alone.
+ *  Pinned tabs are in the set; the planner ignores them anyway.  One
+ *  copy answers when several exist — whichever replies first
+ *  (production has one panel; the tab-hosted copies of E2E/user setups
+ *  race, and a wrong window's answer simply fails the tree's tab
+ *  filter and yields an empty set → the same fallback). */
 async function fetchRenderedIds (windowId) {
-	const tree = await TST.methods.getLightTree({ windowId, rendered: true, }).catch(() => null);
+	const tree = await TST.methods.getLightTree({ windowId, rendered: true, tab: '*', }).catch(() => null);
 	const ids = new Set;
 	if (Array.isArray(tree)) {
 		for (const node of tree) {
@@ -1734,8 +1740,12 @@ async function enterHintMode (windowId) {
 	// screen.
 	//
 	// The RENDER truth is TST's own live viewport filter: get-light-tree
-	// with rendered:true (background/handle-misc.js — getTargetRenderedTabs
-	// asks the sidebar's virtual scroll for its rendered ids), because
+	// with rendered:true AND tab:'*' (background getTargetRenderedTabs
+	// asks the sidebar's virtual scroll for its rendered ids; tab:'*' is
+	// required — a windowId-ONLY query selects ROOT tabs in TST's
+	// getTargetTabs, so rendered descendants would be filtered away and
+	// the set would be root-only: the 0.6.0 bug, caught by the E2E's
+	// converse coverage check), because
 	// the tabs-rendered/-unrendered EVENT stream is not a per-window
 	// truth: several sidebar copies of one window render/unrender their
 	// own viewports, and one copy's tabs-unrendered would veto rows
