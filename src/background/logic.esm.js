@@ -261,9 +261,16 @@ export function derive ({ tree, shelved, tabsById, hiddenByUs = new Set, }) {
  * So: the active tab, every tab in a collapse/expand animation, and all
  * their ancestors.
  *
+ * A TST drag hold adds `preservedActiveId`: the pre-press active tab
+ * whose branch must survive until the press resolves as a click, a
+ * canceled drag or a settled drop (shelf-nesting delta: a primary-button
+ * TST drag preserves the previously active shelved subtree).  The union
+ * of both chains is protected; a missing/unknown preserved id adds
+ * nothing.
+ *
  * @returns {Set<number>} ids that must stay visible
  */
-export function mustShowTabs ({ tree, activeId, animationStates = ["collapsing", "expanding"], }) {
+export function mustShowTabs ({ tree, activeId, preservedActiveId = null, animationStates = ["collapsing", "expanding"], }) {
 	const { parentIdOf, statesById, } = indexTree(tree);
 	const must = new Set;
 	const protect = id => {
@@ -274,6 +281,7 @@ export function mustShowTabs ({ tree, activeId, animationStates = ["collapsing",
 		}
 	};
 	if (activeId != null) { protect(activeId); }
+	if (preservedActiveId != null) { protect(preservedActiveId); }
 	for (const [id, states] of statesById) {
 		if (animationStates.some(state => states.includes(state))) { protect(id); }
 	}
@@ -366,32 +374,50 @@ function forEachInSubtree (childrenById, id, fn) {
  * folds the owner themselves — `openedSeen` distinguishes that user
  * action from our own expansion still being in flight.
  *
+ * A TST drag hold adds `preservedActiveId` (the pre-press active tab):
+ * the reveal stays alive while EITHER anchor is a descendant of the
+ * owner, and when both anchors live beneath the same owner the exposed
+ * branch is the union of both direct-child branch subtrees — the drag
+ * exception of the shelf-nesting delta.  A dropped anchor contributes
+ * nothing (unknown ids are ignored), and the user's own fold still
+ * prunes an `openedSeen` reveal.
+ *
  * @param {{tree: any[], activeId: number|null,
+ *          preservedActiveId?: number|null,
  *          reveals: Map<number, {openedSeen?: boolean}>,
  *          mustShow?: Set<number>}} args
  * @returns {{suppress: number[], prune: number[]}} ids to take the row
  *          away from, and owners whose reveal must end
  */
-export function planReveals ({ tree, activeId, reveals, mustShow = new Set, }) {
+export function planReveals ({ tree, activeId, preservedActiveId = null, reveals, mustShow = new Set, }) {
 	const { parentIdOf, childrenById, statesById, } = indexTree(tree);
 	const suppress = new Set;
 	const prune = [];
+	// The branch anchor is the owner's DIRECT child that leads to the
+	// anchor tab (rather than the tab itself): that is what makes "the
+	// activated child's subtree is revealed" true — a member with
+	// children brings all of them along, and activating one of them later
+	// does not start hiding its siblings.  Returns null when the anchor
+	// lies outside the owner's subtree.
+	const branchAnchorOf = (ownerId, id) => {
+		let anchor = id;
+		while (anchor != null && anchor != ownerId && parentIdOf.get(anchor) != ownerId) {
+			anchor = parentIdOf.get(anchor);
+		}
+		return anchor != null && anchor != ownerId ? anchor : null;
+	};
 	for (const [owner, info] of reveals) {
 		if (!parentIdOf.has(owner)) { prune.push(owner); continue; } // owner closed
 		if (info?.openedSeen && isSubtreeFolded(statesById.get(owner))) { prune.push(owner); continue; }
-		if (activeId == null || !isDescendantOf({ parentIdOf, }, activeId, owner)) { prune.push(owner); continue; }
+		// alive while either anchor is a descendant of the owner
+		const liveHere = anchorId => anchorId != null &&
+			parentIdOf.has(anchorId) && isDescendantOf({ parentIdOf, }, anchorId, owner);
+		if (!liveHere(activeId) && !liveHere(preservedActiveId)) { prune.push(owner); continue; }
 		const branch = new Set;
-		// The branch is the whole subtree of the owner's DIRECT child that
-		// leads to the active tab.  Anchoring on the direct child (rather
-		// than on the active tab itself) is what makes "the activated
-		// child's subtree is revealed" true: a member with children brings
-		// all of them along, and activating one of them later does not
-		// start hiding its siblings.
-		let anchor = activeId;
-		while (anchor != null && anchor != owner && parentIdOf.get(anchor) != owner) {
-			anchor = parentIdOf.get(anchor);
+		for (const anchorId of [activeId, preservedActiveId]) {
+			const anchor = liveHere(anchorId) ? branchAnchorOf(owner, anchorId) : null;
+			if (anchor != null) { addSubtree(childrenById, anchor, branch); }
 		}
-		if (anchor != null && anchor != owner) { addSubtree(childrenById, anchor, branch); }
 		forEachInSubtree(childrenById, owner, id => {
 			if (branch.has(id) || mustShow.has(id)) { return; }
 			suppress.add(id);

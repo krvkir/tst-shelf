@@ -802,6 +802,114 @@ test("nested reveals each suppress their own owner's subtree", () => {
 });
 
 // ---------------------------------------------------------------------------
+// drag holds: the preserved pre-drag branch (shelf-nesting delta)
+
+test("mustShowTabs without a hold is unchanged by the extra argument", () => {
+	const tree = [node(1, [], [node(2, [], [node(3, [], [node(4)])])])];
+	assert.deepEqual([...mustShowTabs({ tree, activeId: 4, })].sort(), [1, 2, 3, 4]);
+	assert.deepEqual([...mustShowTabs({ tree, activeId: 4, preservedActiveId: null, })].sort(), [1, 2, 3, 4],
+		"a null preserved anchor contributes nothing");
+});
+
+test("mustShowTabs protects the union of the live and preserved chains", () => {
+	// X <- (S <- (s1, ...)), Y <- (y1): the drag hold preserves the
+	// pre-press branch S<-s1 while the press activated y1.
+	const tree = [node(1, [], [node(2, [], [node(3, [], [node(4)])]), node(5, [], [node(6)])])];
+	const must = mustShowTabs({ tree, activeId: 6, preservedActiveId: 4 });
+	assert.deepEqual([...must].sort(), [1, 2, 3, 4, 5, 6],
+		"both chains: the dragged tab keeps its rows, the preserved shelved branch keeps its drop targets");
+});
+
+test("mustShowTabs treats an unknown preserved id like an unknown active id", () => {
+	const tree = [node(2)];
+	assert.deepEqual([...mustShowTabs({ tree, activeId: 2, preservedActiveId: 99, })].sort(), [2, 99],
+		"the walk stops at the missing node; the id itself is still protected until it is re-read");
+});
+
+test("a drag outside a revealed owner does not end its reveal at grasp", () => {
+	// the pre-drag branch (C's subtree) hangs beneath owner A; the press
+	// activated E outside A.  Without the hold this pruned the reveal and
+	// folded A mid-drag; with it the reveal survives until the drag
+	// resolves.
+	const reveals = new Map([[1, { openedSeen: true, }]]);
+	const { suppress, prune, } = planReveals({
+		tree: revealedTree(), activeId: 7, preservedActiveId: 3, reveals,
+	});
+	assert.deepEqual(prune, [], "the preserved branch is still beneath owner A (1)");
+	assert.deepEqual(suppress.sort(), [2, 4], "the live branch is outside, so only the preserved branch's siblings lose their rows");
+});
+
+test("both anchors beneath one owner reveal the union of their branches", () => {
+	// the pressed active tab c1 (id 5) while the preserved branch is C's
+	// whole subtree (3 <- c1, c2): both C's branch and the deeper branch
+	// stay renderable — one subtree contains the other here, so only D
+	// (the unshelved sibling) and B (the other member) are suppressed.
+	const { suppress, prune, } = planReveals({
+		tree: revealedTree(), activeId: 5, preservedActiveId: 3,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	});
+	assert.deepEqual(prune, []);
+	assert.deepEqual(suppress.sort(), [2, 4], "ids outside BOTH branch subtrees are suppressed");
+});
+
+test("two sibling branches beneath one owner both stay renderable", () => {
+	// the active tab is B (id 2, a childless member) while the preserved
+	// branch is C <- (c1, c2): the dragged tab's branch and the preserved
+	// branch are disjoint subtrees, and only D is outside both.
+	const { suppress, prune, } = planReveals({
+		tree: revealedTree(), activeId: 2, preservedActiveId: 3,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	});
+	assert.deepEqual(prune, []);
+	assert.deepEqual(suppress, [4], "D alone loses its row: it is the only descendant outside both branches");
+});
+
+test("one owner, one anchor each: an outside active tab adds nothing to the branch", () => {
+	// the preserved anchor lives below owner A while the active tab (id 7)
+	// is a root tab outside: the branch is the preserved branch alone
+	const { suppress, prune, } = planReveals({
+		tree: revealedTree(), activeId: 7, preservedActiveId: 5,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	});
+	assert.deepEqual(prune, []);
+	assert.deepEqual(suppress.sort(), [2, 4], "C's branch (B=5) is exposed, no part of the outside active tab is");
+});
+
+test("a reveal with only an outside preserved anchor is pruned (release)", () => {
+	// the hold released: the preserved anchor is gone (null) and the
+	// active tab is outside the owner — the ordinary prune path runs
+	assert.deepEqual(planReveals({
+		tree: revealedTree(), activeId: 7, preservedActiveId: null,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	}).prune, [1]);
+});
+
+test("the user folding the owner still wins during a hold", () => {
+	assert.deepEqual(planReveals({
+		tree: foldedTree(), activeId: 7, preservedActiveId: 3,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	}).prune, [1], "openedSeen + collapsed states = the user's own fold, hold or no hold");
+});
+
+test("a closed owner is pruned regardless of a preserved anchor", () => {
+	assert.deepEqual(planReveals({
+		tree: foldedTree(), activeId: 3, preservedActiveId: 99,
+		reveals: new Map([[99, { openedSeen: true, }]]),
+	}).prune, [99]);
+});
+
+test("an unknown preserved anchor never keeps a reveal open by itself", () => {
+	assert.deepEqual(planReveals({
+		tree: revealedTree(), activeId: 6, preservedActiveId: 99,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	}).prune, [], "the live anchor keeps it; the junk anchor is ignored");
+	assert.deepEqual(planReveals({
+		tree: revealedTree(), activeId: 7, preservedActiveId: 99,
+		reveals: new Map([[1, { openedSeen: true, }]]),
+	}).prune, [1], "no anchor under the owner: pruned");
+});
+
+// ---------------------------------------------------------------------------
 // extreme placements ("Place leftmost" / "Place rightmost")
 
 test("a mid-shelf member moves left before the first member", () => {

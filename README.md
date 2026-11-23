@@ -114,6 +114,29 @@ What that leaves:
   a hidden tab when it becomes the active tab, so the row appears without
   the extension doing anything. It is hidden again — `rehideMembersNow`,
   measured at ~30 ms — the moment another tab takes the focus.
+- **Grasping another tab does not fold the target shelf** (0.6.5): TST
+  activates a pressed row on mousedown — long before its dragstart
+  notification — which used to fold the shelved subtree the user was
+  about to drag onto, so tabs could only be added to a shelf by taking
+  the shelved tab off first. A *drag hold* now records the pre-press
+  active branch at mousedown and keeps it renderable through the whole
+  gesture: the shelved rows and their unfolded subtrees stay available
+  as drop targets, and enclosing folded-owner reveals survive the grasp.
+  Arming covers the active shelved tab itself with or without children —
+  a childless member's single revealed row is the shelf's only drop
+  surface, and without the hold it folded away at grasp (0.6.5 fix
+  measured in the E2E drag phase).
+  When the gesture resolves as a plain click or a canceled drag, the
+  ordinary rules fold the branch again; when the drop lands inside the
+  preserved subtree, the dragged tab's own activity keeps it open with
+  no fold/reopen transition; when it lands elsewhere, the branch folds
+  once, child-first. Dropping an active tab onto a folded shelved tab's
+  visible row unfolds the target through TST's own attachment flow. The
+  hold is runtime state only (no session key), and keyboard or
+  programmatic activation keeps the pre-0.6.5 behavior exactly.
+  Known limitation: a drop aimed at an *inactive folded member's
+  favicon* still resolves to its owner row — TST reports no favicon
+  target, see the implementation notes.
 - **A failed tree export is retried** (0.2.2): TST's tree export failing
   once used to end a re-derivation silently, leaving the previous
   decision in force (a member could keep a stale decision). The pass now
@@ -265,6 +288,39 @@ What that leaves:
   react to hint typing either. If your Vimium (or any other
   extension's) keymap differs, the alphabet field on the options page
   takes any two or more distinct letters or digits.
+- **The drag lifecycle, measured** (0.6.5, the E2E drag phase): TST
+  activates a pressed row inside its `promisedMousedownNotified.then`,
+  i.e. right after the extension's `tab-mousedown` reply — so any
+  preservation must arm at mousedown; by `native-tab-dragstart`
+  (broadcast from TST's HTML5 `dragstart` handler) the rows are already
+  moving. The other measured facts the hold leans on: a same-sidebar
+  drop's `tree-attached` lands AFTER `native-tab-dragend`
+  (the settle must not release on dragend alone); TST tears its drag
+  session down `setTimeout(0)`-style within `onDrop`, so a dragend
+  arriving later than a frame reads "already handled by ondrop" and is
+  never broadcast; the row a press resolves through is the
+  `tab-item-substance` element (a press on the bare `tab-item` host is
+  reported as a `tabbar-mousedown`, not a `tab-mousedown`); and a
+  drop onto a folded shelved row reports `parentFolded=false` when
+  TST's own `forceExpand` already unfolded the target — the recorded
+  fold then comes from the pre-attach cached tree. A plain click keeps
+  its old branch only until mouseup (~120 ms debounce after release);
+  keyboard/programmatic activation folds immediately as before. The
+  settled quiet window is 400 ms after drag end and the last structural
+  event, bounded by 3 s, with a 10 s pending and a 90 s dragging
+  watchdog.
+- **A trusted native drag stays a manual check.** Marionette cannot
+  produce an OS-level HTML5 drag session in a headless Firefox
+  (measured — pointer actions produce no dragstart), so the E2E drag
+  phase drives TST's REAL sidebar handlers with synthetic,
+  `DataTransfer`-carrying `mousedown → dragstart → dragover → drop →
+  dragend` chains (composed events inside TST's actual document, the
+  same notifications and commands a real drag raises), and one trusted
+  GUI drag per scenario is verified by `make iso-tst` runs. The
+  synthetic chain is faithful in ordering (the `tree-attached` after
+  `dragend` inversion above was measured with it), but it is not an
+  OS drag: treat any surprising real-drag report as suspect even when
+  the E2E stays green.
 - **Extra-contents writes have no reply.** Every extra-contents case in
   tst-api-frontend.js ends with a bare `return`, and the runtime reply
   race leaves some send promises settled late or never. The row-label
@@ -518,6 +574,30 @@ green.  Two consecutive clean runs are required before merging.
   and a native TST icon drag (drop onto the shelf owner = subtree
   reattach) are the available reorder paths until upstream gains
   drop-target notifications for extra contents.
+- **A drop aimed at an inactive folded member's favicon cannot reach
+  that member** (0.6.5): TST's `SidebarItems.getItemFromDOMNode`
+  (sidebar-items.js:78-85) resolves a drop target through the closest
+  `tab-item-substance`, so an icon inside an owner's row resolves to
+  the OWNER row and no notification carries the icon — a favicon drop
+  lands as an owner-row drop, same as it did before drag preservation
+  existed. The 0.6.5 hold preserves the active member's OWN row while a
+  drag is under way (arming covers shelved members with children and
+  childless ones alike), so the folded *regular row* is a valid drop
+  target; the folded *favicon*
+  is not a target of its own. Exposing it needs one of two upstream
+  changes: temporarily rendering folded members as rows during a drag
+  (rejected: reintroduces row-height work at 350-tab scale), or TST
+  routing extra-contents drop targets to companions.
+- **The E2E drag phase presses `tab-item-substance`, never the row**:
+  TST's `getTreeItemFromEvent` resolves through
+  `getItemFromDOMNode(node.closest('tab-item-substance').raw)`
+  (sidebar-items.js:78-85), and a press dispatched on the bare
+  `tab-item` host falls through to the tabbar fallback — the
+  notification then arrives as `tabbar-mousedown` (no `tab-mousedown`
+  at all, measured). Icon presses are dispatched on the icon element
+  itself, whose `data-drag-data` (`{type: 'tab', data: {id, asTree}}`)
+  drives TST's `detectOverrideDragDataSet` override of the dragged
+  item (drag-and-drop.js:869-929).
 - **The only stored state is the sticky flag** (`tst-shelf` session
   value). Shelf membership, hosts, badges, highlight and selection
   are derived from TST's light tree + `browser.tabs` on every

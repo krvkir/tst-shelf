@@ -312,8 +312,9 @@ const TST = tstApi({
 			register().then(() => scheduleRederiveAll())
 				.catch(error => logBoot("tst-ready-register-fail", describeError(error)));
 		},
-		"tree-attached": message => onTreeMutated(message?.tab?.windowId),
+		"tree-attached": message => onTreeAttached(message),
 		"tree-detached": message => {
+			markHoldStructuralActivity(message?.tab?.windowId);
 			onTreeMutated(message?.tab?.windowId);
 		},
 		"tabs-rendered": message => onTabsRendered(message?.tabs || [], message?.windowId),
@@ -342,6 +343,15 @@ const TST = tstApi({
 			}
 		},
 		"extra-contents-mousedown": message => onExtraContentsMousedown(message),
+		// mouseup verdicts stay false: a truthy reply cancels TST's default
+		// mouseup/click handling wholesale.  These listeners only release a
+		// pending drag hold when the press ends without a native drag.
+		"extra-contents-mouseup": message => onMouseupForHold(message),
+		"tab-mousedown": message => onTabMousedown(message),
+		"tab-mouseup": message => onMouseupForHold(message),
+		"tabbar-mouseup": () => onMouseupForHold(null),
+		"native-tab-dragstart": message => onNativeTabDragstart(message),
+		"native-tab-dragend": message => onNativeTabDragend(message),
 		"extra-contents-clicked": message => onExtraContentsClicked(message),
 		"extra-contents-keydown": message => onExtraContentsKeydown(message),
 		"extra-contents-focus": message => onExtraContentsFocus(message),
@@ -493,8 +503,14 @@ async function fetchRenderedIds (windowId) {
 	return ids.size ? ids : null;
 }
 
-async function rederive (windowId, { reconcile = false, } = {}) {
+async function rederive (windowId, { reconcile = false, preservedActiveId = undefined, } = {}) {
 	if (!tstUsable) { return; }
+	// a drag hold (3c) preserves its pre-press branch in every pass it
+	// outlives; an explicitly passed id (the settle pass) wins over the
+	// live hold so its decision cannot change mid-settle
+	if (preservedActiveId === undefined) {
+		preservedActiveId = holdFor(windowId)?.preservedActiveId ?? null;
+	}
 	// favicon stickiness: tabs.query carries no favIconUrl while a tab
 	// is loading or navigating — resolveFavicons fills the blank from
 	// the memory and records every known one (logic.esm.js).
@@ -540,12 +556,14 @@ async function rederive (windowId, { reconcile = false, } = {}) {
 		.then(list => list.shift(), () => null);
 	diag(`rederive w=${windowId} active=${liveActive?.id} shelved=${shelved.size}`);
 	const activeId = liveActive?.id ?? null;
-	const mustShow = mustShowTabs({ tree, activeId, });
+	const mustShow = mustShowTabs({ tree, activeId, preservedActiveId, });
 	foldDanglingMembers(windowId, tree, mustShow);
 	await reconcileHidden(windowId, tabs, mustShow);
 	// 0.1.7/0.2.x: a folded owner that a reveal keeps open shows only the
 	// active tab's branch — every other descendant loses its row here.
-	await reconcileSuppressed(windowId, tree, tabsById, mustShow, activeId);
+	// A drag hold makes the union rule apply: both anchors' branches stay
+	// renderable until the gesture settles (3c).
+	await reconcileSuppressed(windowId, tree, tabsById, mustShow, activeId, preservedActiveId);
 
 	const derivation = derive({ tree, shelved, tabsById, hiddenByUs, });
 	windows.set(windowId, { derivation, tabsById, tree, });
@@ -837,14 +855,14 @@ function endReveal (windowId, owner) {
  * right back.  The session key `SUPPRESSED_KEY` makes a crash mid-reveal
  * recoverable at boot.
  */
-async function reconcileSuppressed (windowId, tree, tabsById, mustShow, activeIdHint = undefined) {
+async function reconcileSuppressed (windowId, tree, tabsById, mustShow, activeIdHint = undefined, preservedActiveId = null) {
 	if (!tree) { return; }
 	const now = Date.now();
 	// the live active id when the caller has a fresher one than its snapshot
 	const activeId = activeIdHint !== undefined ? activeIdHint :
 		[...tabsById.values()].find(tab => tab.active && !tab.hidden)?.id ?? null;
 	const map = reveals.get(windowId) || new Map;
-	const { suppress, prune, } = planReveals({ tree, activeId, reveals: map, mustShow, });
+	const { suppress, prune, } = planReveals({ tree, activeId, preservedActiveId, reveals: map, mustShow, });
 	for (const owner of prune) { endReveal(windowId, owner); }
 	// once a derivation has SEEN the owner expanded, a later `collapsed`
 	// state on it can only be the user's own fold
@@ -938,7 +956,11 @@ async function rehideMembersNow (windowId) {
 	const cached = windows.get(windowId)?.tree ?? null;
 	if (!cached) { return; }
 	const cachedActiveId = tabs.find(tab => tab.active)?.id ?? null;
-	const mustShow = mustShowTabs({ tree: cached, activeId: cachedActiveId, });
+	// a drag hold (3c) keeps its pre-press branch renderable across this
+	// immediate pass too — the grasp-induced activation must not fold the
+	// branch the gesture is about to target
+	const preservedActiveId = holdFor(windowId)?.preservedActiveId ?? null;
+	const mustShow = mustShowTabs({ tree: cached, activeId: cachedActiveId, preservedActiveId, });
 	// the member that just lost activation may still have an unfolded
 	// subtree: fold it before reclaiming its row (danglingMembers)
 	foldDanglingMembers(windowId, cached, mustShow);
@@ -950,6 +972,376 @@ function onTreeMutated (windowId) {
 	if (!tstUsable || windowId == null) { return; }
 	scheduleRederive(windowId);
 }
+
+// ---------------------------------------------------------------------------
+// 3c. drag holds: a primary-button TST drag keeps the pre-press branch
+//
+// TST activates a pressed row on MOUSEDOWN (sidebar/mouse-event-listener.js
+// activates inside `promisedMousedownNotified.then`, i.e. as soon as the
+// extension's `tab-mousedown` reply is read), which — before this
+// section existed — folded the shelved subtree of the previously active
+// tab the moment the user GRASPED another tab to drag it onto that
+// subtree.  The `native-tab-dragstart` broadcast only lands later, from
+// the HTML5 `dragstart` path (sidebar/drag-and-drop.js), so waiting for
+// it means folding first and reopening into a mid-drag animation race.
+//
+// The hold is therefore armed at mousedown ("pending"), promoted on the
+// native drag start ("dragging"), and resolved only after the drop's
+// STRUCTURAL result is observable: "settling" waits out a quiet window
+// after `native-tab-dragend` and the last tree mutation, applies one
+// final held pass over the fresh tree, drops the hold, and immediately
+// re-runs the ordinary pass — inside-drop stays open via the dragged
+// tab's own activity, outside-drop folds it once, cancellation folds it
+// if the still-active tab is outside.  A plain click releases at
+// mouseup, so its settled result equals the pre-hold behavior.
+//
+// The hold is runtime-only interaction state (like the reveals): no
+// session key, no boot release path — boot starts with no holds, and a
+// hold never enters either hiding ledger.  It is ORCHESTRATION input to
+// the derivation (mustShowTabs + planReveals preservedActiveId), never a
+// second source of truth.
+
+/** Quiet window after `native-tab-dragend` before the settle runs.  A
+ *  same-sidebar drop attaches the dragged tab BEFORE the dragend
+ *  broadcast; a drop elsewhere (native tab bar, other window) attaches
+ *  after.  Both cases are covered by re-arming this timer on every
+ *  structural event (markHoldStructuralActivity); correctness comes from
+ *  the fresh-tree check in the settle pass, not from the constant. */
+const DRAG_SETTLE_QUIET_MS = 400;
+/** A settle must not be starved forever by a stream of unrelated
+ *  structural events: past this total wait the settle runs anyway
+ *  (bounded, so a missing quiet moment cannot pin the hold). */
+const DRAG_SETTLE_MAX_WAIT_MS = 3000;
+/** A press whose button never came up and never became a drag.  Pending
+ *  holds are normally released by mouseup; this bound covers a mouseup
+ *  the extension never sees (press into a system menu and away). */
+const DRAG_PENDING_WATCHDOG_MS = 10000;
+/** A drag whose `native-tab-dragend` never arrived.  HTML5 dragend fires
+ *  even for Escape-canceled drags, so expiry here means a lost message,
+ *  not a user still dragging — but a user dragging for absurdly long is
+ *  also released by it, with the ordinary rules re-applying per pass. */
+const DRAG_DRAGGING_WATCHDOG_MS = 90000;
+
+/** @type {Map<number, {phase: "pending"|"dragging"|"settling",
+ *   sourceId: number|null, preservedActiveId: number|null,
+ *   activityAt: number, dragEndedAt: number|null,
+ *   settleTimer: number|null, watchdogTimer: number|null,
+ *   attachObservations: object[]}>} windowId -> hold. */
+const dragHolds = new Map;
+
+function holdFor (windowId) {
+	return windowId == null ? null : dragHolds.get(windowId) || null;
+}
+
+function stopHoldTimers (hold) {
+	if (hold.settleTimer) { clearTimeout(hold.settleTimer); hold.settleTimer = null; }
+	if (hold.watchdogTimer) { clearTimeout(hold.watchdogTimer); hold.watchdogTimer = null; }
+}
+
+function discardHold (windowId, hold) {
+	stopHoldTimers(hold);
+	if (dragHolds.get(windowId) === hold) { dragHolds.delete(windowId); }
+}
+
+/** Is there a shelved tab on id's ancestor-or-self chain?  Every shelved
+ *  tab on an ACTIVE chain has its row rendered (the active member's row,
+ *  or the shelved ancestor of an active descendant), and that row is the
+ *  hold's preservation target.  Three shapes matter: the member with
+ *  children that is the drop destination (an ancestor's fold would
+ *  remove it and its subtree mid-drag), and the FOLDED-but-active member
+ *  whose OWN ROW is the drop target (dropping onto it attaches beneath
+ *  it; the row would be reclaimed at grasp), and the ACTIVE CHILDLESS
+ *  member whose single row is likewise the only target — with no
+ *  children there is no subtree to unfold, but without the hold the
+ *  ordinary outgoing-member hide reclaims the row at grasp and the drop
+ *  has nowhere to land.  The plain click/fold boundary separates them,
+ *  so the fold state itself is not the arming test.  The CACHED tree
+ *  decides — a press that starts with a stale cache repairs itself
+ *  through the re-derivation the press schedules anyway (worst case: one
+ *  press folds first, the same behavior as before this section). */
+function branchHasShelfRow (tree, activeId) {
+	if (!tree || activeId == null) { return false; }
+	const { parentIdOf, } = indexTree(tree);
+	for (let current = activeId; current != null; current = parentIdOf.get(current)) {
+		if (shelved.has(current)) { return true; }
+	}
+	return false;
+}
+
+/** Create (or replace) the window's hold.  A new pending press replaces
+ *  an older pending press; it must NOT replace an already dragging or
+ *  settling hold — that gesture still owns the branch decision. */
+function armDragHold (windowId, { sourceId, preservedActiveId, }) {
+	const old = dragHolds.get(windowId);
+	if (old && old.phase !== "pending") {
+		diag(`drag-hold-keep w=${windowId} phase=${old.phase} press=${sourceId}`);
+		return false;
+	}
+	if (old) { stopHoldTimers(old); }
+	const hold = {
+		phase: "pending",
+		sourceId: sourceId ?? null,
+		preservedActiveId: preservedActiveId ?? null,
+		activityAt: Date.now(),
+		dragEndedAt: null,
+		settleTimer: null,
+		watchdogTimer: setTimeout(() => {
+			const current = dragHolds.get(windowId);
+			if (!current || current.phase !== "pending") { return; }
+			logBoot("drag-hold-expired", `window ${windowId} phase=pending source=${hold.sourceId}`);
+			diag(`drag-hold-expired w=${windowId} phase=pending`);
+			discardHold(windowId, current);
+			scheduleRederive(windowId);
+		}, DRAG_PENDING_WATCHDOG_MS),
+		attachObservations: [],
+	};
+	dragHolds.set(windowId, hold);
+	diag(`drag-hold w=${windowId} phase=pending source=${hold.sourceId} preserved=${hold.preservedActiveId}`);
+	logBoot("drag-hold", `window ${windowId} source=${hold.sourceId} preserved=${hold.preservedActiveId}`);
+	return true;
+}
+
+/** Regular-row mousedown: read the LIVE active tab (the cached tabs' active
+ *  flags can lag one press behind), decide whether the press could fold a
+ *  visible shelved subtree away, and record the hold.  Returns whether the
+ *  hold was armed — the message response is decided by the caller. */
+async function maybeArmRowHold (message) {
+	const bail = reason => {
+		// every decline is diagnosable: a row press that fails to arm is
+		// otherwise indistinguishable from a press that never arrived
+		diag(`drag-arm-bail ${reason} w=${message?.tab?.windowId} src=${message?.tab?.id} button=${message?.button}`);
+		return false;
+	};
+	const windowId = message?.tab?.windowId;
+	const sourceId = message?.tab?.id;
+	if (!tstUsable || windowId == null || sourceId == null) { return bail("no-identity"); }
+	const cached = windows.get(windowId);
+	if (!cached || !cached.tree) { return bail("no-cache"); }
+	const liveActive = await browser.tabs.query({ windowId, active: true, })
+		.then(list => list.shift(), () => null);
+	const activeId = liveActive?.id ?? null;
+	if (activeId == null || activeId == sourceId) {
+		// dragging the active tab keeps its own branch open (it stays
+		// active for the whole gesture); nothing to preserve
+		return bail(`active-is-source active=${activeId}`);
+	}
+	if (!branchHasShelfRow(cached.tree, activeId)) { return bail(`no-shelf-row active=${activeId}`); }
+	diag(`drag-arm w=${windowId} src=${sourceId}`);
+	return armDragHold(windowId, { sourceId, preservedActiveId: activeId, });
+}
+
+/** `tab-mousedown` (regular rows; icon presses are answered by the
+ *  extra-contents-mousedown flow).  The response MUST be exactly false —
+ *  falling off the end makes the donor client answer `true`, and TST's
+ *  tryOperationAllowed cancels the mousedown on any truthy reply, which
+ *  would freeze every row click.  This listener only records. */
+async function onTabMousedown (message) {
+	diag(`m-d w=${message?.tab?.windowId} src=${message?.tab?.id} button=${message?.button} ctrl=${message?.ctrlKey} shift=${message?.shiftKey}`);
+	try {
+		if (message?.button == 0 && !message?.ctrlKey && !message?.shiftKey
+				&& !message?.altKey && !message?.metaKey) {
+			await maybeArmRowHold(message);
+		}
+	}
+	catch (error) { logBoot("drag-hold-arm-fail", `${error && error.message || error}`); }
+	return false;
+}
+
+/** Release a pending hold: the press resolved as a click (or died)
+ *  without becoming a native drag.  Idempotent; never touches a dragging
+ *  or settling hold. */
+function releasePendingHold (windowId) {
+	const hold = holdFor(windowId);
+	if (!hold || hold.phase !== "pending") { return; }
+	diag(`drag-hold-release w=${windowId} source=${hold.sourceId}`);
+	discardHold(windowId, hold);
+	scheduleRederive(windowId);
+}
+
+/** `tab-mouseup` / `tabbar-mouseup` / `extra-contents-mouseup` — response
+ *  MUST be exactly false: a truthy reply cancels TST's whole default
+ *  mouseup handling (not just our bookkeeping), so no listener here may
+ *  ever own the gesture. */
+async function onMouseupForHold (message) {
+	const tabWindowId = message?.tab?.windowId;
+	if (tabWindowId != null) {
+		releasePendingHold(tabWindowId);
+		return false;
+	}
+	// no tab in the payload (tabbar mouseup, or an icon release re-routed):
+	// presses end one per window, so releasing every pending hold is safe
+	for (const windowId of [...dragHolds.keys()]) { releasePendingHold(windowId); }
+	return false;
+}
+
+/** `native-tab-dragstart`: the press became a real drag.  Only a pending
+ *  hold of the matching source promotes (design decision 4); a mismatch
+ *  means the hold is stale and a newer press should replace it instead. */
+function onNativeTabDragstart (message) {
+	const windowId = message?.windowId ?? message?.tab?.windowId ?? null;
+	const hold = holdFor(windowId);
+	if (!hold || hold.phase !== "pending") { return false; }
+	const draggedId = message?.tab?.id ?? message?.item?.id ?? null;
+	if (hold.sourceId != null && draggedId != null && hold.sourceId != draggedId) {
+		diag(`drag-promote-skip w=${windowId} hold=${hold.sourceId} drag=${draggedId}`);
+		return false;
+	}
+	if (hold.watchdogTimer) { clearTimeout(hold.watchdogTimer); }
+	hold.phase = "dragging";
+	hold.activityAt = Date.now();
+	hold.watchdogTimer = setTimeout(() => {
+		const current = dragHolds.get(windowId);
+		if (!current || current === hold && current.phase === "dragging") {
+			logBoot("drag-hold-expired", `window ${windowId} phase=dragging source=${hold.sourceId}`);
+			diag(`drag-hold-expired w=${windowId} phase=dragging`);
+			discardHold(windowId, current || hold);
+			scheduleRederive(windowId);
+		}
+	}, DRAG_DRAGGING_WATCHDOG_MS);
+	diag(`drag-start w=${windowId} dragged=${draggedId} preserved=${hold.preservedActiveId}`);
+	logBoot("drag-dragstart", `window ${windowId} dragged=${draggedId}`);
+	return false;
+}
+
+/** `native-tab-dragend`: the gesture ended, but TST's drop command and
+ *  this notification are separate asynchronous paths and the payload
+ *  carries no parent or drop position — releasing now would fold the
+ *  preserved branch before an inside-drop's attach lands.  Enter the
+ *  settling phase instead and wait out a quiet window before the final
+ *  held pass. */
+function onNativeTabDragend (message) {
+	const windowId = message?.windowId ?? null;
+	const hold = holdFor(windowId);
+	if (!hold || hold.phase === "settling") { return false; }
+	if (hold.watchdogTimer) { clearTimeout(hold.watchdogTimer); hold.watchdogTimer = null; }
+	hold.phase = "settling";
+	hold.dragEndedAt = Date.now();
+	// the quiet window counts from the DRAG END: the drop's structural
+	// result (tree-attached!) arrives after this broadcast (measured), so
+	// a window measured from the drag start settles before the attach is
+	// observable and the settle's fresh tree misses the new parent
+	hold.activityAt = Date.now();
+	hold.watchdogTimer = setTimeout(() => {
+		const current = dragHolds.get(windowId);
+		if (current && current === hold && current.phase === "settling") {
+			logBoot("drag-hold-expired", `window ${windowId} phase=settling source=${hold.sourceId}`);
+			diag(`drag-hold-expired w=${windowId} phase=settling`);
+			settleDragHold(windowId).catch(error =>
+				logBoot("drag-settle-fail", `${windowId} ${error && error.message || error}`));
+		}
+	}, DRAG_SETTLE_MAX_WAIT_MS);
+	scheduleHoldSettle(windowId, hold);
+	diag(`drag-end w=${windowId} source=${hold.sourceId}`);
+	logBoot("drag-dragend", `window ${windowId}`);
+	return false;
+}
+
+/** Structural events during a drag: keep the quiet window running so the
+ *  settle only ever reads a tree that already contains the drop's result. */
+function markHoldStructuralActivity (windowId) {
+	const hold = holdFor(windowId);
+	if (!hold) { return; }
+	hold.activityAt = Date.now();
+	if (hold.phase === "settling") { scheduleHoldSettle(windowId, hold); }
+}
+
+function scheduleHoldSettle (windowId, hold) {
+	if (!hold) { return; }
+	if (hold.settleTimer) { clearTimeout(hold.settleTimer); }
+	const since = Date.now() - hold.activityAt;
+	if (since >= DRAG_SETTLE_QUIET_MS || hold.dragEndedAt != null &&
+			Date.now() - hold.dragEndedAt > DRAG_SETTLE_MAX_WAIT_MS) {
+		settleDragHold(windowId).catch(error =>
+			logBoot("drag-settle-fail", `${windowId} ${error && error.message || error}`));
+		return;
+	}
+	hold.settleTimer = setTimeout(() => {
+		hold.settleTimer = null;
+		settleDragHold(windowId).catch(error =>
+			logBoot("drag-settle-fail", `${windowId} ${error && error.message || error}`));
+	}, DRAG_SETTLE_QUIET_MS - since);
+}
+
+/** The settle: one final HELD pass over a fresh tree (the union
+ *  protection still governs fold/hide/suppress), THEN drop the hold and
+ *  apply the ordinary rules immediately.  Inside-drop: the dragged tab is
+ *  active beneath the shelved parent, so the ordinary pass keeps the
+ *  branch open for the same reason it protects any active branch.
+ *  Outside-drop and cancellation: the ordinary pass folds the preserved
+ *  branch once, child-first (foldDanglingMembers → hideGuard →
+ *  reconcileHidden).  Keeps the hold in the map until the held pass has
+ *  updated the window cache, so a debounced pass racing in between still
+ *  plans with the union and cannot fold the destination mid-settle. */
+async function settleDragHold (windowId) {
+	const hold = dragHolds.get(windowId);
+	if (!hold || hold.phase !== "settling" || hold.settling) { return; }
+	hold.settling = true;
+	if (hold.settleTimer) { clearTimeout(hold.settleTimer); hold.settleTimer = null; }
+	logBoot("drag-settle", `window ${windowId} preserved=${hold.preservedActiveId} attached=${hold.attachObservations.length}`);
+	diag(`drag-settle w=${windowId} preserved=${hold.preservedActiveId} attached=${hold.attachObservations.length}`);
+	try {
+		await rederive(windowId, { preservedActiveId: hold.preservedActiveId ?? null, });
+	}
+	finally {
+		if (dragHolds.get(windowId) === hold) {
+			dragHolds.delete(windowId);
+			diag(`drag-hold-dropped w=${windowId}`);
+		}
+	}
+	// the ordinary pass, immediately: settled visibility from the live
+	// active tab over the tree the held pass just cached
+	await rederive(windowId)
+		.catch(error => logBoot("drag-settle-ordinary-fail", `${windowId} ${error && error.message || error}`));
+}
+
+/** `tree-attached` during a drag: the only place TST reports WHAT the
+ *  drop actually re-parented (tab + parent, with states).  Record it as
+ *  drag telemetry and keep the settle's quiet window honest. */
+function onTreeAttached (message) {
+	const tab = message?.tab;
+	const parent = message?.parent;
+	const windowId = tab?.windowId ?? parent?.windowId ?? null;
+	const hold = holdFor(windowId);
+	if (hold && (hold.phase === "dragging" || hold.phase === "settling")) {
+		// the notification's parent snapshot may post-date TST's own
+		// forceExpand of a folded target (measured: parentFolded=false for
+		// an attach that TST expanded); the cached tree from the last
+		// pre-attach derivation still knows the prior fold
+		const cachedStates = (windows.get(windowId)?.tree
+			? indexTree(windows.get(windowId).tree).statesById : null) || null;
+		const cachedParentFolded = parent?.id != null && cachedStates
+			? isSubtreeFolded(cachedStates.get(parent.id)) : false;
+		const observation = {
+			tabId: tab?.id ?? null,
+			parentId: parent?.id ?? null,
+			parentShelved: parent?.id != null && shelved.has(parent.id),
+			parentFolded: isSubtreeFolded(parent?.states) || cachedParentFolded,
+		};
+		hold.attachObservations.push(observation);
+		if (hold.attachObservations.length > 20) { hold.attachObservations.shift(); }
+		diag(`drag-attach w=${windowId} tab=${observation.tabId} parent=${observation.parentId}`
+			+ ` parentShelved=${observation.parentShelved} parentFolded=${observation.parentFolded}`);
+		markHoldStructuralActivity(windowId);
+	}
+	onTreeMutated(windowId);
+}
+
+/** Icon mousedown: arm the hold BEFORE the selection choreography runs —
+ *  the previous member's direct collapse (selectShelfTab) and the
+ *  outgoing row's hide would otherwise fold the preserved branch while
+ *  the button is still down (the icon drag of a same-shelf member). */
+async function maybeArmIconHold (windowId, memberId) {
+	if (!tstUsable || windowId == null || memberId == null) { return false; }
+	const cached = windows.get(windowId);
+	if (!cached || !cached.tree) { return false; }
+	const liveActive = await browser.tabs.query({ windowId, active: true, })
+		.then(list => list.shift(), () => null);
+	const activeId = liveActive?.id ?? null;
+	if (activeId == null || activeId == memberId) { return false; }
+	if (!branchHasShelfRow(cached.tree, activeId)) { return false; }
+	return armDragHold(windowId, { sourceId: memberId, preservedActiveId: activeId, });
+}
+
 
 // ---------------------------------------------------------------------------
 // 3b. shelf placement (the member block)
@@ -1298,6 +1690,11 @@ async function onExtraContentsMousedown (message) {
 	if (memberId == null || !shelved.has(memberId)) { return false; }
 	const button = message?.button;
 	if (button == 0) {
+		// arm the hold BEFORE the choreography (3c): the icon press may
+		// become a native icon drag, and the previous member's direct
+		// collapse/hide below must not fold the branch the drag targets
+		const tab = await browser.tabs.get(memberId).catch(() => null);
+		await maybeArmIconHold(tab?.windowId, memberId).catch(() => false);
 		await selectShelfTab(memberId);
 		return true; // cancel: the owner row must not activate on mousedown
 	}
@@ -1324,12 +1721,22 @@ async function onExtraContentsClicked (message) {
 }
 
 /** Selection on the shelf: fold the previous member, unfold this one,
- *  activate it — one subtree visible per shelf (spec shelf-nesting). */
+ *  activate it — one subtree visible per shelf (spec shelf-nesting).
+ *  A drag hold (3c) suspends exactly the two direct fold/hide steps that
+ *  would fold the preserved branch at grasp: the previous member keeps
+ *  its subtree and row while the gesture is unresolved.  The incoming
+ *  expansion, activation, and the sticky shelf membership are untouched;
+ *  after release, the ordinary whole-window pass applies the fold and the
+ *  delayed row hide (no incremental visibility patching). */
 async function selectShelfTab (memberId) {
 	const tab = await browser.tabs.get(memberId).catch(() => null);
 	const windowId = tab?.windowId;
 	if (windowId == null) { return; }
 	const cached = windows.get(windowId);
+	const hold = holdFor(windowId);
+	const preservedActiveId = hold?.preservedActiveId ?? null;
+	const preserves = id => !!hold &&
+		isOnPreservedBranch(cached?.tree ?? null, id, preservedActiveId);
 	let outgoingId = null;
 	if (cached) {
 		// the member that currently owns the shelf's one visible row: the
@@ -1340,7 +1747,7 @@ async function selectShelfTab (memberId) {
 		}
 		const owner = cached.derivation.shelfOf.get(memberId);
 		const previous = cached.derivation.selectedOfShelf.get(owner);
-		if (previous != null && previous != memberId) {
+		if (previous != null && previous != memberId && !preserves(previous)) {
 			// its children are about to animate away: keep its own row
 			// until the animation is over (see hideGuard)
 			guardRow(previous);
@@ -1358,7 +1765,7 @@ async function selectShelfTab (memberId) {
 	// because the tab is still active); the retry covers that order.
 	// The incoming member needs no action from us: it is hidden, and
 	// Firefox reveals a hidden tab the moment it becomes active.
-	const reclaimable = outgoingId != null && !hideGuard.has(outgoingId);
+	const reclaimable = outgoingId != null && !hideGuard.has(outgoingId) && !preserves(outgoingId);
 	const activation = browser.tabs.update(memberId, { active: true, }).catch(() => null);
 	// issued without awaiting the activation: the parent processes the two
 	// messages in order, so the reveal and the hide land in the same task
@@ -1369,6 +1776,19 @@ async function selectShelfTab (memberId) {
 		await hideNow(outgoingId);
 	}
 	scheduleRederive(windowId);
+}
+
+/** Is `id` the preserved anchor itself or one of its ancestors — i.e.
+ *  does its subtree contain the branch the hold protects?  The CACHED
+ *  tree decides; unknown ids answer false (no protection).  Pure-ish
+ *  helper for selectShelfTab's direct fold/hide gate (section 3c). */
+function isOnPreservedBranch (tree, id, preservedActiveId) {
+	if (!tree || id == null || preservedActiveId == null) { return false; }
+	const { parentIdOf, } = indexTree(tree);
+	for (let current = preservedActiveId; current != null; current = parentIdOf.get(current)) {
+		if (current == id) { return true; }
+	}
+	return false;
 }
 
 /** Hide one tab right away, recording it as OUR hide (see hiddenByUs). */
@@ -1556,13 +1976,28 @@ browser.tabs.onRemoved.addListener(tabId => {
 	// a closed owner ends its reveal; a closed active tab prunes it on the
 	// next derivation (planReveals)
 	for (const map of reveals.values()) { map.delete(tabId); }
+	// a hold whose pressed tab or preserved anchor died keeps rows
+	// nobody can use as drop targets — 3c cleanup (idempotent)
+	for (const [windowId, hold] of dragHolds) {
+		if (hold.sourceId == tabId || hold.preservedActiveId == tabId) {
+			discardHold(windowId, hold);
+			diag(`drag-hold-cleanup w=${windowId} tab-closed=${tabId}`);
+			logBoot("drag-hold-cleanup", `window ${windowId} tab-closed ${tabId}`);
+			scheduleRederive(windowId);
+		}
+	}
 	if (shelved.delete(tabId)) { scheduleRederiveAll(); }
 });
 
 browser.tabs.onActivated.addListener(activeInfo => {
+	// ordering trace for the drag-hold probe (section 3c): activation lands
+	// between the mousedown and the dragstart of a grasp
+	diag(`activated w=${activeInfo.windowId} t=${activeInfo.tabId}`);
 	// a shelved tab activated inside a FOLDED owner's subtree: reveal its
 	// branch only (see section 3b).  This covers every activation route —
 	// the shelf icon's mousedown, Ctrl+Tab, Firefox's own tab bar.
+	// (A drag-hold grasp routes through here too; the hold keeps the
+	// preserved branch renderable across rehideMembersNow, 3c.)
 	maybeBeginReveal(activeInfo.windowId, activeInfo.tabId);
 	// end the previous member's reveal immediately (see rehideMembersNow)
 	rehideMembersNow(activeInfo.windowId);
@@ -1584,13 +2019,16 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 browser.tabs.onMoved.addListener((_tabId, moveInfo) => {
+	markHoldStructuralActivity(moveInfo.windowId);
 	scheduleRederive(moveInfo.windowId);
 });
 browser.tabs.onAttached.addListener((_tabId, attachInfo) => {
+	markHoldStructuralActivity(attachInfo.newWindowId);
 	scheduleRederive(attachInfo.newWindowId);
 	scheduleRederiveAll();
 });
 browser.tabs.onDetached.addListener((_tabId, detachInfo) => {
+	markHoldStructuralActivity(detachInfo.oldWindowId);
 	scheduleRederive(detachInfo.oldWindowId);
 	scheduleRederiveAll();
 });
@@ -1599,6 +2037,8 @@ browser.windows.onRemoved.addListener(async windowId => {
 	timers.delete(windowId);
 	windows.delete(windowId);
 	reveals.delete(windowId);
+	const windowHold = dragHolds.get(windowId);
+	if (windowHold) { discardHold(windowId, windowHold); }
 	if (hint && hint.windowId === windowId) { exitHintMode("window"); }
 	renderedTabs.delete(windowId);
 	sidebarState.delete(windowId);
@@ -2111,6 +2551,17 @@ function onTestMessage (message) {
 				codes: [...hint.codes.entries()],
 				rendered: hint.rendered ? [...hint.rendered] : null,
 			};
+			const dragHoldState = {};
+			for (const [windowId, hold] of dragHolds.entries()) {
+				dragHoldState[windowId] = {
+					phase: hold.phase,
+					sourceId: hold.sourceId,
+					preservedActiveId: hold.preservedActiveId,
+					activityAt: hold.activityAt,
+					dragEndedAt: hold.dragEndedAt,
+					observations: [...hold.attachObservations],
+				};
+			}
 			const storedBootlog = (await browser.storage.local.get({ bootlog: [], }).catch(() => ({}))).bootlog || [];
 			return {
 				registered: TST.isRegistered, usable: tstUsable,
@@ -2119,6 +2570,7 @@ function onTestMessage (message) {
 				suppressedHiddenByUs: [...suppressedHiddenByUs],
 				reveals: revealState,
 				revealDebug,
+				dragHolds: dragHoldState,
 				shelves, favicons,
 				renderedTabs: renderedState,
 				hints: hintState,
@@ -2234,6 +2686,33 @@ function onTestMessage (message) {
 			// internal onMessage filters `treestyletab:*` only)
 			const tree = await TST.methods.getTree({ tab: message.tab, }).catch(() => null);
 			return { tree: tree || null, };
+		}
+		case "test:tabs-remove": {
+			await browser.tabs.remove([message.tabId,]).catch(error => {
+				logBoot("test-tab-remove-fail", `${message.tabId} ${error && error.message || error}`);
+			});
+			return { ok: true, };
+		}
+		case "test:http-tab-create": {
+			// the drag scenarios' fresh drop sources: root-level http tabs
+			// appraised at the strip end (a synthetic press can only happen
+			// on a rendered row; TST renders appended tabs)
+			const created = await browser.tabs.create({
+				windowId: message.windowId,
+				url: message.url,
+				active: false,
+			}).catch(error => {
+				logBoot("test-tab-create-fail", String(error && error.message || error));
+				return null;
+			});
+			return { ok: !!created, id: created ? created.id : null, };
+		}
+		case "test:http-tabs": {
+			// the drag scenarios' outer drop sources: http tabs of the
+			// window (the driver's hint pages) are the fixture's only
+			// unshelved root rows outside the shelf blocks
+			const list = await browser.tabs.query({ windowId: message.windowId, }).catch(() => []);
+			return { ok: true, ids: list.filter(tab => /^https?:/i.test(tab.url || "")).map(tab => tab.id), };
 		}
 		case "test:hint-key": {
 			// The typing machine, with a synthesized payload (the phase-2

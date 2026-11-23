@@ -224,6 +224,14 @@ const sidebarScript = String.raw`
 						bubbles: true, composed: true, button: 0,
 						clientX: rect.x + 5, clientY: rect.y + 5,
 					}));
+					// the matching release: a mousedown-only press would leave
+					// the drag hold armed for its whole 10 s watchdog window
+					// (the hold is released on mouseup), so every synthetic
+					// click here is a faithful press+release
+					target.dispatchEvent(new MouseEvent("mouseup", {
+						bubbles: true, composed: true, button: 0,
+						clientX: rect.x + 5, clientY: rect.y + 5,
+					}));
 					record.clicked = true;
 				}
 			}
@@ -2106,6 +2114,1003 @@ async function runSidebarPhase (marionette, { windowId, expect, }) {
 	}
 }
 
+/** The synthetic drag lifecycle, dispatched through TST's REAL sidebar
+ *  handlers (document-level mousedown/dragstart/dragover/drop/dragend in
+ *  sidebar/mouse-event-listener.js and sidebar/drag-and-drop.js) inside
+ *  the tab-hosted sidebar page.  A trusted OS drag cannot be produced
+ *  through Marionette (Firefox does not synthesize HTML5 drag sessions
+ *  from synthetic input, measured), so this DataTransfer-carrying chain
+ *  is the headless characterization; ONE trusted GUI drag per scenario
+ *  remains an explicit manual check (task 1.2).
+ *
+ *  arguments: [sourceId, sourceKind, targetId, dropMode, probeIds]
+ *    sourceId/sourceKind — the pressed tab row or shelf icon
+ *    targetId/dropMode   — the drop row + one of:
+ *      "center" — the row's middle half => kDROP_ON_SELF (attach child)
+ *      "after"  — the row's bottom quarter => kDROP_AFTER (next sibling)
+ *      "cancel" — no drop at all; dragend without drop
+ *    probeIds            — row ids whose DOM presence is recorded at
+ *                          each step (the mid-drag visibility oracle)
+ *
+ *  Between the events the script reads BOTH truths: the shelf's own
+ *  test:state (drag-hold phases, hiddenByUs, suppressedHiddenByUs) over
+ *  the cross-extension runtime channel, and the sidebar's DOM rows.
+ *  The steps carry timestamps so the run can be ordered against the
+ *  background diag ring. */
+const dragSequenceScript = String.raw`
+	const [sourceId, sourceKind, targetId, dropMode, probeIds] = arguments;
+	const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+	const byId = id => document.querySelector('tab-item[data-tab-id="' + id + '"]');
+	const iconOf = id => {
+		for (const host of document.querySelectorAll("#tabbar-top .extra-items-container, tab-item .extra-items-container.below")) {
+			const root = host.shadowRoot;
+			const icon = root && root.querySelector('[part~="shelf-icon"][data-tab-id="' + id + '"]');
+			if (icon) { return icon; }
+		}
+		return null;
+	};
+	const source = sourceKind === "icon" ? iconOf(sourceId) : byId(sourceId);
+	if (!source) { throw new Error("no drag source " + sourceId + " (" + sourceKind + ")"); }
+	const target = dropMode === "cancel" ? null : byId(targetId);
+	if (dropMode !== "cancel" && !target) { throw new Error("no drop target " + targetId); }
+	// TST's getItemFromDOMNode resolves tree items through the
+	// tab-item-substance element; a press dispatched on the tab-item HOST
+	// reads as a tabbar-mousedown instead of a tab one (measured: no
+	// tab-mousedown broadcast at all), so rows are pressed on the substance
+	const pressTarget = element => element.tagName.toLowerCase() === "tab-item"
+		? (element.querySelector("tab-item-substance") || element)
+		: element;
+	const state = async (note) => {
+		try {
+			const raw = await browser.runtime.sendMessage("tst-shelf@example.com", { type: "test:state", });
+			const holds = raw && raw.dragHolds || {};
+			const hold = holds[Object.keys(holds)[0]] || null;
+			return {
+				kind: sourceKind,
+				note,
+				hold: hold ? { phase: hold.phase, sourceId: hold.sourceId, preservedActiveId: hold.preservedActiveId, } : null,
+				hiddenByUs: (raw && raw.hiddenByUs || []).filter(id => probeIds.includes(id)),
+				suppressed: (raw && raw.suppressedHiddenByUs || []).filter(id => probeIds.includes(id)),
+				shelved: (raw && raw.shelved || []).filter(id => probeIds.includes(id)),
+				reveals: (raw && raw.reveals) || {},
+				diagTail: (raw && raw.diagLog || []).slice(-30),
+			};
+		}
+		catch (error) { return { note, stateError: String(error && error.message || error), }; }
+	};
+	const rows = note => {
+		const out = {};
+		for (const id of probeIds) { out[id] = !!byId(id); }
+		out.note = note;
+		return out;
+	};
+	const pointOf = element => {
+		const rect = element.getBoundingClientRect();
+		return { x: rect.x + rect.width * 0.6, y: rect.y + rect.height * 0.5, };
+	};
+	const timeline = [];
+	const step = async (note) => { timeline.push({ at: Math.round(performance.now()), note, state: await state(note), rows: rows(note), }); };
+	return (async () => {
+	try {
+		const dt = new DataTransfer();
+		const at = pointOf(source);
+		const pressOn = pressTarget(source);
+		const dropOn = target ? pressTarget(target) : null;
+		pressOn.dispatchEvent(new MouseEvent("mousedown", {
+			bubbles: true, composed: true, cancelable: true, button: 0,
+			clientX: at.x, clientY: at.y,
+		}));
+		await wait(420);
+		await step("after-mousedown");
+		// composed is LOAD-BEARING for the icon source: the strap icons
+		// live INSIDE a shadow root, and an uncomposed synthetic dragstart
+		// stops at the shadow boundary, never reaching TST's document-level
+		// dragstart handler (measured: no native-tab-dragstart, the pending
+		// hold had to expire by watchdog)
+		pressOn.dispatchEvent(new DragEvent("dragstart", {
+			bubbles: true, composed: true, cancelable: true, dataTransfer: dt, clientX: at.x, clientY: at.y,
+		}));
+		await wait(420);
+		await step("after-dragstart");
+		if (dropMode !== "cancel") {
+			const where = dropMode === "after"
+				? { x: target.getBoundingClientRect().x + target.getBoundingClientRect().width * 0.6, y: target.getBoundingClientRect().top + target.getBoundingClientRect().height * 0.9, }
+				: pointOf(target);
+			dropOn.dispatchEvent(new DragEvent("dragover", {
+				bubbles: true, composed: true, cancelable: true, dataTransfer: dt, clientX: where.x, clientY: where.y,
+			}));
+			await wait(180);
+			dropOn.dispatchEvent(new DragEvent("drop", {
+				bubbles: true, composed: true, cancelable: true, dataTransfer: dt, clientX: where.x, clientY: where.y,
+			}));
+			// NO wait before the dragend: the browser fires drop THEN
+			// dragend without an intervening delay, and TST tears its drag
+			// session down within onDrop's setTimeout(0) — a dragend arriving
+			// later reads "already handled by ondrop" and never broadcasts
+			// native-tab-dragend (measured), which would pin the hold
+		}
+		pressOn.dispatchEvent(new DragEvent("dragend", {
+			bubbles: true, composed: true, cancelable: true, dataTransfer: dt, clientX: at.x, clientY: at.y,
+		}));
+		await wait(650);
+		await step(dropMode === "cancel" ? "after-canceled-dragend" : "after-dropped-dragend");
+		return JSON.stringify({ steps: timeline, });
+	}
+	catch (error) {
+		return JSON.stringify({ steps: timeline, error: String(error && error.stack || error), });
+	}
+	})();
+`;
+
+/** Press-only probe for the cleanup scenario: dispatch a mousedown on a
+ *  rendered row, sample the addon's hold after TST's mousedown activation,
+ *  and optionally release with a mouseup.  The dragSequenceScript sequence
+ *  cannot be interrupted mid-flight, and a mid-press tab removal must
+ *  happen between two scripted calls (task 4.7). */
+const pressOnlyScript = String.raw`
+	return (async () => {
+	const [sourceId, probeIds, release] = arguments;
+	const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+	const byId = id => document.querySelector('tab-item[data-tab-id="' + id + '"]');
+	const target = byId(sourceId);
+	if (!target) { throw new Error("no press source " + sourceId); }
+	// TST resolves presses through tab-item-substance; the bare tab-item
+	// host reads as a tabbar-mousedown (measured in the drag scenarios)
+	const on = target.tagName.toLowerCase() === "tab-item"
+		? (target.querySelector("tab-item-substance") || target) : target;
+	const rect = on.getBoundingClientRect();
+	const at = { x: rect.x + rect.width * 0.6, y: rect.y + rect.height * 0.5, };
+	on.dispatchEvent(new MouseEvent("mousedown", {
+		bubbles: true, composed: true, cancelable: true, button: 0,
+		clientX: at.x, clientY: at.y,
+	}));
+	await wait(420);
+	let pressed = null;
+	try {
+		const raw = await browser.runtime.sendMessage("tst-shelf@example.com", { type: "test:state", });
+		const holds = raw && raw.dragHolds || {};
+		const hold = holds[Object.keys(holds)[0]] || null;
+		pressed = hold ? {
+			phase: hold.phase,
+			sourceId: hold.sourceId,
+			preservedActiveId: hold.preservedActiveId,
+		} : null;
+	}
+	catch (error) { pressed = { error: String(error && error.message || error), }; }
+	const sampled = {};
+	for (const id of probeIds) { sampled[id] = !!byId(id); }
+	if (release === "up") {
+		on.dispatchEvent(new MouseEvent("mouseup", {
+			bubbles: true, composed: true, cancelable: true, button: 0,
+			clientX: at.x, clientY: at.y,
+		}));
+	}
+	return JSON.stringify({ pressed, sampled, });
+	})();
+`;
+
+/** Full window tab dump (id, url, hidden, active) read from an extension
+ *  page — the drag phase's ground truth when ids, hides and restarts need
+ *  untangling mid-run. */
+const tabsDumpScript = String.raw`
+	return (async () => {
+		const tabs = await browser.tabs.query({ windowId: arguments[0], });
+		return JSON.stringify(tabs.map(tab => ({
+			id: tab.id, active: tab.active, hidden: tab.hidden,
+			url: String(tab.url || "").slice(0, 48),
+		})));
+	})();
+`;
+
+/** The drag-phase sidebar copy must be the ACTIVE tab of its window:
+ *  a dormant background tab pauses TST's virtual-scroll layout, so the
+ *  copy activates itself (the last sidebar-hosting tab is its own) from
+ *  TST's tabs permission. */
+const activateSelfScript = String.raw`
+	return (async () => {
+		const pick = String(arguments[0] || "newest");
+		const sidebars = (await browser.tabs.query({}))
+			.filter(tab => String(tab.url || "").includes("/sidebar/sidebar.html"))
+			.sort((a, b) => pick === "oldest" ? a.id - b.id : b.id - a.id);
+		const own = sidebars[0] || null;
+		if (!own) { return "no-sidebar-tab"; }
+		await browser.tabs.update(own.id, { active: true, });
+		return "activated " + own.id;
+	})();
+`;
+
+/** Virtual-scroll readiness for the drag phase: the tab-hosted copy
+ *  renders rows lazily around the scroll offset, and a synthetic press
+ *  can only happen on a row whose tab-item element exists (SidebarItems'
+ *  virtual scroll).  Scrolls the tree so every wanted row is rendered
+ *  and inside the viewport, then reports what is rendered. */
+const scrollReadyScript = String.raw`
+	return (async () => {
+		const wanted = (arguments[0] || []).map(String);
+		const wait = ms => new Promise(r => setTimeout(r, ms));
+		const container = () => document.querySelector("#normal-tabs-container");
+		const rowOf = id => document.querySelector('tab-item[data-tab-id="' + id + '"]');
+		const rowsInDom = () => [...document.querySelectorAll("tab-item[data-tab-id]")].map(row => row.dataset.tabId);
+		const inView = id => {
+			const row = rowOf(id);
+			if (!row) { return false; }
+			const rect = row.getBoundingClientRect();
+			return rect.top >= -4 && rect.bottom <= window.innerHeight + 4;
+		};
+		for (let pass = 0; pass < 6; pass++) {
+			if (wanted.every(id => inView(id))) { break; }
+			// the rendered window is sticky in a quiet copy: rows that left
+			// it (or were appended past it) re-render when the scroll offset
+			// sweeps their side of the strip, so scroll toward the missing
+			// side repeatedly (the whole visible strip barely overflows one
+			// viewport, two passes cover it)
+			const box = container();
+			const missing = wanted.filter(id => !inView(id)).map(Number);
+			const rendered = rowsInDom().map(Number);
+			const missingTop = rendered.length > 0 && missing.length > 0
+				&& Math.min(...missing) < Math.min(...rendered);
+			if (box) {
+				box.scrollTop = missingTop ? 0 : (box.scrollTopMax || 0);
+			}
+			await wait(500);
+		}
+		return JSON.stringify({
+			wanted, ok: wanted.every(id => inView(id)), rendered: rowsInDom(),
+			viewport: {
+				innerHeight: window.innerHeight,
+				clientHeight: document.documentElement ? document.documentElement.clientHeight : -1,
+				containerHeight: container() ? container().clientHeight : -1,
+				scrollTop: container() ? container().scrollTop : -1,
+			},
+		});
+	})();
+`;
+
+/** The plain-click boundary: mousedown on a row, hold ~350 ms, mouseup —
+ *  with the preservation truth read from the model (hiddenByUs) at both
+ *  edges, because the sidebar copy's outer rows are virtual-scroll
+ *  rendered and the pressed row is usually far from the probed one. */
+const plainClickScript = String.raw`
+	return (async () => {
+		const [sourceId, probeId, windowId] = arguments;
+		const row = document.querySelector('tab-item[data-tab-id="' + sourceId + '"]');
+		if (!row) { throw new Error("no row " + sourceId); }
+		const state = async () => {
+			try {
+				const raw = await browser.runtime.sendMessage("tst-shelf@example.com", { type: "test:state", });
+				return (raw && raw.hiddenByUs || []).map(Number);
+			}
+			catch (error) { return null; }
+		};
+		const rect = row.getBoundingClientRect();
+		const where = { x: rect.x + rect.width * 0.6, y: rect.y + rect.height * 0.5, };
+		const substance = row.tagName.toLowerCase() === "tab-item"
+			? (row.querySelector("tab-item-substance") || row) : row;
+		substance.dispatchEvent(new MouseEvent("mousedown", {
+			bubbles: true, composed: true, cancelable: true, button: 0,
+			clientX: where.x, clientY: where.y,
+		}));
+		await new Promise(r => setTimeout(r, 350));
+		const midHidden = await state();
+		const midPressUnhidden = midHidden != null && !midHidden.includes(Number(probeId));
+		substance.dispatchEvent(new MouseEvent("mouseup", {
+			bubbles: true, composed: true, cancelable: true, button: 0,
+			clientX: where.x, clientY: where.y,
+		}));
+		await new Promise(r => setTimeout(r, 40));
+		const afterHidden = await state();
+		const rightAfterUpUnhidden = afterHidden != null && !afterHidden.includes(Number(probeId));
+		return JSON.stringify({ midPressUnhidden, rightAfterUpUnhidden, midHidden, afterHidden, });
+	})();
+`;
+
+/** Phase 2d: the primary-button drag exception (shelf-nesting delta,
+ *  hold-shelf-subtrees-during-drag).  Runs on a dedicated tab-hosted
+ *  sidebar copy so the drag's tab moves never disturb phase 2's DOM
+ *  oracle; restores the phase-3 resting state (C folded, E active)
+ *  before returning. */
+async function runDragPhase (marionette, { windowId, expect, }) {
+	if (!expect) {
+		check("phase 2d skipped (no setup report)", false);
+		return;
+	}
+	const e = expect.expect;
+	const C = e.clickFirst;
+	const c1 = e.children[0];
+	const c2 = e.children[1];
+	const D = e.plain;
+	const B = e.members[0];
+	const A = e.owner;
+	const E = e.rootMember;
+	const F = e.f;
+	// a root tab OUTSIDE the fixture's shelf: the http hint page created
+	// at the end of the window (never a child of A or a shelf member)
+	const call = async message => {
+		const response = await marionette.command("WebDriver:ExecuteScript", {
+			script: shelfCallScript, args: [message,], newSandbox: false,
+		}).catch(error => { console.log(`[drive] shelf call failed: ${error.message}`); return null; });
+		return response && response.value ? JSON.parse(response.value) : null;
+	};
+	const httpCall = await call({ type: "test:http-tabs", windowId, }) || { ids: [], };
+	const httpIds = (httpCall.ids || []).map(Number);
+	const setupState = await call({ type: "test:state", }) || {};
+	const shelved = new Set((setupState.shelved || []).map(Number));
+	const hidden = new Set((setupState.hiddenByUs || []).map(Number));
+	const fixtureIds = new Set([A, B, C, D, E, F, c1, c2, e.containerMember, e.controlMember].map(Number));
+	const outerRootId = httpIds.find(id => !shelved.has(id) && !hidden.has(id) && !fixtureIds.has(id)) || null;
+	check("an outside-the-shelf drag source exists (phase 2d setup)", outerRootId != null,
+		`httpIds=${JSON.stringify(httpIds)} shelved=${JSON.stringify([...shelved])}`);
+	if (outerRootId == null) { return; }
+	// Fresh root-level http tabs: every drag scenario presses a source of
+	// its own.  Rows are only pressable where their tab-item is rendered,
+	// and TST renders appended tabs, so the scenarios never depend on the
+	// initial strip's virtual-scroll window.
+	const freshSources = [];
+	{
+		const mkSource = async name => {
+			const created = await call({ type: "test:http-tab-create", windowId, url: `${HINT_ORIGIN}/${name}`, }) || {};
+			return created && created.id;
+		};
+		for (const name of ["d1.html", "d2.html", "d3.html", "d5.html", "d7a.html", "d7b.html", "d8.html",]) {
+			const id = await mkSource(name);
+			if (id) { freshSources.push(Number(id)); }
+		}
+		check("phase 2d created fresh drag sources", freshSources.length === 7, JSON.stringify(freshSources));
+	}
+	if (freshSources.length < 4) { return; }
+
+	// Reuse PHASE 2's tab-hosted sidebar copy: a second copy tab opens
+	// DORMANT (its window focus sits elsewhere), TST's virtual-scroll rAF
+	// layout never runs in it, and only the rows that happened to exist at
+	// navigation time stay in its DOM — a drag source/target set that
+	// nothing can repair from outside (the dormant-copy trap).  Phase 2's
+	// copy rendered every row its checks needed; the drags run there.
+	{
+		const tabIdsScript = String.raw`
+			return JSON.stringify({ href: location.href, });
+		`;
+		let adopted = false;
+		try {
+			marionette.command("Marionette:SetContext", { value: "chrome", }).catch(() => {});
+			const handlesResponse = await marionette.command("WebDriver:GetWindowHandles", {})
+				.catch(() => null);
+			const browserHandles = handlesResponse && (handlesResponse.value || handlesResponse) || [];
+			for (const handle of browserHandles) {
+				const switched = await commandTry(marionette, "WebDriver:SwitchToWindow", ["Marionette:SwitchToWindow"], { handle, })
+					.then(() => true, error => { console.log(`[drive] phase 2d switch to ${handle} failed: ${error.message}`); return false; });
+				if (!switched) { continue; }
+				await marionette.command("Marionette:SetContext", { value: "content", }).catch(() => {});
+				const href = await marionette.command("WebDriver:ExecuteScript", {
+					script: tabIdsScript, args: [], newSandbox: false,
+				}).then(response => response && response.value ? JSON.parse(response.value).href : null, () => null);
+				if (href && href.includes("/sidebar/sidebar.html") && href.includes(`windowId=${windowId}`)) {
+					adopted = true;
+					break;
+				}
+			}
+		}
+		catch (error) { console.log(`[drive] phase 2d adoption failed: ${error.message}`); }
+		check("phase 2d adopted phase 2's sidebar copy", adopted);
+		if (!adopted) { return; }
+		// the copy is its window's tab again (the hint phase focused the
+		// smoke tab and other drivers moved focus around): a dormant
+		// background tab pauses TST's virtual-scroll rAF layout
+		const activation = await marionette.command("WebDriver:ExecuteScript", {
+			script: tabsDumpScript, args: [windowId,], newSandbox: false,
+		}).then(r => r && r.value, error => "ERR:" + error.message);
+		console.log(`[drive] phase 2d adopted page tabs: ${activation}`);
+		const activationSelf = await marionette.command("WebDriver:ExecuteScript", {
+			script: activateSelfScript, args: ["oldest",], newSandbox: false,
+		}).then(r => r && r.value, error => "ERR:" + error.message);
+		console.log(`[drive] phase 2d copy activation: ${activationSelf}`);
+		await new Promise(resolve => setTimeout(resolve, 3500));
+	}
+	const rows = async ids => {
+		const response = await marionette.command("WebDriver:ExecuteScript", {
+			script: rowPresenceScript, args: [ids,], newSandbox: false,
+		}).catch(() => null);
+		return response && response.value ? JSON.parse(response.value) : {};
+	};
+	// The dedicated sidebar copy needs its straps before any icon click
+	// works (see openBranch); individual icon clicks keep small sleeps.
+	const waitFor = async (predicate, ms, what) => {
+		const deadline = Date.now() + ms;
+		let last = null;
+		while (Date.now() < deadline) {
+			last = await predicate();
+			if (last && last.ok) { return last; }
+			await new Promise(resolve => setTimeout(resolve, 600));
+		}
+		return last || { ok: false, };
+	};
+	const noHold = state => !state || Object.keys(state.dragHolds || {}).length === 0;
+	// TST's get-tree export carries NO `parent`: ancestorTabIds is
+	// parent-first ([direct parent, ..., root ancestor], measured)
+	const parentOfTree = tree => (tree && tree.ancestorTabIds || [])[0] ?? null;
+	/** The tab-hosted copy renders a small initial window of rows and a
+	 *  drag can only press rows whose tab-item exists in the DOM, so the
+	 *  scenarios scroll the tree (or back to the top) before pressing, and
+	 *  the probe documents what the copy renders.  Marionette flakiness
+	 *  on a freshly-navigated tab is retried once. */
+	const ensureRowsRendered = async wanted => {
+		let parsed = null;
+		for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
+			const result = await marionette.command("WebDriver:ExecuteScript", {
+				script: scrollReadyScript, args: [wanted,], newSandbox: false,
+			}).catch(error => ({ value: "ERR:" + error.message, }));
+			const value = result && result.value;
+			try {
+				parsed = value ? JSON.parse(value) : null;
+			}
+			catch (_error) {
+				console.log(`[drive] phase 2d render probe attempt ${attempt} failed: ${value}`);
+				parsed = null;
+				await new Promise(resolve => setTimeout(resolve, 2000));
+			}
+		}
+		if (parsed) { console.log(`[drive] phase 2d rendered rows: ${JSON.stringify(parsed)}`); }
+		return parsed;
+	};
+	const openBranch = async () => {
+		const icons = await waitFor(async () => {
+			const dump = await marionette.command("WebDriver:ExecuteScript", {
+				script: sidebarScript, args: [null,], newSandbox: false,
+			}).catch(() => null);
+			const parsed = dump && dump.value ? JSON.parse(dump.value) : null;
+			return parsed && (parsed.icons || []).some(icon => icon.id == String(C))
+				? { ok: true, icons: parsed.icons.length, } : null;
+		}, 12000, "strap icons");
+		if (!icons || !icons.ok) { return { ok: false, what: "no C icon", icons, }; }
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: sidebarScript, args: [C,], newSandbox: false,
+		}).catch(error => console.log(`[drive] phase 2d icon click failed: ${error.message}`));
+		return await waitFor(async () => {
+			const rendered = await ensureRowsRendered([C, c2]);
+			const presence = await rows([C, c2,]);
+			return presence[c2] ? { ok: true, presence, rendered, } : null;
+		}, 12000, "C branch rows");
+	};
+	const dragEventOrder = state => {
+		// the chronological diag lines of the drag lifecycle (the events
+		// the E2E synthesizes reach the addon as the same notifications;
+		// their recorded order documents the measured ordering, task 1.3)
+		return ((state && state.diagLog) || [])
+			.filter(line => line.includes("drag-hold w=") || line.includes("activated ")
+				|| line.includes("drag-start w=") || line.includes("drag-attach w=")
+				|| line.includes("drag-end w=") || line.includes("drag-settle w=")
+				|| line.includes("drag-hold-dropped w="))
+			.slice(-30);
+	};
+
+	// -- D0: open C's branch and verify the resting state --------------
+	{
+		const opening = await openBranch();
+		const rendered = await ensureRowsRendered([A, C, c2]);
+		const presence = await rows([A, C, c2]);
+		check("phase 2d opens C\'s branch (owner, member, plain child rows)",
+			!!(opening && opening.ok && presence[A] && presence[C] && presence[c2]),
+			() => `opening=${JSON.stringify(opening && { ok: opening.ok, what: opening.what, })} rows=${JSON.stringify(presence)} rendered=${JSON.stringify(rendered && rendered.rendered)}`);
+	}
+	{
+		const state = await call({ type: "test:state", });
+		check("no hold lingers from phase 2 (phase 2d setup)", noHold(state), JSON.stringify(state && state.dragHolds));
+	}
+
+	try { // scenarios may fail individually; the restore always runs
+
+	// -- D1: ordinary-row grasp survives, inside-drop keeps the branch --
+	{
+		const source1 = freshSources[0];
+		await ensureRowsRendered([source1, C, c2]);
+		const sequence = await marionette.command("WebDriver:ExecuteScript", {
+			script: dragSequenceScript,
+			args: [source1, "row", C, "center", [C, c2, source1,],], newSandbox: false,
+		}).catch(error => { console.log(`[drive] drag sequence D1 failed: ${error.message}`); return null; });
+		const result = sequence && sequence.value ? JSON.parse(sequence.value) : null;
+		if (!result || result.error) {
+			check("the synthetic drag lifecycle runs (D1)", false, () => JSON.stringify(result));
+			throw new Error("D1 sequence unavailable");
+		}
+		const afterDown = result.steps.find(step => step.note === "after-mousedown") || {};
+		const afterStart = result.steps.find(step => step.note === "after-dragstart") || {};
+		check("the grasp arms the hold from the mousedown (D1)",
+			afterDown.state && afterDown.state.hold && afterDown.state.hold.phase === "pending"
+				&& afterDown.state.hold.preservedActiveId != null,
+			() => `after-mousedown state: ${JSON.stringify(afterDown.state)}`);
+		check("the grasp preserves the shelved subtree mid-gesture (old behavior folded C here)",
+			afterDown.rows && afterDown.rows[C] === true && afterDown.rows[c2] === true,
+			() => `after-mousedown rows: ${JSON.stringify(afterDown.rows)}`);
+		check("the grasp is answered with an explicit false (the hold records the pressed tab, D1)",
+			afterDown.state && afterDown.state.hold && afterDown.state.hold.sourceId == source1,
+			() => JSON.stringify(afterDown.state));
+		check("native drag start promotes the pending hold (D1)",
+			afterStart.state && afterStart.state.hold && afterStart.state.hold.phase === "dragging",
+			() => `after-dragstart state: ${JSON.stringify(afterStart.state)}`);
+		check("the shelved branch stays visible throughout the drag (D1)",
+			afterStart.rows && afterStart.rows[C] === true && afterStart.rows[c2] === true,
+			() => `after-dragstart rows: ${JSON.stringify(afterStart.rows)}`);
+		// after the settle: D (the active dragged tab) is now child of C;
+		// the active branch keeps C visible through the ordinary pass.
+		const settled = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const tree = await marionette.command("WebDriver:ExecuteScript", {
+				script: treeStateScript, args: [source1,], newSandbox: false,
+			}).then(r => r && r.value ? JSON.parse(r.value) : null, () => null);
+			const presence = await rows([A, C, c2]);
+			return {
+				ok: noHold(state)
+					&& parentOfTree(tree) == C
+					&& presence[C] === true && presence[c2] === true,
+				state, tree, presence,
+			};
+		}, 9000, "D1 settle");
+		const activeIds = ((settled.state && settled.state.shelves) || {})[windowId]?.active || [];
+		check("the inside drop re-parents the dragged tab under the shelved parent (D1)",
+			parentOfTree(settled.tree) == C,
+			() => `tree=${JSON.stringify(settled.tree)}`);
+		check("the grasp answered false: TST\'s row activation ran and the dropped tab stays active (D1)",
+			activeIds.includes(source1),
+			() => `active=${JSON.stringify(activeIds)} dragHolds=${JSON.stringify(settled.state && settled.state.dragHolds)}`);
+		check("the inside drop keeps the shelved parent\'s subtree visible after settlement (D1)",
+			settled.presence && settled.presence[C] === true && settled.presence[c2] === true,
+			() => `rows=${JSON.stringify(settled.presence)} hiddenByUs=${JSON.stringify(settled.state && settled.state.hiddenByUs)}`);
+		check("the hold is gone after settlement (D1)", noHold(settled.state),
+			() => `dragHolds=${JSON.stringify(settled.state && settled.state.dragHolds)}`);
+		const attachLines = dragEventOrder(settled.state).filter(line => line.includes("drag-attach"));
+		check("tree-attached telemetry recorded the drop (D1)",
+			attachLines.some(line => line.includes(`parent=${C}`) && line.includes("parentShelved=true")),
+			() => `lines=${JSON.stringify(attachLines)}`);
+		console.log(`[drive] phase 2d D1 event order: ${JSON.stringify(dragEventOrder(settled.state))}`);
+	}
+
+	// -- D2: a canceled drag folds the preserved branch once, afterwards -
+	{
+		// D is under C after D1 and C\'s branch is open: grab the outer
+		// root tab (bottom of the strip) and cancel without a drop.  The
+		// mid-gesture truth is the model (a scroll is impossible mid-drag),
+		// the settled truth is the rows (scrolled back into the render
+		// range afterwards).
+		const source2 = freshSources[1];
+		await ensureRowsRendered([source2]);
+		const before = await call({ type: "test:state", });
+		check("phase 2d D2 setup has C\'s branch renderable and unhidden",
+			!(((before && before.hiddenByUs) || []).map(Number).includes(C)),
+			() => `hiddenByUs=${JSON.stringify(before && before.hiddenByUs)}`);
+		const sequence = await marionette.command("WebDriver:ExecuteScript", {
+			script: dragSequenceScript,
+			args: [source2, "row", null, "cancel", [],], newSandbox: false,
+		}).catch(error => { console.log(`[drive] drag sequence D2 failed: ${error.message}`); return null; });
+		const result = sequence && sequence.value ? JSON.parse(sequence.value) : null;
+		check("the canceled-drag sequence runs (D2)", !!(result && !result.error), () => JSON.stringify(result));
+		if (result && !result.error) {
+			const mid = result.steps.find(step => step.note === "after-dragstart") || {};
+			check("the canceled drag preserves the shelved branch while it lasts (D2)",
+				mid.state && !(((mid.state.hiddenByUs) || []).map(Number).includes(C)),
+				() => `after-dragstart state: ${JSON.stringify(mid.state)}`);
+			const pending = result.steps.find(step => step.note === "after-mousedown") || {};
+			check("the grasp armed a hold for the canceled drag (D2)",
+				pending.state && pending.state.hold && pending.state.hold.phase === "pending",
+				() => JSON.stringify(pending.state));
+		}
+		const settled = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const hiddenNow = (((state && state.hiddenByUs) || []).map(Number).includes(C));
+			return { ok: noHold(state) && hiddenNow, state, };
+		}, 9000, "D2 settle");
+		await ensureRowsRendered([A]);
+		const settledRows = await rows([A, C, c2]);
+		check("canceling the drag folds the preserved branch once the gesture resolves (D2)",
+			settledRows[A] === true && settledRows[C] === false && settledRows[c2] === false
+				&& (((settled.state && settled.state.hiddenByUs) || []).map(Number).includes(C)),
+			() => `rows=${JSON.stringify(settledRows)} hiddenByUs=${JSON.stringify(settled.state && settled.state.hiddenByUs)}`);
+		check("no auto-unshelving through the drag exception (D2)",
+			((settled.state && settled.state.shelved) || []).map(Number).includes(C),
+			() => `shelved=${JSON.stringify(settled.state && settled.state.shelved)}`);
+		check("the hold is gone after the canceled drag settles (D2)", noHold(settled.state),
+			() => `dragHolds=${JSON.stringify(settled.state && settled.state.dragHolds)}`);
+	}
+
+	// -- D3: dropping an active dragged tab on a folded, VISIBLE shelved
+	//      row unfolds it (TST\'s own forceExpand path) ---------------
+	{
+		// the dragged source is a fresh http root tab (guaranteed
+		// rendered); C stays folded as the drop target of the
+		// grasp-protected row.
+		const source3 = freshSources[2];
+		const opened3 = await openBranch();
+		check("phase 2d D3 setup has C\'s branch open",
+			!!(opened3 && opened3.ok), () => JSON.stringify(opened3 && { ok: opened3.ok, what: opened3.what, }));
+		await ensureRowsRendered([C, c2, source3]);
+		await call({ type: "test:collapse", tabId: C, windowId, collapsed: true, });
+		const folded = await waitFor(async () => {
+			const tree = await marionette.command("WebDriver:ExecuteScript", {
+				script: treeStateScript, args: [C,], newSandbox: false,
+			}).then(r => r && r.value ? JSON.parse(r.value) : null, () => null);
+			const presence = await rows([A, C, c2]);
+			return (tree && (tree.states || []).includes("subtree-collapsed"))
+				&& presence[C] === true && presence[c2] === false
+				? { ok: true, tree, presence, } : { ok: false, tree, presence, };
+		}, 8000, "C folded with row");
+		check("phase 2d D3 setup: C is folded yet keeps its visible regular row (the target)",
+			!!(folded && folded.ok), () => `tree=${JSON.stringify(folded && folded.tree)} rows=${JSON.stringify(folded && folded.presence)}`);
+		const sequence = await marionette.command("WebDriver:ExecuteScript", {
+			script: dragSequenceScript,
+			args: [source3, "row", C, "center", [C, c2, source3,],], newSandbox: false,
+		}).catch(error => { console.log(`[drive] drag sequence D3 failed: ${error.message}`); return null; });
+		const result = sequence && sequence.value ? JSON.parse(sequence.value) : null;
+		check("the folded-target drag sequence runs (D3)", !!(result && !result.error), () => JSON.stringify(result));
+		if (result && !result.error) {
+			const mid = result.steps.find(step => step.note === "after-dragstart") || {};
+			check("the folded shelved row survives the grasp (D3)",
+				mid.rows && mid.rows[C] === true,
+				() => `after-dragstart rows: ${JSON.stringify(mid.rows)}`);
+		}
+		const settled = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const tree = await marionette.command("WebDriver:ExecuteScript", {
+				script: treeStateScript, args: [source3,], newSandbox: false,
+			}).then(r => r && r.value ? JSON.parse(r.value) : null, () => null);
+			const presence = await rows([C, c2,]);
+			return { ok: noHold(state) && parentOfTree(tree) == C && presence[c2] === true, state, tree, presence, };
+		}, 9000, "D3 settle");
+		check("the drop on a folded shelved row attaches beneath it (D3)",
+			parentOfTree(settled.tree) == C, () => `tree=${JSON.stringify(settled.tree)}`);
+		check("TST\'s attachment flow unfolded the folded shelved target (D3)",
+			!(settled.tree && (settled.tree.states || []).includes("subtree-collapsed")) && settled.presence[c2] === true,
+			() => `tree=${JSON.stringify(settled.tree)} rows=${JSON.stringify(settled.presence)}`);
+		const attachLines = dragEventOrder(settled.state).filter(line => line.includes("drag-attach") && line.includes(`parent=${C}`));
+		check("tree-attached telemetry recorded the parent and its prior fold (D3)",
+			attachLines.some(line => line.includes("parentShelved=true") && line.includes("parentFolded=true")),
+			() => `lines=${JSON.stringify(attachLines)}`);
+		check("the hold is gone and the child plus ancestors stay visible after settlement (D3)",
+			noHold(settled.state) && settled.presence[C] === true && settled.presence[c2] === true,
+			() => `rows=${JSON.stringify(settled.presence)} dragHolds=${JSON.stringify(settled.state && settled.state.dragHolds)}`);
+	}
+
+	// -- D4: a shelf-icon drag keeps the previous member\'s subtree -------
+	{
+		// grab B\'s icon while C\'s subtree is open: selectShelfTab\'s direct
+		// fold of the previous member must not run during the gesture
+		const opened = await openBranch();
+		check("phase 2d D4 setup has C\'s branch open",
+			!!(opened && opened.ok), () => JSON.stringify(opened && { ok: opened.ok, what: opened.what, }));
+		const sequence = await marionette.command("WebDriver:ExecuteScript", {
+			script: dragSequenceScript,
+			args: [B, "icon", A, "center", [C, c2, B,],], newSandbox: false,
+		}).catch(error => { console.log(`[drive] drag sequence D4 failed: ${error.message}`); return null; });
+		const result = sequence && sequence.value ? JSON.parse(sequence.value) : null;
+		check("the icon-drag sequence runs (D4)", !!(result && !result.error), () => JSON.stringify(result));
+		if (result && !result.error) {
+			const mid = result.steps.find(step => step.note === "after-dragstart") || {};
+			check("grasping another member\'s icon preserves the previous member\'s subtree (D4)",
+				mid.rows && mid.rows[C] === true && mid.rows[c2] === true,
+				() => `after-dragstart rows: ${JSON.stringify(mid.rows)} state=${JSON.stringify(mid.state)}`);
+			check("the dragged member\'s selection ran (its row is back, D4)",
+				mid.rows && mid.rows[B] === true,
+				() => `after-dragstart rows: ${JSON.stringify(mid.rows)}`);
+			const pending = result.steps.find(step => step.note === "after-mousedown") || {};
+			check("the icon grasp armed a hold with the previous member\'s branch preserved (D4)",
+				pending.state && pending.state.hold && pending.state.hold.phase === "pending",
+				() => JSON.stringify(pending.state));
+		}
+		const settled = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const tree = await marionette.command("WebDriver:ExecuteScript", {
+				script: treeStateScript, args: [A,], newSandbox: false,
+			}).then(r => r && r.value ? JSON.parse(r.value) : null, () => null);
+			const presence = await rows([A, C, c2, B]);
+			return {
+				// the fold's hide waits out the collapse-animation guard
+				// (~300 ms after the settle's ordinary pass), so poll C's
+				// hidden-by-us truth, not the row's first absence
+				ok: noHold(state) && ((state && state.shelved) || []).map(Number).includes(B)
+					&& (((state && state.hiddenByUs) || []).map(Number).includes(C)),
+				state, tree, presence,
+			};
+		}, 9000, "D4 settle");
+		check("the icon drags its OWN tab, not the owner row (A stays, member B stays shelved, D4)",
+			((settled.state && settled.state.shelved) || []).map(Number).includes(B)
+				&& settled.tree && Number(settled.tree.id) == Number(A),
+			() => `tree=${JSON.stringify(settled.tree)} shelved=${JSON.stringify(settled.state && settled.state.shelved)}`);
+		check("resolving the icon drag leaves at most one member subtree (D4)",
+			settled.presence && settled.presence[B] === true && settled.presence[C] === false && settled.presence[c2] === false,
+			() => `rows=${JSON.stringify(settled.presence)} hiddenByUs=${JSON.stringify(settled.state && settled.state.hiddenByUs)} diag=${JSON.stringify(((settled.state && settled.state.diagLog) || []).slice(-20))}`);
+		check("the hold is gone after the icon drag settles (D4)", noHold(settled.state),
+			() => `dragHolds=${JSON.stringify(settled.state && settled.state.dragHolds)}`);
+		console.log(`[drive] phase 2d D4 event order: ${JSON.stringify(dragEventOrder(settled.state))}`);
+	}
+
+	// -- D5: a plain click releases at mouseup; programmatic activation --
+	{
+		const opened = await openBranch();
+		check("phase 2d D5 setup has C\'s branch open", !!(opened && opened.ok), () => JSON.stringify(opened && { ok: opened.ok, what: opened.what, }));
+		const source5 = freshSources[3];
+		await ensureRowsRendered([source5, C, c2]);
+		const clickResult = await marionette.command("WebDriver:ExecuteScript", {
+			script: plainClickScript, args: [source5, C, windowId,], newSandbox: false,
+		}).catch(error => { console.log(`[drive] plain click failed: ${error.message}`); return null; });
+		const click = clickResult && clickResult.value ? JSON.parse(clickResult.value) : null;
+		check("a plain click preserves the old branch only until mouseup (mid-press un-hidden, D5)",
+			!!(click && click.midPressUnhidden && click.rightAfterUpUnhidden),
+			() => JSON.stringify(click));
+		const settled = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const hiddenNow = (((state && state.hiddenByUs) || []).map(Number).includes(C));
+			return { ok: noHold(state) && hiddenNow, state, };
+		}, 9000, "D5 settle");
+		await ensureRowsRendered([A]);
+		const settledRows = await rows([A, C, c2]);
+		check("the clicked outcome follows the ordinary rules (the clicked tab is outside: the branch folds, D5)",
+			settledRows[A] === true && settledRows[C] === false
+				&& (((settled.state && settled.state.hiddenByUs) || []).map(Number).includes(C)),
+			() => `rows=${JSON.stringify(settledRows)} hiddenByUs=${JSON.stringify(settled.state && settled.state.hiddenByUs)}`);
+		// programmatic activation: no hold, immediate fold (the non-pointer
+		// exception of the delta: no arm, no pending interval)
+		const reopened = await openBranch();
+		const heldBefore = await call({ type: "test:state", });
+		check("no hold exists for a programmatic activation setup (D5)", noHold(heldBefore),
+			() => JSON.stringify(heldBefore && heldBefore.dragHolds));
+		check("phase 2d D5 programming setup has C\'s branch open again",
+			!!(reopened && reopened.ok), () => JSON.stringify(reopened && { ok: reopened.ok, what: reopened.what, }));
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: activateScript, args: [source5,], newSandbox: false,
+		}).catch(error => console.log(`[drive] programmatic activation failed: ${error.message}`));
+		await new Promise(resolve => setTimeout(resolve, 2500));
+		const afterProgrammatic = await call({ type: "test:state", });
+		await ensureRowsRendered([C, c2]);
+		const presenceProgrammatic = await rows([C, c2]);
+		check("programmatic activation folds the branch at once and creates no hold (D5)",
+			noHold(afterProgrammatic) && presenceProgrammatic[C] === false && presenceProgrammatic[c2] === false,
+			() => `rows=${JSON.stringify(presenceProgrammatic)} dragHolds=${JSON.stringify(afterProgrammatic && afterProgrammatic.dragHolds)}`);
+	}
+
+	// -- D6: a drag across a folded-owner reveal preserves the reveal ----
+	{
+		// fold the owner A, activate C (the tabs.update route reaches the
+		// reveal too): the reveal shows C\'s branch only; grasping the
+		// outer tab must not prune the reveal at grasp, and an outside
+		// resolution ends it through the ordinary prune path
+		await ensureRowsRendered([A]);
+		await call({ type: "test:collapse", tabId: A, windowId, collapsed: true, });
+		await new Promise(resolve => setTimeout(resolve, 2200));
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: activateScript, args: [C,], newSandbox: false,
+		}).catch(error => console.log(`[drive] phase 2d D6 reveal activation failed: ${error.message}`));
+		const revealOpening = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const reveal = (((state && state.reveals) || {})[windowId] || []);
+			return reveal.some(([owner]) => owner == A) ? { ok: true, reveal, } : null;
+		}, 9000, "reveal");
+		const before = await call({ type: "test:state", });
+		const revealBefore = ((before && before.reveals) || {})[windowId] || [];
+		check("phase 2d D6 setup holds a folded-owner reveal for C\'s branch",
+			!!(revealOpening && revealOpening.ok) && revealBefore.some(([owner]) => owner == A),
+			() => JSON.stringify({ reveal: revealBefore, debug: before && before.revealDebug,
+				shelved: (before && before.shelved || []).map(Number),
+				active: (((before && before.shelves) || {})[windowId] || {}).active,
+				hiddenByUs: (before && before.hiddenByUs || []).map(Number) }));
+		const source6 = freshSources[3];
+		await ensureRowsRendered([source6]);
+		const sequence = await marionette.command("WebDriver:ExecuteScript", {
+			script: dragSequenceScript,
+			args: [source6, "row", null, "cancel", [],], newSandbox: false,
+		}).catch(error => { console.log(`[drive] drag sequence D6 failed: ${error.message}`); return null; });
+		const result = sequence && sequence.value ? JSON.parse(sequence.value) : null;
+		check("the reveal-drag sequence runs (D6)", !!(result && !result.error), () => JSON.stringify(result));
+		const midState = await call({ type: "test:state", });
+		const midStep = result && !result.error && (result.steps || []).find(step => step.note === "after-dragstart");
+		check("grasping outside a revealed owner keeps the reveal AND the branch unpruned at grasp (D6)",
+			!!(midStep && midStep.state
+				&& (((midStep.state.reveals || {})[windowId] || []).some(([owner]) => owner == A))
+				&& !(((midStep.state.hiddenByUs) || []).map(Number).includes(C))),
+			() => `stepState=${JSON.stringify(midStep && midStep.state)}`);
+		check("the drag mid-state carried the hold beside the revealed branch (D6 bookkeeping)",
+			!!(midStep && midStep.state && midStep.state.hold && midStep.state.hold.phase === "dragging"),
+			() => `stepState=${JSON.stringify(midStep && midStep.state)} dragHoldsNow=${JSON.stringify((midState && midState.dragHolds) || {})}`);
+		const postRevealGone = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			const revealGone = (((state && state.reveals) || {})[windowId] || []).length === 0;
+			// the fold-back and the row reclaim trail the reveal's end by
+			// TST's collapse animation plus the hide guard (~450 ms) — the
+			// model truth settles first, the rows follow
+			const hiddenC = (((state && state.hiddenByUs) || []).map(Number).includes(C));
+			return { ok: noHold(state) && revealGone && hiddenC, state, };
+		}, 9000, "D6 settle");
+		await ensureRowsRendered([A]);
+		const settledRows = await rows([A, C, c2]);
+		check("an outside resolution ends the reveal through the ordinary prune path (D6)",
+			postRevealGone.ok && settledRows[A] === true && settledRows[C] === false && settledRows[c2] === false,
+			() => `resolves=${JSON.stringify(postRevealGone.ok)} rows=${JSON.stringify(settledRows)} debug=${JSON.stringify(postRevealGone.state && postRevealGone.state.revealDebug)}`);
+		check("the hold is gone after the reveal drag settles (D6)", noHold(postRevealGone.state),
+			() => `dragHolds=${JSON.stringify(postRevealGone.state && postRevealGone.state.dragHolds)}`);
+	}
+
+	// -- D7: a mid-press tab death drops the hold (task 4.7 cleanup) -----
+	{
+		// The anchor must arm the hold (its branch carries C's shelf row):
+		// c1, the nested-shelf member inside C's branch.  Its death
+		// removes one member, which phase 3 tolerates — the reinstall's
+		// shelved set rebuilds from the SURVIVING tabs' session values and
+		// excludes dead ids.  Source-close and anchor-close share one
+		// discard path in tabs.onRemoved; both are driven here.
+		const source7a = freshSources[4];
+		const source7b = freshSources[5];
+		await openBranch();
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: activateScript, args: [c1,], newSandbox: false,
+		}).catch(error => console.log(`[drive] D7 anchor activation failed: ${error.message}`));
+		await ensureRowsRendered([source7a, c1, C, c2]);
+		const anchorSetup = await rows([c1, C, c2]);
+		check("phase 2d D7 setup has the anchor branch open (c1 active, C rows)",
+			!!(anchorSetup[c1] && anchorSetup[C] && anchorSetup[c2]), () => JSON.stringify(anchorSetup));
+		// sub-case 1: the PRESSED SOURCE dies mid-press
+		const press1 = await marionette.command("WebDriver:ExecuteScript", {
+			script: pressOnlyScript,
+			args: [source7a, [c1, C, c2], "press",], newSandbox: false,
+		}).catch(error => { console.log(`[drive] D7 press 1 failed: ${error.message}`); return null; });
+		const held1 = press1 && press1.value ? JSON.parse(press1.value) : null;
+		check("the press arms a hold preserving the anchor branch (D7)",
+			!!(held1 && held1.pressed && held1.pressed.phase === "pending"
+				&& held1.pressed.preservedActiveId == c1 && held1.pressed.sourceId == source7a),
+			() => JSON.stringify(held1 && held1.pressed));
+		check("the anchored branch stays painted while the press holds (D7)",
+			!!(held1 && held1.sampled && held1.sampled[C] && held1.sampled[c1] && held1.sampled[c2]),
+			() => JSON.stringify(held1 && held1.sampled));
+		await call({ type: "test:tabs-remove", tabId: source7a, });
+		const cleaned1 = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			return { ok: noHold(state) && (((state && state.shelved) || []).map(Number).includes(C)), state, };
+		}, 9000, "D7 source-close cleanup");
+		check("closing the pressed source drops the hold (D7)",
+			!!(cleaned1 && cleaned1.ok),
+			() => JSON.stringify(cleaned1 && cleaned1.state && cleaned1.state.dragHolds));
+		check("the source-death cleanup left C shelved (D7)",
+			!!(cleaned1 && cleaned1.state && ((cleaned1.state.shelved) || []).map(Number).includes(C)),
+			() => JSON.stringify(cleaned1 && cleaned1.state && cleaned1.state.shelved));
+		// sub-case 2: the PRESERVED ANCHOR dies mid-press.  Sub-case 1's
+		// ordinary pass folded C's branch (the active tab fell outside
+		// it), so the anchor is re-activated first: the activation reopens
+		// C's row and C's plain-child rows before press 2 can arm.
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: activateScript, args: [c1,], newSandbox: false,
+		}).catch(error => console.log(`[drive] D7 anchor re-activation failed: ${error.message}`));
+		const anchorReopened = await waitFor(async () => {
+			const readiness = await ensureRowsRendered([c1, C, c2]);
+			const fresh = await rows([c1, C, c2]);
+			return fresh[c1] && fresh[C] && fresh[c2] ? { ok: true, fresh, readiness, } : null;
+		}, 9000, "D7 anchor rows");
+		const anchorSetup2 = anchorReopened && anchorReopened.fresh || await rows([c1, C, c2]);
+		check("phase 2d D7 re-setup has the anchor branch open for press 2",
+			!!(anchorSetup2[c1] && anchorSetup2[C] && anchorSetup2[c2]), () => JSON.stringify(anchorSetup2));
+		if (anchorSetup2[c1] && anchorSetup2[C]) {
+			const press2 = await marionette.command("WebDriver:ExecuteScript", {
+				script: pressOnlyScript,
+				args: [source7b, [c2, C], "press",], newSandbox: false,
+			}).catch(error => { console.log(`[drive] D7 press 2 failed: ${error.message}`); return null; });
+			const held2 = press2 && press2.value ? JSON.parse(press2.value) : null;
+			check("the second press arms a hold with the same anchor (D7)",
+				!!(held2 && held2.pressed && held2.pressed.phase === "pending"
+					&& held2.pressed.preservedActiveId == c1 && held2.pressed.sourceId == source7b),
+				() => JSON.stringify(held2 && held2.pressed));
+			await call({ type: "test:tabs-remove", tabId: c1, });
+			const cleaned2 = await waitFor(async () => {
+				const state = await call({ type: "test:state", });
+				return { ok: noHold(state) && (((state && state.shelved) || []).map(Number).includes(C)), state, };
+			}, 9000, "D7 anchor-close cleanup");
+			check("closing the preserved anchor drops the hold and keeps its owner shelved (D7)",
+				!!(cleaned2 && cleaned2.ok),
+				() => JSON.stringify({ holds: cleaned2 && cleaned2.state && cleaned2.state.dragHolds,
+					shelved: cleaned2 && cleaned2.state && cleaned2.state.shelved }));
+			// release the dangling press: the hold is already gone, the
+			// release is a no-op for us, and TST's click resolves the press
+			await marionette.command("WebDriver:ExecuteScript", {
+				script: pressOnlyScript,
+				args: [source7b, [], "up",], newSandbox: false,
+			}).catch(error => console.log(`[drive] D7 release failed: ${error.message}`));
+			const settled7 = await waitFor(async () => {
+				const state = await call({ type: "test:state", });
+				const hidden = ((state && state.hiddenByUs) || []).map(Number);
+				return { ok: noHold(state) && hidden.includes(C) && !hidden.includes(c2), state, };
+			}, 9000, "D7 settle");
+			await ensureRowsRendered([A]);
+			const settledRows7 = await rows([A, c1, c2]);
+			check("after the anchor death the branch resolves by the ordinary rules (D7)",
+				!!(settled7 && settled7.ok) && settledRows7[A] === true && settledRows7[c2] === false,
+				() => `hold=${JSON.stringify(settled7 && settled7.state && settled7.state.dragHolds)}`
+					+ ` hiddenByUs=${JSON.stringify(settled7 && settled7.state && settled7.state.hiddenByUs)}`
+					+ ` rows=${JSON.stringify(settledRows7)}`);
+		}
+	}
+
+	// -- D8: the ACTIVE CHILDLESS member keeps its row at grasp ----------
+	{
+		// B is a member with no children: its single revealed row is the
+		// shelf's whole drop surface.  The 0.6.5 arming test demanded a
+		// shelved member WITH children, so the hold never armed here and
+		// the ordinary outgoing-member hide reclaimed the row at grasp —
+		// the user bug "its subtree disappears the moment I clutch
+		// another tab" (a subtree of exactly one row).  The widened test
+		// must arm on B itself, and the inside drop must land beneath B.
+		const source8 = freshSources[6];
+		await call({ type: "test:collapse", tabId: A, windowId, collapsed: false, });
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: activateScript, args: [B,], newSandbox: false,
+		}).catch(error => console.log(`[drive] D8 anchor activation failed: ${error.message}`));
+		const anchorReady = await waitFor(async () => {
+			const readiness = await ensureRowsRendered([B, source8]);
+			const fresh = await rows([B, source8]);
+			return fresh[B] && fresh[source8] ? { ok: true, fresh, readiness, } : null;
+		}, 12000, "D8 rows");
+		const setup8 = anchorReady && anchorReady.fresh || await rows([B, source8]);
+		check("phase 2d D8 setup renders the childless member's row (B active)",
+			!!(setup8[B] && setup8[source8]),
+			() => JSON.stringify({ setup8, readiness: anchorReady && anchorReady.readiness }));
+		const sequence = await marionette.command("WebDriver:ExecuteScript", {
+			script: dragSequenceScript,
+			args: [source8, "row", B, "center", [B, source8,],], newSandbox: false,
+		}).catch(error => { console.log(`[drive] drag sequence D8 failed: ${error.message}`); return null; });
+		const result = sequence && sequence.value ? JSON.parse(sequence.value) : null;
+		check("the childless-anchor drag sequence runs (D8)",
+			!!(result && !result.error), () => JSON.stringify(result));
+		const grasp = result && !result.error && (result.steps || []).find(step => step.note === "after-mousedown");
+		check("the childless shelved member's row survives the grasp (D8)",
+			!!(grasp && grasp.rows && grasp.rows[B]),
+			() => `notes=${JSON.stringify(result && (result.steps || []).map(step => step.note))} rows=${JSON.stringify(grasp && grasp.rows)}`);
+		const dragged8 = result && !result.error && (result.steps || []).find(step => step.note === "after-dragstart");
+		check("the childless member's row is still the target mid-drag (D8)",
+			!!(dragged8 && dragged8.rows && dragged8.rows[B]
+				&& dragged8.state && dragged8.state.hold && dragged8.state.hold.phase === "dragging"),
+			() => JSON.stringify({ rows: dragged8 && dragged8.rows, hold: dragged8 && dragged8.state && dragged8.state.hold }));
+		const settled8 = await waitFor(async () => {
+			const state = await call({ type: "test:state", });
+			return { ok: noHold(state), state, };
+		}, 9000, "D8 settle");
+		const treeCall = await call({ type: "test:tree-of", tab: source8, });
+		const parentOf8 = parentOfTree(treeCall && treeCall.tree);
+		const settledRows8 = await rows([B, source8]);
+		check("the inside drop attaches under the childless member and keeps its row (D8)",
+			parentOf8 == B && settledRows8[B] === true && settledRows8[source8] === true
+				&& !!(settled8 && settled8.ok)
+				&& ((settled8.state && settled8.state.shelved) || []).map(Number).includes(B),
+			() => `parent=${parentOf8} rows=${JSON.stringify(settledRows8)}`
+				+ ` hold=${JSON.stringify(settled8.state && settled8.state.dragHolds)}`
+				+ ` tree=${JSON.stringify(treeCall && treeCall.tree && treeCall.tree.ancestorTabIds)}`);
+	}
+
+	}
+	finally { // -- restore the phase-3 resting state (C folded, E active) --
+		// the fresh source tabs leave with the phase: their rows would
+		// stay coded surface rows for phase 3's hint replay otherwise
+		for (const sourceId of freshSources) {
+			await call({ type: "test:tabs-remove", tabId: sourceId, });
+		}
+		await new Promise(resolve => setTimeout(resolve, 1500));
+		await call({ type: "test:collapse", tabId: A, windowId, collapsed: false, });
+		await call({ type: "test:collapse", tabId: C, windowId, collapsed: true, });
+		// wait out the settle quiet window so no hold survives the phase
+		await new Promise(resolve => setTimeout(resolve, 2500));
+		const state = await call({ type: "test:state", });
+		check("phase 2d leaves no hold behind (phase 3 gate)", noHold(state), JSON.stringify(state && state.dragHolds));
+		const shelvedIds = ((state && state.shelved) || []).map(Number);
+		check("phase 2d keeps every member shelved (B, C, F stayed through the drags)",
+			shelvedIds.includes(B) && shelvedIds.includes(C) && shelvedIds.includes(F),
+			() => `shelved=${JSON.stringify(shelvedIds)}`);
+		const folded = await waitFor(async () => {
+			const tree = await marionette.command("WebDriver:ExecuteScript", {
+				script: treeStateScript, args: [C,], newSandbox: false,
+			}).then(r => r && r.value ? JSON.parse(r.value) : null, () => null);
+			return tree && (tree.states || []).includes("subtree-collapsed") ? { ok: true, tree, } : { ok: false, tree, };
+		}, 8000, "C folded");
+		check("phase 2d re-folds C for the persist-through-reinstall check",
+			!!(folded && folded.ok),
+			() => `tree=${JSON.stringify(folded && folded.tree)}`);
+		await marionette.command("WebDriver:ExecuteScript", {
+			script: activateScript, args: [E,], newSandbox: false,
+		}).catch(error => console.log(`[drive] phase 2d final reset failed: ${error.message}`));
+		await new Promise(resolve => setTimeout(resolve, 2000));
+	}
+}
+
 async function main () {
 	prepareProfile();
 	fs.rmSync(CONSOLE_LOG, { force: true, });
@@ -2180,6 +3185,9 @@ async function main () {
 
 		// -- phase 2: sidebar DOM assertions + synthetic clicks ------------
 		await runSidebarPhase(marionette, { windowId, expect, });
+
+		// -- phase 2d: the drag lifecycle (hold-shelf-subtrees-during-drag)
+		await runDragPhase(marionette, { windowId, expect, });
 
 
 		// -- final report of phase 1+2 -------------------------------------

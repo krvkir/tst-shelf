@@ -131,9 +131,38 @@ for (let index = 0; index < RUNS; index++) {
 }
 shelved.delete(extra);
 
+// one held pass (drag hold): the union planning of the live and the
+// preserved branch plus a reveal under a folded owner — the extra
+// ancestor-chain walk and the second branch anchor are the only cost a
+// hold can add to a pass (shelf-nesting delta, task 2.4)
+const heldActiveId = activeId;
+const heldPreservedId = (function preservedShelvedDescendant () {
+	const owners = [...tree];
+	const firstMember = owners[0].children?.[0];
+	return firstMember?.children?.[0]?.id ?? null;
+})();
+
+function heldPass () {
+	const mustShow = mustShowTabs({ tree, activeId: heldActiveId, preservedActiveId: heldPreservedId, });
+	const dangling = danglingMembers({ tree, shelved, mustShow, });
+	const owner = 1; // the first shelf owner (id 1)
+	const heldReveals = new Map([[owner, { openedSeen: true, }]]);
+	const plan = planReveals({ tree, activeId: heldActiveId, preservedActiveId: heldPreservedId, reveals: heldReveals, mustShow, });
+	return { mustShow, dangling, plan, };
+}
+for (let index = 0; index < 3; index++) { heldPass(); }
+const heldSamples = [];
+for (let index = 0; index < RUNS; index++) {
+	const started = performance.now();
+	heldPass();
+	heldSamples.push(performance.now() - started);
+}
+
 const medianFull = median(samples);
 const worstFull = Math.max(...samples);
 const medianPut = median(putSamples);
+const medianHeld = median(heldSamples);
+const worstHeld = Math.max(...heldSamples);
 
 const check = (name, ok, detail) => {
 	console.log(`${ok ? "PASS" : "FAIL"} [perf] ${name}${detail ? " " + detail : ""}`);
@@ -148,3 +177,6 @@ check("a full pure pass stays inside the reconciliation budget",
 check("a put re-derivation stays inside the strap budget",
 	medianPut < BUDGET_PUT,
 	`median=${medianPut.toFixed(2)}ms budget=<${BUDGET_PUT}ms`);
+check("a held (drag-hold) planning pass stays inside the reconciliation budget",
+	medianHeld < BUDGET_FULL && worstHeld < BUDGET_WORST,
+	`median=${medianHeld.toFixed(2)}ms worst=${worstHeld.toFixed(2)}ms preserved=${heldPreservedId}`);
