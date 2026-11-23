@@ -6,6 +6,10 @@
 const BADGE_MODE_KEY = "badgeMode";
 const HINT_CHARSET_KEY = "hintCharset";
 const HINT_EXCLUDE_SPECIAL_KEY = "hintExcludeSpecialPages";
+/** storage.local key the background reads (index.esm.js
+ *  HINT_FONT_SIZE_KEY).  Missing, the whole page dies at load:
+ *  every listener dies with it, and no option saves (b1583d1, 0.6.3). */
+const HINT_FONT_SIZE_KEY = "hintFontSize";
 /** The default the background falls back to (style.esm.js
  *  DEFAULT_HINT_FONT_SIZE_PX). */
 const DEFAULT_HINT_FONT_SIZE = 12;
